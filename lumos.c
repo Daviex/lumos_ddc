@@ -197,6 +197,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdLineA, int showCmd
     Settings_Init(&g_settings);
     Settings_UpgradeAutostart(); /* Add the login switch to this exe's legacy Run entry. */
     Settings_LoadDeltas(&g_settings, &g_monitors);
+    Settings_ApplyMonitorSelection(&g_settings, &g_monitors);
 
     if (!UI_Init(hInst)) {
         MessageBoxW(NULL, L"Failed to initialize UI", APP_NAME, MB_ICONERROR);
@@ -264,6 +265,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdLineA, int showCmd
     /* Message loop */
     MSG msg = { 0 };
     while (GetMessageW(&msg, NULL, 0, 0) > 0) {
+        if (UI_HandleDialogMessage(&msg)) continue;
         TranslateMessage(&msg);
         DispatchMessageW(&msg);
     }
@@ -432,6 +434,7 @@ static void ShowContextMenu(HWND hwnd)
 
 static void HandleHotkey(int id)
 {
+    if (!Monitor_HasSelected(&g_monitors)) return;
     int step = g_settings.step;
     int delta = 0;
 
@@ -458,22 +461,26 @@ static void HandleHotkey(int id)
     TIMED("hotkey: SetAllBrightness",
           Monitor_SetAllBrightness(&g_monitors, g_masterTarget));
 
-    /* Show OSD on primary monitor (where cursor is) */
+    /* Show feedback on an affected display, preferring the cursor's monitor. */
     TIMED("hotkey: RefreshBrightness", Monitor_RefreshBrightness(&g_monitors));
     {
         POINT curPos;
         GetCursorPos(&curPos);
         HMONITOR hCurMon = MonitorFromPoint(curPos, MONITOR_DEFAULTTOPRIMARY);
-        /* Find matching monitor for percentage display, fallback to first */
-        int pct = 50;
+        int selected = -1;
         for (int i = 0; i < g_monitors.count; i++) {
-            if (g_monitors.monitors[i].hMonitor == hCurMon && g_monitors.monitors[i].controllable) {
-                BrightMonitor *mon = &g_monitors.monitors[i];
-                pct = Brightness_GetPercent(mon);
+            BrightMonitor *mon = &g_monitors.monitors[i];
+            if (!Monitor_CanControl(mon)) continue;
+            if (selected < 0) selected = i;
+            if (mon->hMonitor == hCurMon) {
+                selected = i;
                 break;
             }
         }
-        UI_ShowOSD(g_hInst, hCurMon, pct);
+        if (selected >= 0) {
+            BrightMonitor *mon = &g_monitors.monitors[selected];
+            UI_ShowOSD(g_hInst, mon->hMonitor, Brightness_GetPercent(mon));
+        }
     }
 
     /* Update popup if visible */
@@ -830,6 +837,47 @@ static void RestartSchedule(void)
     Schedule_ApplyNow();
 }
 
+/* A scope change cancels queued writes and any drag against the previous
+   selection. Rebase manual controls on the newly selected displays so the
+   first hotkey does not jump to the previous group's brightness. */
+static void UpdateMonitorSelection(void)
+{
+    MonitorList scoped = g_monitors;
+    Settings_ApplyMonitorSelection(&g_settings, &scoped);
+    BOOL changed = scoped.selectedOnly != g_monitors.selectedOnly;
+    DWORD retained = 0;
+    for (int i = 0; i < scoped.count; i++) {
+        if (scoped.monitors[i].excludedFromControl != g_monitors.monitors[i].excludedFromControl)
+            changed = TRUE;
+        if (Monitor_CanControl(&scoped.monitors[i]) && Monitor_CanControl(&g_monitors.monitors[i]))
+            retained |= 1u << i;
+    }
+    if (!changed) return;
+
+    if (g_hwndPopup) DestroyWindow(g_hwndPopup);
+    g_hwndPopup = NULL;
+    MonitorWorker_Reset();
+    Settings_ApplyMonitorSelection(&g_settings, &g_monitors);
+    /* Saving a new scope is user activity. Restore an idle level only on
+       displays retained from the old scope; newly selected displays keep their
+       own current brightness instead of inheriting another display's target. */
+    if (g_idleDimmed && g_masterTargetValid) {
+        for (int i = 0; i < g_monitors.count; i++) {
+            if (!(retained & (1u << i))) continue;
+            int target = g_masterTarget + g_monitors.monitors[i].delta;
+            if (target < 0) target = 0;
+            if (target > 100) target = 100;
+            Monitor_SetBrightness(&g_monitors.monitors[i], (DWORD)target);
+        }
+    }
+    g_idleDimmed = FALSE;
+    g_masterTarget = Brightness_MasterTarget(&g_monitors);
+    g_masterTargetValid = Monitor_HasSelected(&g_monitors);
+    UI_SetMasterTarget(g_masterTarget);
+    g_hwndPopup = UI_CreatePopup(g_hInst, &g_monitors);
+    Monitor_RefreshBrightness(&g_monitors);
+}
+
 static void HandleCommand(HWND hwnd, int cmd)
 {
     if (cmd >= IDM_PRESET_BASE && cmd < IDM_PRESET_BASE + MAX_PRESETS) {
@@ -856,7 +904,7 @@ static void HandleCommand(HWND hwnd, int cmd)
             Idle_Restore();   /* undo an active dim immediately */
         break;
     case IDM_SETTINGS:
-        UI_ShowSettings(hwnd, &g_settings);
+        UI_ShowSettings(hwnd, &g_settings, &g_monitors);
         break;
     case IDM_SETTINGS_SAVED: {
         /* The window already wrote the edited values into g_settings.
@@ -865,6 +913,7 @@ static void HandleCommand(HWND hwnd, int cmd)
             !Settings_SetAutostart(g_settings.autostart))
             g_settings.autostart = Settings_GetAutostart();
         Settings_Save(&g_settings);
+        UpdateMonitorSelection();
         if (!g_settings.idleDimEnabled)
             Idle_Restore();           /* undo an active dim right away */
         RestartSchedule();
@@ -961,7 +1010,7 @@ static void ApplyPendingTargets(const MonitorTarget pending[MAX_MONITORS], DWORD
     for (int i = 0; i < MAX_MONITORS; i++) {
         if (!(mask & (1u << i))) continue;
         int match = Monitor_FindUniqueDisplay(&g_monitors, &pending[i].monitor);
-        if (match >= 0)
+        if (match >= 0 && Monitor_CanControl(&g_monitors.monitors[match]))
             Monitor_SetBrightness(&g_monitors.monitors[match], pending[i].percent);
     }
 }
@@ -980,12 +1029,13 @@ static void AdoptMonitorList(MonitorList *fresh)
     g_monitors = *fresh; /* Transfer ownership of the fresh list's leases. */
     free(fresh);
     Settings_LoadDeltas(&g_settings, &g_monitors);
+    Settings_ApplyMonitorSelection(&g_settings, &g_monitors);
     g_hwndPopup = UI_CreatePopup(g_hInst, &g_monitors);
 
     /* Keep a pending restore through placeholder results, even after retries
        expire. A monitor connected while idle must inherit the idle level too. */
     if ((g_rescan.reapplyBrightness || g_idleDimmed) &&
-        Monitor_HasControllable(&g_monitors)) {
+        Monitor_HasSelected(&g_monitors)) {
         g_rescan.reapplyBrightness = FALSE;
         TIMED("rescan done: ReapplyBrightness", ReapplyBrightness());
     }
@@ -1015,8 +1065,9 @@ static void HandleRescanResult(HWND hwnd, DWORD gen, MonitorList *fresh)
        a generic panel, and adopting that silently kills brightness control
        until the next display event. Retry on a backoff and keep the list we
        have, which is either still valid or about to be replaced anyway. */
-    if (fresh && !Monitor_HasControllable(fresh) &&
-        (Monitor_HasControllable(&g_monitors) || g_rescan.reapplyBrightness) &&
+    if (fresh) Settings_ApplyMonitorSelection(&g_settings, fresh);
+    if (fresh && !Monitor_HasSelected(fresh) &&
+        (Monitor_HasSelected(&g_monitors) || g_rescan.reapplyBrightness) &&
         g_rescan.retry < RESCAN_MAX_RETRIES) {
         DWORD delay = kRescanBackoffMs[g_rescan.retry++];
         DbgLog("rescan: nothing controllable, retry %d in %lu ms",

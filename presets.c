@@ -6,6 +6,7 @@
 #define REG_RUN_KEY L"Software\\Microsoft\\Windows\\CurrentVersion\\Run"
 #define APP_NAME    L"Lumos"
 #define AUTOSTART_COMMAND_CAPACITY (MAX_PATH + 2 + ARRAYSIZE(L" " LUMOS_STARTUP_ARGUMENT) - 1)
+#define MONITOR_SELECTION_SECTION L"MonitorSelection"
 
 static void EnsureDirectory(const WCHAR *path)
 {
@@ -52,6 +53,8 @@ void Settings_CreateDefaults(Settings *s)
     WritePrivateProfileStringW(L"Settings", L"IdleDimEnabled", L"0", s->iniPath);
     WritePrivateProfileStringW(L"Settings", L"IdleDimPercent", L"5", s->iniPath);
     WritePrivateProfileStringW(L"Settings", L"IdleDimMinutes", L"5", s->iniPath);
+    WritePrivateProfileStringW(MONITOR_SELECTION_SECTION, L"Mode", L"All", s->iniPath);
+    WritePrivateProfileStringW(MONITOR_SELECTION_SECTION, L"Count", L"0", s->iniPath);
 }
 
 int Settings_DayBrightness(const Settings *s)
@@ -67,6 +70,67 @@ int Settings_DayBrightness(const Settings *s)
         }
     }
     return dayBrightness >= 0 ? dayBrightness : DEFAULT_DAY_BRIGHTNESS;
+}
+
+static void LoadMonitorSelection(Settings *s)
+{
+    MonitorSelection *selection = &s->monitorSelection;
+    WCHAR mode[16];
+    memset(selection, 0, sizeof(*selection));
+    GetPrivateProfileStringW(MONITOR_SELECTION_SECTION, L"Mode", L"All",
+                             mode, ARRAYSIZE(mode), s->iniPath);
+    if (_wcsicmp(mode, L"All") == 0) selection->selectedOnly = FALSE;
+    else {
+        selection->selectedOnly = TRUE;
+        /* An invalid explicit mode fails closed, rather than controlling all. */
+        if (_wcsicmp(mode, L"Selected") != 0) return;
+    }
+
+    int count = (int)GetPrivateProfileIntW(MONITOR_SELECTION_SECTION, L"Count", 0, s->iniPath);
+    if (count < 0) count = 0;
+    if (count > MAX_MONITORS) count = MAX_MONITORS;
+    for (int i = 0; i < count; i++) {
+        WCHAR field[16], key[MONITOR_SELECTION_KEY_LEN + 1];
+        StringCchPrintfW(field, ARRAYSIZE(field), L"Key%d", i);
+        DWORD length = GetPrivateProfileStringW(MONITOR_SELECTION_SECTION, field, L"",
+                                                key, ARRAYSIZE(key), s->iniPath);
+        /* A one-character larger read buffer distinguishes a valid maximum
+           length key from a truncated identity; never accept a shortened ID. */
+        if (length >= MONITOR_SELECTION_KEY_LEN || !Settings_MonitorKeyValid(key)) continue;
+        BOOL duplicate = FALSE;
+        for (int j = 0; j < selection->count; j++)
+            if (_wcsicmp(selection->keys[j], key) == 0) duplicate = TRUE;
+        if (duplicate) continue;
+        int index = selection->count++;
+        StringCchCopyW(selection->keys[index], MONITOR_SELECTION_KEY_LEN, key);
+        StringCchPrintfW(field, ARRAYSIZE(field), L"Name%d", i);
+        GetPrivateProfileStringW(MONITOR_SELECTION_SECTION, field, L"",
+                                 selection->names[index], ARRAYSIZE(selection->names[index]), s->iniPath);
+    }
+}
+
+static void SaveMonitorSelection(const Settings *s)
+{
+    const MonitorSelection *selection = &s->monitorSelection;
+    int savedIndices[MAX_MONITORS], count = 0;
+    WCHAR field[16], value[16];
+    WritePrivateProfileSectionW(MONITOR_SELECTION_SECTION, L"", s->iniPath);
+    WritePrivateProfileStringW(MONITOR_SELECTION_SECTION, L"Mode",
+                               selection->selectedOnly ? L"Selected" : L"All", s->iniPath);
+    for (int i = 0; i < selection->count && i < MAX_MONITORS; i++) {
+        if (!Settings_MonitorKeyValid(selection->keys[i])) continue;
+        BOOL duplicate = FALSE;
+        for (int j = 0; j < count; j++)
+            if (_wcsicmp(selection->keys[savedIndices[j]], selection->keys[i]) == 0) duplicate = TRUE;
+        if (duplicate) continue;
+        StringCchPrintfW(field, ARRAYSIZE(field), L"Key%d", count);
+        WritePrivateProfileStringW(MONITOR_SELECTION_SECTION, field, selection->keys[i], s->iniPath);
+        StringCchPrintfW(field, ARRAYSIZE(field), L"Name%d", count);
+        WritePrivateProfileStringW(MONITOR_SELECTION_SECTION, field, selection->names[i], s->iniPath);
+        savedIndices[count++] = i;
+    }
+    StringCchPrintfW(value, ARRAYSIZE(value), L"%d", count);
+    WritePrivateProfileStringW(MONITOR_SELECTION_SECTION, L"Count", value, s->iniPath);
 }
 
 void Settings_Load(Settings *s)
@@ -156,6 +220,7 @@ void Settings_Load(Settings *s)
         }
         Schedule_Sort(s->schedule, s->scheduleCount);
     }
+    LoadMonitorSelection(s);
 }
 
 void Settings_Save(Settings *s)
@@ -210,6 +275,7 @@ void Settings_Save(Settings *s)
         section[pos] = L'\0';  /* final terminator */
         WritePrivateProfileSectionW(L"Schedule", section, s->iniPath);
     }
+    SaveMonitorSelection(s);
 }
 
 static BOOL GetAutostartExecutable(WCHAR exePath[MAX_PATH])

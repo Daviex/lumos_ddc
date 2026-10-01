@@ -98,7 +98,10 @@ void UI_ShowScheduleEditor(HWND hwndOwner, Settings *s);
 
 /* Show the settings window. On Save it writes the edited values into *s and
    posts WM_COMMAND(IDM_SETTINGS_SAVED) to hwndOwner. */
-void UI_ShowSettings(HWND hwndOwner, Settings *s);
+void UI_ShowSettings(HWND hwndOwner, Settings *s, MonitorList *monitors);
+
+/* Route keyboard navigation to an open settings child dialog. */
+BOOL UI_HandleDialogMessage(MSG *message);
 
 /* About window dimensions */
 #define ABOUT_WIDTH     300

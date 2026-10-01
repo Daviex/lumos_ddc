@@ -4,20 +4,22 @@
 every filesystem, INI and registry API it uses to in-memory mocks. It verifies
 path bounds, quoted autostart commands, safe migration of legacy Run entries,
 API errors, idempotent disabling and the configured Day/Giorno preset lookup.
+Global monitor selections are also checked for INI round trips, legacy defaults,
+bounded identities, duplicates, disconnected displays and empty selections.
 Running it does not launch Lumos or change the registry or configuration files.
 
 From the repository root with a Windows Clang/MinGW toolchain in `PATH`:
 Create the `build` directory first if it does not exist.
 
 ```powershell
-clang -std=c11 -Wall -Wextra -Werror -DUNICODE -D_UNICODE tests/test_settings.c schedule.c -o build/test_settings.exe
+clang -std=c11 -Wall -Wextra -Werror -DUNICODE -D_UNICODE tests/test_settings.c schedule.c monitor_selection.c -o build/test_settings.exe
 ./build/test_settings.exe
 ```
 
 With MSVC from a developer command prompt:
 
 ```bat
-cl /nologo /std:c11 /W4 /DUNICODE /D_UNICODE tests\test_settings.c schedule.c /Fe:build\test_settings.exe /Fo"build\\"
+cl /nologo /std:c11 /W4 /DUNICODE /D_UNICODE tests\test_settings.c schedule.c monitor_selection.c /Fe:build\test_settings.exe /Fo"build\\"
 build\test_settings.exe
 ```
 
@@ -45,6 +47,8 @@ reads/writes/destruction, WMI and the worker. Enumeration is never invoked. It
 checks shared handle leases (including valid handle zero), queued ownership,
 nonblocking cleanup during enumeration, rejected invalid readings and scaling
 across the full 32-bit brightness range.
+Excluded displays are checked at the preview, DDC/WMI write, group and active
+monitor boundaries to ensure their brightness remains unchanged.
 
 ```powershell
 clang -std=c11 -Wall -Wextra -Werror -DUNICODE -D_UNICODE tests/test_monitor.c brightness.c -ldxva2 -luser32 -lgdi32 -ladvapi32 -o build/test_monitor.exe
@@ -60,8 +64,10 @@ build\test_monitor.exe
 APIs, renders the real popup into offscreen DIBs and simulates mouse
 messages. It verifies GDI resource reuse and cleanup, pixel stability, resize
 and allocation errors, the final drag value, capture loss, cancellation and
-master target bookkeeping. Window and monitor operations are mocked;
-no window is shown and no monitor or registry setting is changed.
+master target bookkeeping. Excluded sliders and delta controls cannot write, and the master operates only
+on the selected displays, including the case where none is available.
+Window and monitor operations are mocked; no window is shown and no monitor or
+registry setting is changed.
 
 ```powershell
 clang -std=c11 -Wall -Wextra -Werror -DUNICODE -D_UNICODE tests/test_ui.c brightness.c -o build/test_ui.exe -lgdi32 -luser32 -lshell32 -ldwmapi
@@ -91,8 +97,21 @@ launch behavior, Day priority until the next dated schedule anchor, idle and
 manual overrides, and recovery of the latest target after delayed monitor
 discovery, exhausted retries and failed writes. The application entry point is never called.
 Day lookup and registry migration are covered separately by `test_settings.c`.
+The real selection helpers also verify that login, presets, idle, schedule,
+hotkeys and reordered rescan results leave a second, excluded monitor unchanged.
 
 ```powershell
-clang -O2 -std=c11 -Wall -Wextra -Werror -DUNICODE -D_UNICODE -ffunction-sections -fdata-sections tests/test_startup.c brightness.c schedule.c '-Wl,--gc-sections' -lshell32 -o build/test_startup.exe
+clang -O2 -std=c11 -Wall -Wextra -Werror -DUNICODE -D_UNICODE -ffunction-sections -fdata-sections tests/test_startup.c brightness.c schedule.c monitor_selection.c '-Wl,--gc-sections' -lshell32 -o build/test_startup.exe
 ./build/test_startup.exe
+```
+
+`test_monitor_selection_ui.c` exercises the real picker and settings handlers
+with mocked window APIs. It checks All/custom choices, Apply/Cancel isolation,
+parent Save, retained offline selections, reordered displays, ambiguous identities,
+selection limits and keyboard navigation. It does not create windows or access
+hardware, the registry or configuration files.
+
+```powershell
+clang -O2 -std=c11 -Wall -Wextra -Werror -DUNICODE -D_UNICODE -ffunction-sections -fdata-sections tests/test_monitor_selection_ui.c monitor_selection.c schedule.c ui_graphics.c '-Wl,--gc-sections' -lgdi32 -luser32 -lshell32 -ldwmapi -lcomctl32 -o build/test_monitor_selection_ui.exe
+./build/test_monitor_selection_ui.exe
 ```

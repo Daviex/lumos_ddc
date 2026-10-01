@@ -9,6 +9,14 @@
 #define MAX_PRESET_NAME 64
 #define DEFAULT_DAY_BRIGHTNESS 80
 #define LUMOS_STARTUP_ARGUMENT L"--startup"
+#define MONITOR_SELECTION_KEY_LEN 260 /* backend prefix + 255-character identity + NUL */
+
+typedef struct {
+    BOOL selectedOnly; /* FALSE: all monitors; TRUE: only the saved stable keys */
+    int count;
+    WCHAR keys[MAX_MONITORS][MONITOR_SELECTION_KEY_LEN];
+    WCHAR names[MAX_MONITORS][128]; /* retained even while a selected monitor is offline */
+} MonitorSelection;
 
 typedef struct {
     WCHAR name[MAX_PRESET_NAME];
@@ -30,6 +38,7 @@ typedef struct {
     BOOL          idleDimEnabled;
     int           idleDimPercent;   /* level held while the session is idle (0-100) */
     int           idleDimMinutes;   /* idle time before dimming */
+    MonitorSelection monitorSelection;
 } Settings;
 
 /* Initialize settings path and load from INI */
@@ -48,6 +57,15 @@ void Settings_CreateDefaults(Settings *s);
    Giorno takes precedence over Day. The first match for each name wins, with
    DEFAULT_DAY_BRIGHTNESS used when neither name is present. */
 int Settings_DayBrightness(const Settings *s);
+
+/* Stable backend-prefixed keys, never a display name, index or physical handle.
+   Missing identity cannot match a custom selection. */
+BOOL Settings_MonitorKey(const BrightMonitor *monitor, WCHAR key[MONITOR_SELECTION_KEY_LEN]);
+BOOL Settings_MonitorKeyValid(const WCHAR *key);
+BOOL Settings_MonitorSelected(const MonitorSelection *selection, const BrightMonitor *monitor);
+/* Apply global scope without discarding saved offline entries. All matching
+   monitors are excluded when a selected identity is ambiguous in this list. */
+void Settings_ApplyMonitorSelection(const Settings *s, MonitorList *view);
 
 /* Toggle autostart registry entry; returns whether the change succeeded. */
 BOOL Settings_SetAutostart(BOOL enable);

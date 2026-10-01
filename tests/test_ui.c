@@ -19,8 +19,10 @@ static const HWND testWindow = (HWND)(UINT_PTR)1;
 static HWND testCapture;
 static LONG_PTR testUserData;
 static BOOL testVisible = TRUE;
-static int commits, setCalls, refreshCalls, manualCalls, lastRow, lastTarget;
+static int commits, setCalls, allCalls, refreshCalls, manualCalls, deltaSaves;
+static int lastRow, lastTarget;
 static BOOL failNextDC, failNextBrush, failNextCommit;
+static BOOL sawAllLabel, sawSelectedLabel, sawExcludedLabel;
 static MonitorList testMonitors;
 
 static BOOL WINAPI MockUpdateLayeredWindow(HWND, HDC, const POINT *, const SIZE *,
@@ -37,6 +39,7 @@ static HDC WINAPI MockCreateCompatibleDC(HDC);
 static HBRUSH WINAPI MockCreateSolidBrush(COLORREF);
 static BOOL WINAPI MockDeleteDC(HDC);
 static BOOL WINAPI MockDeleteObject(HGDIOBJ);
+static int WINAPI MockDrawTextW(HDC, LPCWSTR, int, LPRECT, UINT);
 
 #undef GetWindowLongPtrW
 #undef SetWindowLongPtrW
@@ -52,6 +55,7 @@ static BOOL WINAPI MockDeleteObject(HGDIOBJ);
 #define CreateSolidBrush MockCreateSolidBrush
 #define DeleteDC MockDeleteDC
 #define DeleteObject MockDeleteObject
+#define DrawTextW MockDrawTextW
 #include "../ui_graphics.c"
 #include "../ui_popup.c"
 #undef UpdateLayeredWindow
@@ -66,6 +70,7 @@ static BOOL WINAPI MockDeleteObject(HGDIOBJ);
 #undef CreateSolidBrush
 #undef DeleteDC
 #undef DeleteObject
+#undef DrawTextW
 
 static BOOL WINAPI MockUpdateLayeredWindow(HWND hwnd, HDC destination,
                                           const POINT *position, const SIZE *size,
@@ -146,11 +151,23 @@ static BOOL WINAPI MockDeleteObject(HGDIOBJ object)
     return result;
 }
 
+static int WINAPI MockDrawTextW(HDC dc, LPCWSTR text, int length,
+                               LPRECT rectangle, UINT format)
+{
+    if (length == -1) {
+        if (wcscmp(text, L"All Monitors") == 0) sawAllLabel = TRUE;
+        if (wcscmp(text, L"Selected Monitors") == 0) sawSelectedLabel = TRUE;
+        if (wcsstr(text, L"(excluded)")) sawExcludedLabel = TRUE;
+    }
+    return DrawTextW(dc, text, length, rectangle, format);
+}
+
 BOOL Monitor_SetBrightness(BrightMonitor *monitor, DWORD percent)
 {
     CHECK(monitor >= testMonitors.monitors &&
           monitor < testMonitors.monitors + testMonitors.count);
     CHECK(percent <= 100);
+    CHECK(Monitor_CanControl(monitor));
     setCalls++;
     monitor->brightnessCur = monitor->brightnessMin +
         ((monitor->brightnessMax - monitor->brightnessMin) * percent) / 100;
@@ -160,7 +177,9 @@ BOOL Monitor_SetBrightness(BrightMonitor *monitor, DWORD percent)
 void Monitor_SetAllBrightness(MonitorList *view, int target)
 {
     CHECK(view == &testMonitors);
+    allCalls++;
     for (int i = 0; i < view->count; i++) {
+        if (!Monitor_CanControl(&view->monitors[i])) continue;
         int percent = target + view->monitors[i].delta;
         if (percent < 0) percent = 0;
         if (percent > 100) percent = 100;
@@ -185,6 +204,8 @@ static void ManualChange(int row, int target)
                        testMonitors.monitors[row].delta);
 }
 
+static void SaveDelta(void) { deltaSaves++; }
+
 static void ResetPopup(int count)
 {
     ReleasePopupRenderCache();
@@ -207,9 +228,11 @@ static void ResetPopup(int count)
     testUserData = (LONG_PTR)&g_popupData;
     testCapture = NULL;
     testVisible = TRUE;
-    commits = setCalls = refreshCalls = manualCalls = 0;
+    commits = setCalls = allCalls = refreshCalls = manualCalls = deltaSaves = 0;
+    sawAllLabel = sawSelectedLabel = sawExcludedLabel = FALSE;
     failNextDC = failNextBrush = failNextCommit = FALSE;
     UI_SetManualChangeCallback(ManualChange);
+    UI_SetDeltaSaveCallback(SaveDelta);
 }
 
 static LPARAM SliderPosition(int row, int percent)
@@ -385,11 +408,105 @@ static void TestMasterTarget(void)
     puts("PASS master target stays authoritative with delta and clamping");
 }
 
+static LPARAM DeltaPosition(int row, BOOL plus)
+{
+    RECT minus, value, positive;
+    GetDeltaButtonRects(row, &minus, &value, &positive);
+    RECT button = plus ? positive : minus;
+    return MAKELPARAM((button.left + button.right) / 2,
+                     (button.top + button.bottom) / 2);
+}
+
+static void TestMonitorSelection(void)
+{
+    ResetPopup(2);
+    RenderPopup(testWindow, &g_popupData);
+    CHECK(sawAllLabel && !sawSelectedLabel && !sawExcludedLabel);
+    DWORD objects = GdiObjectCount();
+    int oldCommits = commits;
+    testMonitors.selectedOnly = TRUE;
+    testMonitors.monitors[1].excludedFromControl = TRUE;
+    UI_RefreshPopup(testWindow, &testMonitors);
+    CHECK(commits == oldCommits + 1 && GdiObjectCount() == objects);
+    CHECK(sawSelectedLabel && sawExcludedLabel);
+    CHECK(g_popupRender.frame.selectedOnly);
+    CHECK(g_popupRender.frame.enabled[0] && !g_popupRender.frame.enabled[1]);
+    CHECK(g_popupRender.frame.enabled[2] && g_popupRender.frame.excluded[1]);
+
+    PopupWndProc(testWindow, WM_LBUTTONDOWN, MK_LBUTTON, SliderPosition(1, 100));
+    CHECK(g_popupData.activeSlider == -1 && testCapture == NULL);
+    CHECK(setCalls == 0 && allCalls == 0 && manualCalls == 0);
+    PopupWndProc(testWindow, WM_LBUTTONDOWN, MK_LBUTTON, DeltaPosition(1, TRUE));
+    CHECK(testMonitors.monitors[1].delta == 0 && deltaSaves == 0);
+    ApplySliderValue(&g_popupData, 1, 0); /* Direct callers are guarded as well. */
+    CHECK(setCalls == 0 && manualCalls == 0 && refreshCalls == 0);
+
+    PopupWndProc(testWindow, WM_LBUTTONDOWN, MK_LBUTTON, SliderPosition(2, 100));
+    PopupWndProc(testWindow, WM_LBUTTONUP, 0, SliderPosition(2, 100));
+    CHECK(lastRow == -1 && lastTarget == 100 && allCalls == 2 && setCalls == 2);
+    CHECK(testMonitors.monitors[0].brightnessCur == 100);
+    CHECK(testMonitors.monitors[1].brightnessCur == 50 && manualCalls == 2);
+    PopupWndProc(testWindow, WM_LBUTTONDOWN, MK_LBUTTON, DeltaPosition(0, TRUE));
+    CHECK(testMonitors.monitors[0].delta == 1 && deltaSaves == 1);
+    CHECK(manualCalls == 2); /* Calibration retains its existing callback policy. */
+
+    testMonitors.monitors[1].excludedFromControl = FALSE;
+    UI_RefreshPopup(testWindow, &testMonitors);
+    CHECK(g_popupRender.frame.enabled[1] && g_popupRender.frame.selectedOnly);
+    sawAllLabel = FALSE;
+    oldCommits = commits;
+    testMonitors.selectedOnly = FALSE;
+    UI_RefreshPopup(testWindow, &testMonitors);
+    CHECK(commits == oldCommits + 1 && sawAllLabel);
+    ReleasePopupRenderCache();
+    puts("PASS selected popup labels, disabled exclusions and selected master writes");
+}
+
+static void TestNoEligibleControls(void)
+{
+    ResetPopup(2);
+    testMonitors.selectedOnly = TRUE;
+    testMonitors.monitors[0].excludedFromControl = TRUE;
+    testMonitors.monitors[1].excludedFromControl = TRUE;
+    UI_RefreshPopup(testWindow, &testMonitors);
+    CHECK(!g_popupRender.frame.enabled[0] && !g_popupRender.frame.enabled[1]);
+    CHECK(!g_popupRender.frame.enabled[2]);
+    PopupWndProc(testWindow, WM_LBUTTONDOWN, MK_LBUTTON, SliderPosition(2, 100));
+    ApplySliderValue(&g_popupData, 2, 100);
+    PopupWndProc(testWindow, WM_LBUTTONDOWN, MK_LBUTTON, DeltaPosition(0, FALSE));
+    CHECK(g_popupData.activeSlider == -1 && testCapture == NULL);
+    CHECK(setCalls == 0 && allCalls == 0 && manualCalls == 0 && deltaSaves == 0);
+
+    ResetPopup(1);
+    testMonitors.monitors[0].controllable = FALSE;
+    PopupWndProc(testWindow, WM_LBUTTONDOWN, MK_LBUTTON, SliderPosition(0, 100));
+    PopupWndProc(testWindow, WM_LBUTTONDOWN, MK_LBUTTON, SliderPosition(1, 100));
+    PopupWndProc(testWindow, WM_LBUTTONDOWN, MK_LBUTTON, DeltaPosition(0, TRUE));
+    CHECK(setCalls == 0 && allCalls == 0 && manualCalls == 0 && deltaSaves == 0);
+
+    ResetPopup(0);
+    PopupWndProc(testWindow, WM_LBUTTONDOWN, MK_LBUTTON, SliderPosition(0, 100));
+    CHECK(setCalls == 0 && allCalls == 0 && manualCalls == 0 && testCapture == NULL);
+
+    ResetPopup(1);
+    PopupWndProc(testWindow, WM_LBUTTONDOWN, MK_LBUTTON, SliderPosition(0, 0));
+    int oldSets = setCalls, oldManual = manualCalls;
+    testMonitors.monitors[0].excludedFromControl = TRUE;
+    PopupWndProc(testWindow, WM_MOUSEMOVE, MK_LBUTTON, SliderPosition(0, 100));
+    PopupWndProc(testWindow, WM_LBUTTONUP, 0, SliderPosition(0, 100));
+    CHECK(setCalls == oldSets && manualCalls == oldManual);
+    CHECK(g_popupData.activeSlider == -1 && testCapture == NULL);
+    ReleasePopupRenderCache();
+    puts("PASS no eligible monitor means no slider/delta requests or manual callbacks");
+}
+
 int main(void)
 {
     TestRenderCache();
     TestDragFinalValue();
     TestMasterTarget();
+    TestMonitorSelection();
+    TestNoEligibleControls();
     ReleasePopupRenderCache();
     printf("UI tests: %s\n", failures ? "FAIL" : "ALL PASS");
     return failures ? 1 : 0;

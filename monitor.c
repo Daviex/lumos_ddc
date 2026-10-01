@@ -554,7 +554,7 @@ DWORD Monitor_RefreshBrightnessSync(MonitorList *ml)
 
 BOOL Monitor_SetBrightnessSync(BrightMonitor *mon, DWORD percent)
 {
-    if (!mon->controllable)
+    if (!Monitor_CanControl(mon))
         return FALSE;
 
     if (percent > 100) percent = 100;
@@ -588,12 +588,13 @@ BOOL Monitor_SetBrightnessSync(BrightMonitor *mon, DWORD percent)
 
 void Monitor_PreviewBrightness(BrightMonitor *mon, DWORD percent)
 {
+    if (!Monitor_CanControl(mon)) return;
     mon->brightnessCur = Brightness_ToRaw(mon, percent);
 }
 
 BOOL Monitor_SetBrightness(BrightMonitor *mon, DWORD percent)
 {
-    if (!mon->controllable) return FALSE;
+    if (!Monitor_CanControl(mon)) return FALSE;
     if (percent > 100) percent = 100;
     if (!MonitorWorker_Running()) return Monitor_SetBrightnessSync(mon, percent);
     if (!MonitorWorker_Set(mon, percent)) return FALSE;
@@ -618,6 +619,7 @@ BOOL Monitor_HasControllable(const MonitorList *ml)
 void Monitor_SetAllBrightness(MonitorList *ml, int percent)
 {
     for (int i = 0; i < ml->count; i++) {
+        if (!Monitor_CanControl(&ml->monitors[i])) continue;
         int adj = percent + ml->monitors[i].delta;
         if (adj < 0) adj = 0;
         if (adj > 100) adj = 100;
@@ -632,7 +634,7 @@ void Monitor_AdjustActive(MonitorList *ml, int delta)
         ml->active = 0;
 
     BrightMonitor *mon = &ml->monitors[ml->active];
-    if (!mon->controllable) return;
+    if (!Monitor_CanControl(mon)) return;
 
     int pct = Brightness_GetPercent(mon) + delta;
     if (pct < 0) pct = 0;
@@ -644,11 +646,15 @@ void Monitor_AdjustActive(MonitorList *ml, int delta)
 
 void Monitor_CycleActive(MonitorList *ml, int direction)
 {
-    if (ml->count <= 1) return;
+    if (ml->count == 0) return;
     Log("CycleActive: %d dir=%d", ml->active, direction);
-    ml->active += direction;
-    if (ml->active < 0)
-        ml->active = ml->count - 1;
-    if (ml->active >= ml->count)
-        ml->active = 0;
+    int index = ml->active;
+    if (index < 0 || index >= ml->count) index = 0;
+    for (int i = 0; i < ml->count; i++) {
+        index = (index + (direction < 0 ? ml->count - 1 : 1)) % ml->count;
+        if (Monitor_CanControl(&ml->monitors[index])) {
+            ml->active = index;
+            return;
+        }
+    }
 }

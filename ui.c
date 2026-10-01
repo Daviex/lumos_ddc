@@ -1,5 +1,6 @@
 #include "ui.h"
 #include "ui_graphics.h"
+#include "ui_monitor_selection.h"
 #include "resource.h"
 #include <shellapi.h>
 #include <dwmapi.h>
@@ -718,11 +719,11 @@ static LRESULT CALLBACK SchedWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
 
 /* Rows are data, not code: the table below drives rendering, hit testing and
    editing, so adding a setting later is one BuildSettingsRows line. */
-enum { SET_SECTION = 0, SET_TOGGLE, SET_NUMBER };
+enum { SET_SECTION = 0, SET_TOGGLE, SET_NUMBER, SET_MONITORS };
 enum { SET_UNIT_PLAIN = 0, SET_UNIT_PERCENT, SET_UNIT_MINUTES };
 
 /* Hit kinds returned by SetHitTest. */
-enum { SETHIT_NONE = 0, SETHIT_MINUS, SETHIT_PLUS, SETHIT_TOGGLE, SETHIT_ROW };
+enum { SETHIT_NONE = 0, SETHIT_MINUS, SETHIT_PLUS, SETHIT_TOGGLE, SETHIT_ROW, SETHIT_MONITORS };
 
 typedef struct {
     int    kind;
@@ -747,10 +748,14 @@ typedef struct {
     int   idleDimMinutes;
     int   presetValues[MAX_PRESETS];
     int   presetCount;
+    MonitorSelection monitorSelection;
+    MonitorList *monitors;
+    BOOL selectionOpen;
 
     SetRow rows[MAX_SET_ROWS];
     int    rowCount;
     int    hoverRow;
+    int    keyboardRow; /* rowCount denotes Save, -1 means mouse navigation */
     Settings *settings;
     HWND   owner;
 } SetEditData;
@@ -792,6 +797,7 @@ static void BuildSettingsRows(SetEditData *d)
     SetAddRow(d, SET_SECTION, L"GENERAL");
     SetAddNumber(d, L"Brightness step", &d->step, 1, 50, 1, SET_UNIT_PERCENT);
     SetAddToggle(d, L"Start with Windows", &d->autostart);
+    SetAddRow(d, SET_MONITORS, L"Choose Monitors");
 
     SetAddRow(d, SET_SECTION, L"IDLE DIM");
     SetAddToggle(d, L"Dim when idle", &d->idleDimEnabled);
@@ -880,6 +886,11 @@ static int SetHitTest(SetEditData *d, int x, int y, int *outHit)
         int rh = SetRowHeight(r);
         if (y >= top && y < top + rh) {
             if (r->kind == SET_SECTION) return -1;
+            if (r->kind == SET_MONITORS) {
+                if (x < 12 || x > SET_WIDTH - 12) return -1;
+                *outHit = SETHIT_MONITORS;
+                return i;
+            }
             if (r->kind == SET_TOGGLE) {
                 RECT rc;
                 SetToggleRect(top, &rc);
@@ -898,6 +909,12 @@ static int SetHitTest(SetEditData *d, int x, int y, int *outHit)
     return -1;
 }
 
+static BOOL SetCanSave(const SetEditData *d)
+{
+    return !d->monitorSelection.selectedOnly ||
+           (d->monitorSelection.count > 0 && d->monitorSelection.count <= MAX_MONITORS);
+}
+
 static void RenderSettings(HWND hwnd, SetEditData *d)
 {
     int w = SET_WIDTH;
@@ -906,6 +923,7 @@ static void RenderSettings(HWND hwnd, SetEditData *d)
     BYTE *bits = NULL;
     HBITMAP bmp = NULL;
     HDC dc = UI_CreateAlphaDC(w, h, &bmp, &bits);
+    if (!dc) return;
 
     HBRUSH bg = CreateSolidBrush(UI_ColorRef(CLR_BG));
     RECT rcAll = { 0, 0, w, h };
@@ -925,12 +943,12 @@ static void RenderSettings(HWND hwnd, SetEditData *d)
 
     /* Title + hint */
     RECT rcTitle = { 16, 12, w - 16, 32 };
-    SelectObject(dc, hFontBold);
+    HFONT oldFont = (HFONT)SelectObject(dc, hFontBold);
     SetTextColor(dc, UI_ColorRef(CLR_TEXT));
     DrawTextW(dc, L"Settings", -1, &rcTitle, DT_LEFT | DT_SINGLELINE);
     SelectObject(dc, hFontSmall);
     SetTextColor(dc, UI_ColorRef(CLR_SUBTEXT));
-    DrawTextW(dc, L"wheel = adjust", -1, &rcTitle, DT_RIGHT | DT_SINGLELINE);
+    DrawTextW(dc, L"Tab / wheel", -1, &rcTitle, DT_RIGHT | DT_SINGLELINE);
 
     HPEN noPen = CreatePen(PS_NULL, 0, 0);
     HPEN oldPen = (HPEN)SelectObject(dc, noPen);
@@ -948,12 +966,30 @@ static void RenderSettings(HWND hwnd, SetEditData *d)
             continue;
         }
 
-        if (i == d->hoverRow) {
+        if (i == d->hoverRow || i == d->keyboardRow || r->kind == SET_MONITORS) {
             HBRUSH hb = CreateSolidBrush(UI_ColorRef(CLR_SURFACE));
             HBRUSH ob = (HBRUSH)SelectObject(dc, hb);
             RoundRect(dc, 8, y + 2, w - 8, y + SET_ROW_H - 2, 8, 8);
             SelectObject(dc, ob);
             DeleteObject(hb);
+        }
+
+        if (r->kind == SET_MONITORS) {
+            RECT label = { 16, y, w - 112, y + SET_ROW_H };
+            RECT summary = { w - 116, y, w - 16, y + SET_ROW_H };
+            WCHAR text[32];
+            if (d->monitorSelection.selectedOnly)
+                wsprintfW(text, L"%d selected", d->monitorSelection.count);
+            else
+                lstrcpyW(text, L"All Monitors");
+            SelectObject(dc, hFont);
+            SetTextColor(dc, UI_ColorRef(CLR_TEXT));
+            DrawTextW(dc, r->label, -1, &label, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+            SelectObject(dc, hFontSmall);
+            SetTextColor(dc, UI_ColorRef(CLR_ACCENT));
+            DrawTextW(dc, text, -1, &summary, DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
+            y += SET_ROW_H;
+            continue;
         }
 
         RECT rcLabel = { 16, y, w - 124, y + SET_ROW_H };
@@ -1009,23 +1045,29 @@ static void RenderSettings(HWND hwnd, SetEditData *d)
     /* Footer: Save on the right, cancel hint on the left */
     RECT rcSave;
     SetSaveRect(d, &rcSave);
-    HBRUSH acc = CreateSolidBrush(UI_ColorRef(CLR_ACCENT));
+    BOOL canSave = SetCanSave(d);
+    HBRUSH acc = CreateSolidBrush(UI_ColorRef(canSave ? CLR_ACCENT : CLR_TRACK));
     HBRUSH oldBr = (HBRUSH)SelectObject(dc, acc);
     RoundRect(dc, rcSave.left, rcSave.top, rcSave.right, rcSave.bottom, 8, 8);
     SelectObject(dc, oldBr);
     DeleteObject(acc);
 
     SelectObject(dc, hFont);
-    SetTextColor(dc, UI_ColorRef(CLR_BG));
+    SetTextColor(dc, UI_ColorRef(canSave ? CLR_BG : CLR_SUBTEXT));
     DrawTextW(dc, L"Save", -1, &rcSave, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    if (d->keyboardRow == d->rowCount) {
+        RECT focus = { rcSave.left + 4, rcSave.top + 4, rcSave.right - 4, rcSave.bottom - 4 };
+        DrawFocusRect(dc, &focus);
+    }
 
     RECT rcNote = { 16, rcSave.top, rcSave.left - 8, rcSave.bottom };
     SelectObject(dc, hFontSmall);
     SetTextColor(dc, UI_ColorRef(CLR_SUBTEXT));
-    DrawTextW(dc, L"click outside to cancel", -1, &rcNote,
+    DrawTextW(dc, canSave ? L"Esc to cancel" : L"Select at least one", -1, &rcNote,
               DT_LEFT | DT_VCENTER | DT_SINGLELINE);
 
     SelectObject(dc, oldPen);
+    SelectObject(dc, oldFont);
     DeleteObject(noPen);
     DeleteObject(hFont);
     DeleteObject(hFontBold);
@@ -1034,8 +1076,8 @@ static void RenderSettings(HWND hwnd, SetEditData *d)
     UI_ApplyRoundedMask(bits, w, h, SET_CORNER, 245);
     UI_CommitLayered(hwnd, dc, w, h);
 
-    DeleteObject(bmp);
     DeleteDC(dc);
+    DeleteObject(bmp);
 }
 
 /* Copy the working values back into Settings. Only the fields this window owns
@@ -1049,8 +1091,44 @@ static void SetCommit(SetEditData *d)
     s->idleDimEnabled  = d->idleDimEnabled;
     s->idleDimPercent  = d->idleDimPercent;
     s->idleDimMinutes  = d->idleDimMinutes;
+    s->monitorSelection = d->monitorSelection;
     for (int i = 0; i < d->presetCount && i < s->presetCount; i++)
         s->presets[i].brightness = (DWORD)d->presetValues[i];
+}
+
+static void SetSelectionClosed(BOOL applied)
+{
+    (void)applied;
+    g_set.selectionOpen = FALSE;
+    if (g_setHwnd) RenderSettings(g_setHwnd, &g_set);
+}
+
+static void SetChooseMonitors(HWND hwnd, SetEditData *d)
+{
+    d->selectionOpen = TRUE; /* activation changes while the child is being created */
+    if (!UI_ShowMonitorSelection(hwnd, &d->monitorSelection, d->monitors, SetSelectionClosed)) {
+        d->selectionOpen = FALSE;
+        RenderSettings(hwnd, d);
+    }
+}
+
+static void SetSave(HWND hwnd, SetEditData *d)
+{
+    if (!SetCanSave(d)) return;
+    SetCommit(d);
+    HWND owner = d->owner;
+    DestroyWindow(hwnd);
+    PostMessageW(owner, WM_COMMAND, (WPARAM)IDM_SETTINGS_SAVED, 0);
+}
+
+static void SetMoveKeyboard(SetEditData *d, int direction)
+{
+    int row = d->keyboardRow;
+    if (row < 0) row = direction > 0 ? -1 : 0;
+    do {
+        row = (row + direction + d->rowCount + 1) % (d->rowCount + 1);
+    } while (row < d->rowCount && d->rows[row].kind == SET_SECTION);
+    d->keyboardRow = row;
 }
 
 static LRESULT CALLBACK SetWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
@@ -1064,18 +1142,16 @@ static LRESULT CALLBACK SetWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
         RECT rcSave;
         SetSaveRect(d, &rcSave);
         if (x >= rcSave.left && x <= rcSave.right && y >= rcSave.top && y <= rcSave.bottom) {
-            SetCommit(d);
-            HWND owner = d->owner;
-            DestroyWindow(hwnd);
-            g_setHwnd = NULL;
-            PostMessageW(owner, WM_COMMAND, (WPARAM)IDM_SETTINGS_SAVED, 0);
+            SetSave(hwnd, d);
             return 0;
         }
 
         int hit;
         int row = SetHitTest(d, x, y, &hit);
         if (row >= 0) {
+            d->keyboardRow = -1;
             SetRow *r = &d->rows[row];
+            if (hit == SETHIT_MONITORS) { SetChooseMonitors(hwnd, d); return 0; }
             if (hit == SETHIT_TOGGLE && r->bval) *r->bval = !*r->bval;
             else if (hit == SETHIT_MINUS)        SetAdjust(r, -1);
             else if (hit == SETHIT_PLUS)         SetAdjust(r, +1);
@@ -1109,8 +1185,31 @@ static LRESULT CALLBACK SetWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
         return 0;
     }
 
+    case WM_KEYDOWN:
+        if (wParam == VK_ESCAPE) { DestroyWindow(hwnd); return 0; }
+        if (wParam == VK_TAB) {
+            SetMoveKeyboard(d, GetKeyState(VK_SHIFT) < 0 ? -1 : 1);
+            RenderSettings(hwnd, d);
+            return 0;
+        }
+        if (d->keyboardRow == d->rowCount && (wParam == VK_RETURN || wParam == VK_SPACE)) {
+            SetSave(hwnd, d);
+            return 0;
+        }
+        if (d->keyboardRow >= 0 && d->keyboardRow < d->rowCount) {
+            SetRow *r = &d->rows[d->keyboardRow];
+            if (wParam == VK_RETURN || wParam == VK_SPACE) {
+                if (r->kind == SET_MONITORS) { SetChooseMonitors(hwnd, d); return 0; }
+                if (r->kind == SET_TOGGLE && r->bval) *r->bval = !*r->bval;
+            } else if (wParam == VK_LEFT || wParam == VK_RIGHT) {
+                SetAdjust(r, wParam == VK_RIGHT ? 1 : -1);
+            }
+            RenderSettings(hwnd, d);
+        }
+        return 0;
+
     case WM_ACTIVATE:
-        if (LOWORD(wParam) == WA_INACTIVE) {
+        if (LOWORD(wParam) == WA_INACTIVE && !d->selectionOpen) {
             /* Dismiss without saving on click-outside, like the schedule editor. */
             DestroyWindow(hwnd);
             g_setHwnd = NULL;
@@ -1119,6 +1218,7 @@ static LRESULT CALLBACK SetWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
 
     case WM_DESTROY:
         g_setHwnd = NULL;
+        UI_CloseMonitorSelection();
         return 0;
 
     default:
@@ -1134,6 +1234,7 @@ BOOL UI_Init(HINSTANCE hInst)
     g_hInst = hInst;
 
     if (!UI_PopupInit(hInst)) return FALSE;
+    if (!UI_MonitorSelectionInit(hInst)) return FALSE;
 
     WNDCLASSEXW wcOsd = { 0 };
     wcOsd.cbSize = sizeof(wcOsd);
@@ -1179,6 +1280,7 @@ BOOL UI_Init(HINSTANCE hInst)
 
 void UI_Shutdown(void)
 {
+    UI_CloseMonitorSelection();
     UI_PopupShutdown();
     if (g_ctxHwnd) {
         DestroyWindow(g_ctxHwnd);
@@ -1327,7 +1429,7 @@ void UI_ShowScheduleEditor(HWND hwndOwner, Settings *s)
     SetForegroundWindow(g_schedHwnd);
 }
 
-void UI_ShowSettings(HWND hwndOwner, Settings *s)
+void UI_ShowSettings(HWND hwndOwner, Settings *s, MonitorList *monitors)
 {
     if (g_setHwnd && IsWindow(g_setHwnd)) {
         DestroyWindow(g_setHwnd);
@@ -1338,6 +1440,9 @@ void UI_ShowSettings(HWND hwndOwner, Settings *s)
     g_set.settings = s;
     g_set.owner = hwndOwner;
     g_set.hoverRow = -1;
+    g_set.keyboardRow = -1;
+    g_set.monitors = monitors;
+    g_set.monitorSelection = s->monitorSelection;
     g_set.step = s->step;
     g_set.autostart = Settings_GetAutostart();   /* the registry is the truth here */
     g_set.scheduleEnabled = s->scheduleEnabled;
@@ -1376,6 +1481,11 @@ void UI_ShowSettings(HWND hwndOwner, Settings *s)
     RenderSettings(g_setHwnd, &g_set);
     ShowWindow(g_setHwnd, SW_SHOWNOACTIVATE);
     SetForegroundWindow(g_setHwnd);
+}
+
+BOOL UI_HandleDialogMessage(MSG *message)
+{
+    return UI_MonitorSelectionMessage(message);
 }
 
 /* ---- About window ---- */

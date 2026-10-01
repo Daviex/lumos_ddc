@@ -29,6 +29,11 @@ static struct {
     DWORD commandBytes;
     WCHAR queryValue[MAX_PATH + 64];
     DWORD queryType, queryBytes;
+    struct {
+        WCHAR field[24];
+        WCHAR value[MONITOR_SELECTION_KEY_LEN + 32];
+    } selectionValues[MAX_MONITORS * 2 + 8];
+    int selectionValueCount;
 } mock;
 
 static void ResetMocks(void)
@@ -66,12 +71,36 @@ static DWORD WINAPI MockGetFileAttributesW(LPCWSTR path)
     return INVALID_FILE_ATTRIBUTES;  /* Exercise default INI creation too. */
 }
 
+static const WCHAR *SelectionIniValue(const WCHAR *field)
+{
+    for (int i = 0; i < mock.selectionValueCount; i++)
+        if (_wcsicmp(mock.selectionValues[i].field, field) == 0)
+            return mock.selectionValues[i].value;
+    return NULL;
+}
+
+static void PutSelectionIni(const WCHAR *field, const WCHAR *value)
+{
+    int index = 0;
+    for (; index < mock.selectionValueCount; index++)
+        if (_wcsicmp(mock.selectionValues[index].field, field) == 0) break;
+    CHECK(index < (int)ARRAYSIZE(mock.selectionValues));
+    if (index >= (int)ARRAYSIZE(mock.selectionValues)) return;
+    if (index == mock.selectionValueCount) mock.selectionValueCount++;
+    CHECK(SUCCEEDED(StringCchCopyW(mock.selectionValues[index].field,
+                                   ARRAYSIZE(mock.selectionValues[index].field), field)));
+    CHECK(SUCCEEDED(StringCchCopyW(mock.selectionValues[index].value,
+                                   ARRAYSIZE(mock.selectionValues[index].value), value)));
+}
+
 static BOOL WINAPI MockWritePrivateProfileStringW(LPCWSTR section, LPCWSTR key,
                                                  LPCWSTR value, LPCWSTR path)
 {
     if (section && key && value && wcscmp(section, L"Presets") == 0 &&
         wcscmp(key, L"Day") == 0)
         CHECK(SUCCEEDED(StringCchCopyW(mock.defaultDayValue, ARRAYSIZE(mock.defaultDayValue), value)));
+    if (section && key && value && wcscmp(section, L"MonitorSelection") == 0)
+        PutSelectionIni(key, value);
     CHECK(SUCCEEDED(StringCchCopyW(mock.iniWritePath, ARRAYSIZE(mock.iniWritePath), path)));
     return TRUE;
 }
@@ -79,7 +108,11 @@ static BOOL WINAPI MockWritePrivateProfileStringW(LPCWSTR section, LPCWSTR key,
 static BOOL WINAPI MockWritePrivateProfileSectionW(LPCWSTR section, LPCWSTR values,
                                                   LPCWSTR path)
 {
-    (void)section; (void)values; (void)path;
+    (void)path;
+    if (wcscmp(section, L"MonitorSelection") == 0) {
+        CHECK(values[0] == L'\0');
+        mock.selectionValueCount = 0;
+    }
     return TRUE;
 }
 
@@ -87,15 +120,24 @@ static DWORD WINAPI MockGetPrivateProfileStringW(LPCWSTR section, LPCWSTR key,
                                                 LPCWSTR fallback, LPWSTR buffer,
                                                 DWORD capacity, LPCWSTR path)
 {
-    (void)section; (void)key; (void)fallback; (void)path;
-    if (capacity) buffer[0] = L'\0';
-    return 0;
+    (void)path;
+    if (!capacity) return 0;
+    if (!key) { buffer[0] = L'\0'; return 0; }
+    const WCHAR *value = wcscmp(section, L"MonitorSelection") == 0 ? SelectionIniValue(key) : NULL;
+    if (!value) value = fallback;
+    size_t length = wcslen(value);
+    if (length >= capacity) length = capacity - 1;
+    memcpy(buffer, value, length * sizeof(WCHAR));
+    buffer[length] = L'\0';
+    return (DWORD)length;
 }
 
 static UINT WINAPI MockGetPrivateProfileIntW(LPCWSTR section, LPCWSTR key,
                                             INT fallback, LPCWSTR path)
 {
-    (void)section; (void)key; (void)path;
+    (void)path;
+    const WCHAR *value = wcscmp(section, L"MonitorSelection") == 0 ? SelectionIniValue(key) : NULL;
+    if (value) return (UINT)_wtoi(value);
     return (UINT)fallback;
 }
 
@@ -500,6 +542,193 @@ static void TestAutostartUpgradeErrors(void)
     CheckNoAutostartWrite();
 }
 
+static BrightMonitor SelectionMonitor(MonitorBackend backend, const WCHAR *identity)
+{
+    BrightMonitor monitor = { 0 };
+    monitor.backend = backend;
+    monitor.controllable = TRUE;
+    monitor.brightnessMax = 100;
+    wcscpy(monitor.name, L"Same display name");
+    if (backend == BACKEND_DDC)
+        StringCchCopyW(monitor.deviceInstance, ARRAYSIZE(monitor.deviceInstance), identity);
+    if (backend == BACKEND_WMI)
+        StringCchCopyW(monitor.wmiInstance, ARRAYSIZE(monitor.wmiInstance), identity);
+    return monitor;
+}
+
+static void TestMonitorSelectionKeys(void)
+{
+    BrightMonitor monitor = SelectionMonitor(BACKEND_DDC, L"DISPLAY\\DDC1");
+    MonitorSelection selection = { 0 };
+    WCHAR key[MONITOR_SELECTION_KEY_LEN];
+    CHECK(Settings_MonitorKey(&monitor, key));
+    CHECK(wcscmp(key, L"DDC:DISPLAY\\DDC1") == 0);
+    CHECK(Settings_MonitorSelected(&selection, &monitor));
+    selection.selectedOnly = TRUE;
+    CHECK(!Settings_MonitorSelected(&selection, &monitor)); /* Custom empty is not All. */
+    selection.count = 1;
+    wcscpy(selection.keys[0], L"ddc:display\\ddc1");
+    CHECK(Settings_MonitorSelected(&selection, &monitor));
+    monitor = SelectionMonitor(BACKEND_WMI, L"DISPLAY\\DDC1");
+    CHECK(Settings_MonitorKey(&monitor, key));
+    CHECK(wcscmp(key, L"WMI:DISPLAY\\DDC1") == 0);
+    CHECK(!Settings_MonitorSelected(&selection, &monitor)); /* Backend prefixes differ. */
+    monitor = SelectionMonitor(BACKEND_DDC, L"");
+    monitor.hPhysical = (HANDLE)(UINT_PTR)1;
+    monitor.hMonitor = (HMONITOR)(UINT_PTR)1;
+    CHECK(!Settings_MonitorKey(&monitor, key) && key[0] == L'\0');
+    CHECK(!Settings_MonitorSelected(&selection, &monitor)); /* Never name/index/handle fallback. */
+    monitor = SelectionMonitor(BACKEND_NONE, L"DISPLAY\\DDC1");
+    CHECK(!Settings_MonitorKey(&monitor, key));
+    monitor = SelectionMonitor(BACKEND_DDC, L"DISPLAY\\DDC1\nInjected=1");
+    CHECK(!Settings_MonitorKey(&monitor, key));
+    monitor = SelectionMonitor(BACKEND_DDC, L"");
+    FillMockPath(monitor.deviceInstance, 255);
+    CHECK(Settings_MonitorKey(&monitor, key) && wcslen(key) == 259);
+    for (size_t i = 0; i < ARRAYSIZE(monitor.deviceInstance); i++) monitor.deviceInstance[i] = L'a';
+    CHECK(!Settings_MonitorKey(&monitor, key) && key[0] == L'\0');
+}
+
+static void TestApplyMonitorSelection(void)
+{
+    Settings settings = { 0 };
+    MonitorList view = { 0 };
+    view.count = 3;
+    view.monitors[0] = SelectionMonitor(BACKEND_DDC, L"DISPLAY\\DDC1");
+    view.monitors[1] = SelectionMonitor(BACKEND_DDC, L"DISPLAY\\DDC2");
+    view.monitors[2] = SelectionMonitor(BACKEND_WMI, L"DISPLAY\\PANEL_0");
+    for (int i = 0; i < view.count; i++) view.monitors[i].excludedFromControl = TRUE;
+    Settings_ApplyMonitorSelection(&settings, &view);
+    CHECK(!view.selectedOnly);
+    for (int i = 0; i < view.count; i++) CHECK(!view.monitors[i].excludedFromControl);
+
+    settings.monitorSelection.selectedOnly = TRUE;
+    Settings_ApplyMonitorSelection(&settings, &view);
+    CHECK(view.selectedOnly);
+    for (int i = 0; i < view.count; i++) CHECK(view.monitors[i].excludedFromControl);
+    settings.monitorSelection.count = 1;
+    wcscpy(settings.monitorSelection.keys[0], L"DDC:DISPLAY\\OFFLINE");
+    wcscpy(settings.monitorSelection.names[0], L"Offline display");
+    Settings_ApplyMonitorSelection(&settings, &view);
+    for (int i = 0; i < view.count; i++) CHECK(view.monitors[i].excludedFromControl);
+    CHECK(settings.monitorSelection.count == 1);
+    CHECK(wcscmp(settings.monitorSelection.names[0], L"Offline display") == 0);
+
+    Settings_MonitorKey(&view.monitors[0], settings.monitorSelection.keys[0]);
+    settings.monitorSelection.count = 2;
+    Settings_MonitorKey(&view.monitors[2], settings.monitorSelection.keys[1]);
+    Settings_ApplyMonitorSelection(&settings, &view);
+    CHECK(!view.monitors[0].excludedFromControl && view.monitors[1].excludedFromControl);
+    CHECK(!view.monitors[2].excludedFromControl);
+    view.monitors[1] = view.monitors[0]; /* Two monitors expose the selected identity. */
+    Settings_ApplyMonitorSelection(&settings, &view);
+    CHECK(view.monitors[0].excludedFromControl && view.monitors[1].excludedFromControl);
+    CHECK(!view.monitors[2].excludedFromControl); /* Other unique selected keys remain enabled. */
+    view.monitors[1].controllable = FALSE;
+    Settings_ApplyMonitorSelection(&settings, &view);
+    CHECK(!view.monitors[0].excludedFromControl && !view.monitors[2].excludedFromControl);
+}
+
+static void TestMonitorSelectionPersistence(void)
+{
+    Settings settings = { 0 }, loaded = { 0 };
+    ResetMocks();
+    loaded.monitorSelection.selectedOnly = TRUE;
+    loaded.monitorSelection.count = 1;
+    Settings_Load(&loaded);
+    CHECK(!loaded.monitorSelection.selectedOnly && loaded.monitorSelection.count == 0);
+    PutSelectionIni(L"Mode", L"Selected");
+    PutSelectionIni(L"Count", L"0");
+    Settings_Load(&loaded);
+    CHECK(loaded.monitorSelection.selectedOnly && loaded.monitorSelection.count == 0);
+
+    settings.monitorSelection.selectedOnly = TRUE;
+    settings.monitorSelection.count = 2;
+    wcscpy(settings.monitorSelection.keys[0], L"DDC:DISPLAY\\DESKTOP");
+    wcscpy(settings.monitorSelection.names[0], L"Desktop display");
+    wcscpy(settings.monitorSelection.keys[1], L"WMI:DISPLAY\\OFFLINE_0");
+    wcscpy(settings.monitorSelection.names[1], L"Offline internal panel");
+    Settings_Save(&settings);
+    Settings_Load(&loaded);
+    CHECK(loaded.monitorSelection.selectedOnly && loaded.monitorSelection.count == 2);
+    CHECK(wcscmp(loaded.monitorSelection.keys[0], settings.monitorSelection.keys[0]) == 0);
+    CHECK(wcscmp(loaded.monitorSelection.names[1], L"Offline internal panel") == 0);
+    CHECK(mock.createCalls == 0 && mock.openCalls == 0 && mock.setCalls == 0);
+    settings.monitorSelection.selectedOnly = FALSE;
+    Settings_Save(&settings);
+    Settings_Load(&loaded);
+    CHECK(!loaded.monitorSelection.selectedOnly && loaded.monitorSelection.count == 2);
+    CHECK(wcscmp(loaded.monitorSelection.names[1], L"Offline internal panel") == 0);
+}
+
+static void TestMonitorSelectionIniBounds(void)
+{
+    Settings settings = { 0 };
+    WCHAR field[16], value[MONITOR_SELECTION_KEY_LEN + 1];
+    ResetMocks();
+    PutSelectionIni(L"Mode", L"Selected");
+    PutSelectionIni(L"Count", L"1000");
+    for (int i = 0; i <= MAX_MONITORS; i++) {
+        StringCchPrintfW(field, ARRAYSIZE(field), L"Key%d", i);
+        StringCchPrintfW(value, ARRAYSIZE(value), L"DDC:DISPLAY\\MONITOR%d", i);
+        PutSelectionIni(field, value);
+    }
+    Settings_Load(&settings);
+    CHECK(settings.monitorSelection.selectedOnly && settings.monitorSelection.count == MAX_MONITORS);
+    CHECK(wcscmp(settings.monitorSelection.keys[MAX_MONITORS - 1], L"DDC:DISPLAY\\MONITOR15") == 0);
+
+    ResetMocks();
+    PutSelectionIni(L"Mode", L"Selected");
+    PutSelectionIni(L"Count", L"1");
+    FillMockPath(value, MONITOR_SELECTION_KEY_LEN);
+    memcpy(value, L"DDC:", 4 * sizeof(WCHAR));
+    PutSelectionIni(L"Key0", value);
+    Settings_Load(&settings);
+    CHECK(settings.monitorSelection.selectedOnly && settings.monitorSelection.count == 0);
+    value[MONITOR_SELECTION_KEY_LEN - 1] = L'\0'; /* Exact maximum length is valid. */
+    PutSelectionIni(L"Key0", value);
+    Settings_Load(&settings);
+    CHECK(settings.monitorSelection.count == 1 && wcslen(settings.monitorSelection.keys[0]) == 259);
+
+    PutSelectionIni(L"Count", L"-1");
+    Settings_Load(&settings);
+    CHECK(settings.monitorSelection.selectedOnly && settings.monitorSelection.count == 0);
+    PutSelectionIni(L"Mode", L"CorruptMode");
+    PutSelectionIni(L"Count", L"1");
+    Settings_Load(&settings);
+    CHECK(settings.monitorSelection.selectedOnly && settings.monitorSelection.count == 0);
+}
+
+static void TestMonitorSelectionInvalidEntries(void)
+{
+    Settings settings = { 0 }, loaded = { 0 };
+    const WCHAR *keys[] = { L"UNKNOWN:id", L"DDC:", L"WMI:", L"",
+                           L"DDC:id\r\nInjected=1", L"DDC:DISPLAY\\VALID",
+                           L"ddc:display\\valid", L"WMI:DISPLAY\\OFFLINE_0" };
+    WCHAR field[16];
+    ResetMocks();
+    PutSelectionIni(L"Mode", L"Selected");
+    PutSelectionIni(L"Count", L"8");
+    for (int i = 0; i < (int)ARRAYSIZE(keys); i++) {
+        StringCchPrintfW(field, ARRAYSIZE(field), L"Key%d", i);
+        PutSelectionIni(field, keys[i]);
+    }
+    PutSelectionIni(L"Name5", L"First selected display");
+    PutSelectionIni(L"Name6", L"Duplicate display name");
+    PutSelectionIni(L"Name7", L"Offline saved panel");
+    Settings_Load(&settings);
+    CHECK(settings.monitorSelection.selectedOnly && settings.monitorSelection.count == 2);
+    CHECK(wcscmp(settings.monitorSelection.names[0], L"First selected display") == 0);
+    CHECK(wcscmp(settings.monitorSelection.names[1], L"Offline saved panel") == 0);
+    settings.monitorSelection.count = 4;
+    wcscpy(settings.monitorSelection.keys[2], L"INVALID:entry");
+    wcscpy(settings.monitorSelection.keys[3], L"ddc:display\\valid");
+    Settings_Save(&settings);
+    Settings_Load(&loaded);
+    CHECK(loaded.monitorSelection.selectedOnly && loaded.monitorSelection.count == 2);
+    CHECK(wcscmp(loaded.monitorSelection.names[1], L"Offline saved panel") == 0);
+}
+
 int main(void)
 {
     TestSettingsPaths();
@@ -509,10 +738,15 @@ int main(void)
     TestAutostartUpgrade();
     TestAutostartUpgradeInvalidData();
     TestAutostartUpgradeErrors();
+    TestMonitorSelectionKeys();
+    TestApplyMonitorSelection();
+    TestMonitorSelectionPersistence();
+    TestMonitorSelectionIniBounds();
+    TestMonitorSelectionInvalidEntries();
     if (failures) {
         printf("%d settings checks failed\n", failures);
         return 1;
     }
-    puts("ALL PASS: settings paths, autostart migration and daytime preset (mocked I/O)");
+    puts("ALL PASS: settings paths, autostart, daytime preset and monitor selection (mocked I/O)");
     return 0;
 }

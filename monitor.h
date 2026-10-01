@@ -22,6 +22,7 @@ typedef struct {
     DWORD    brightnessCur;
     DWORD    brightnessMax;
     BOOL     controllable; /* TRUE if brightness is settable via any backend */
+    BOOL     excludedFromControl; /* User scope; zero keeps the default All Monitors. */
     BOOL     hasHandle;    /* TRUE if hPhysical is valid (can be 0!) */
     int      delta;        /* per-monitor brightness offset, -40..+40 */
     MonitorBackend backend;
@@ -33,6 +34,7 @@ typedef struct {
     BrightMonitor monitors[MAX_MONITORS];
     int           count;
     int           active;  /* index of "active" monitor for hotkey control */
+    BOOL          selectedOnly; /* Display the current global control scope in the UI. */
 } MonitorList;
 
 /* Enumerate all physical monitors with DDC/CI support */
@@ -52,6 +54,10 @@ BOOL Monitor_SetBrightness(BrightMonitor *mon, DWORD percent);
    enumeration apart from the placeholder Windows reports while a display is
    still coming back after sleep. */
 BOOL Monitor_HasControllable(const MonitorList *ml);
+
+/* User scope and hardware support must both allow a brightness change. */
+BOOL Monitor_CanControl(const BrightMonitor *monitor);
+BOOL Monitor_HasSelected(const MonitorList *ml);
 
 /* Set brightness for all monitors (base percent, can exceed 0-100 with deltas) */
 void Monitor_SetAllBrightness(MonitorList *ml, int percent);

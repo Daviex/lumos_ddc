@@ -33,6 +33,8 @@ static int refreshCalls, popupCalls, destroyCalls, workerResets, cleanupCalls;
 static int timerCalls, killCalls;
 static BOOL acceptResult;
 static int acceptCalls;
+static int osdCalls, osdPercent;
+static HMONITOR osdMonitor;
 static UINT_PTR lastTimer;
 static UINT lastInterval;
 static UINT_PTR lastKilledTimer;
@@ -42,12 +44,18 @@ static DWORD WINAPI MockGetTickCount(void);
 static UINT_PTR WINAPI MockSetTimer(HWND, UINT_PTR, UINT, TIMERPROC);
 static BOOL WINAPI MockKillTimer(HWND, UINT_PTR);
 static BOOL WINAPI MockDestroyWindow(HWND);
+static HRESULT WINAPI MockNotificationState(QUERY_USER_NOTIFICATION_STATE *state);
+static BOOL WINAPI MockGetCursorPos(LPPOINT point);
+static HMONITOR WINAPI MockMonitorFromPoint(POINT point, DWORD flags);
 
 #define GetLocalTime MockGetLocalTime
 #define GetTickCount MockGetTickCount
 #define SetTimer MockSetTimer
 #define KillTimer MockKillTimer
 #define DestroyWindow MockDestroyWindow
+#define SHQueryUserNotificationState MockNotificationState
+#define GetCursorPos MockGetCursorPos
+#define MonitorFromPoint MockMonitorFromPoint
 #define WinMain static UnusedApplicationEntryPoint
 #include "../lumos.c"
 #undef GetLocalTime
@@ -55,6 +63,9 @@ static BOOL WINAPI MockDestroyWindow(HWND);
 #undef SetTimer
 #undef KillTimer
 #undef DestroyWindow
+#undef SHQueryUserNotificationState
+#undef GetCursorPos
+#undef MonitorFromPoint
 #undef WinMain
 
 static void WINAPI MockGetLocalTime(LPSYSTEMTIME time)
@@ -68,6 +79,34 @@ static void WINAPI MockGetLocalTime(LPSYSTEMTIME time)
 }
 
 static DWORD WINAPI MockGetTickCount(void) { return 60000; }
+
+static HRESULT WINAPI MockNotificationState(QUERY_USER_NOTIFICATION_STATE *state)
+{
+    *state = QUNS_ACCEPTS_NOTIFICATIONS;
+    return S_OK;
+}
+
+BOOL Capture_InUse(void) { return FALSE; }
+
+static BOOL WINAPI MockGetCursorPos(LPPOINT point)
+{
+    point->x = point->y = 50;
+    return TRUE;
+}
+
+static HMONITOR WINAPI MockMonitorFromPoint(POINT point, DWORD flags)
+{
+    (void)point; (void)flags;
+    return (HMONITOR)(UINT_PTR)2; /* Cursor is on the excluded screen. */
+}
+
+void UI_ShowOSD(HINSTANCE instance, HMONITOR monitor, int percent)
+{
+    (void)instance;
+    osdCalls++;
+    osdMonitor = monitor;
+    osdPercent = percent;
+}
 
 static UINT_PTR WINAPI MockSetTimer(HWND hwnd, UINT_PTR id, UINT interval,
                                   TIMERPROC callback)
@@ -117,8 +156,8 @@ BOOL Monitor_HasControllable(const MonitorList *view)
 BOOL Monitor_SetBrightness(BrightMonitor *monitor, DWORD percent)
 {
     setOneCalls++;
-    CHECK(monitor->controllable);
-    if (!monitor->controllable) return FALSE;
+    CHECK(Monitor_CanControl(monitor));
+    if (!Monitor_CanControl(monitor)) return FALSE;
     monitor->brightnessCur = Brightness_ToRaw(monitor, percent);
     actualWrites++;
     return TRUE;
@@ -131,7 +170,7 @@ void Monitor_SetAllBrightness(MonitorList *view, int base)
     lastBase = base;
     for (int i = 0; i < view->count; i++) {
         BrightMonitor *monitor = &view->monitors[i];
-        if (!monitor->controllable) continue;
+        if (!Monitor_CanControl(monitor)) continue;
         int percent = base + monitor->delta;
         if (percent < 0) percent = 0;
         if (percent > 100) percent = 100;
@@ -214,6 +253,8 @@ static void ResetState(void)
     timerCalls = killCalls = 0;
     acceptResult = TRUE;
     acceptCalls = 0;
+    osdCalls = osdPercent = 0;
+    osdMonitor = NULL;
     lastTimer = lastKilledTimer = 0;
     lastInterval = 0;
 }
@@ -476,6 +517,153 @@ static void TestWriteFailureRetriesLatestIntent(void)
     CHECK(timerCalls == oldTimers && refreshCalls == oldRefreshes && lastBase == 25);
 }
 
+static void ConfigureOledSelection(void)
+{
+    AddReadyMonitor();
+    wcscpy(g_monitors.monitors[0].deviceInstance, L"TEST\\OLED");
+    g_monitors.count = 2;
+    g_monitors.monitors[1] = MakeMonitor(TRUE, 87);
+    wcscpy(g_monitors.monitors[1].deviceInstance, L"TEST\\LCD");
+    g_settings.monitorSelection.selectedOnly = TRUE;
+    g_settings.monitorSelection.count = 1;
+    CHECK(Settings_MonitorKey(&g_monitors.monitors[0], g_settings.monitorSelection.keys[0]));
+    Settings_ApplyMonitorSelection(&g_settings, &g_monitors);
+    CHECK(Monitor_CanControl(&g_monitors.monitors[0]));
+    CHECK(!Monitor_CanControl(&g_monitors.monitors[1]));
+}
+
+static void TestAllPoliciesRespectGlobalSelection(void)
+{
+    ResetState();
+    ConfigureOledSelection();
+    ApplyStartupBrightness(TRUE);
+    CHECK(g_monitors.monitors[0].brightnessCur == 92);
+    CHECK(g_monitors.monitors[1].brightnessCur == 87 && actualWrites == 1);
+
+    g_settings.presetCount = 1;
+    g_settings.presets[0].brightness = 30;
+    ApplyPreset(0);
+    CHECK(g_monitors.monitors[0].brightnessCur == 40);
+    CHECK(g_monitors.monitors[1].brightnessCur == 87 && actualWrites == 2);
+
+    g_settings.idleDimPercent = 5;
+    Idle_Dim();
+    CHECK(g_idleDimmed && g_monitors.monitors[0].brightnessCur == 15);
+    CHECK(g_monitors.monitors[1].brightnessCur == 87 && actualWrites == 3);
+    Idle_Restore();
+    CHECK(!g_idleDimmed && g_monitors.monitors[0].brightnessCur == 40);
+    CHECK(g_monitors.monitors[1].brightnessCur == 87 && actualWrites == 4);
+
+    ConfigureSchedule();
+    Schedule_ApplyNow();
+    CHECK(g_monitors.monitors[0].brightnessCur == (DWORD)(lastBase + mockDelta));
+    CHECK(g_monitors.monitors[1].brightnessCur == 87 && actualWrites == 5);
+
+    MonitorList *fresh = (MonitorList *)calloc(1, sizeof(*fresh));
+    CHECK(fresh != NULL);
+    if (!fresh) return;
+    fresh->count = 2;
+    fresh->monitors[0] = g_monitors.monitors[1];
+    fresh->monitors[1] = g_monitors.monitors[0];
+    fresh->monitors[0].excludedFromControl = FALSE; /* New enumeration has no policy yet. */
+    fresh->monitors[1].brightnessCur = 100;
+    wcscpy(fresh->monitors[1].name, L"Renamed OLED");
+    g_rescan.awaitedGeneration = ++g_rescan.generation;
+    HandleRescanResult(testWindow, g_rescan.generation, fresh);
+    CHECK(!Monitor_CanControl(&g_monitors.monitors[0]));
+    CHECK(Monitor_CanControl(&g_monitors.monitors[1]));
+    CHECK(g_monitors.monitors[0].brightnessCur == 87 && actualWrites == 6);
+}
+
+static void TestScopeChangeAndDisconnectedSelection(void)
+{
+    ResetState();
+    ConfigureOledSelection();
+    ApplyStartupBrightness(TRUE);
+    CHECK(Settings_MonitorKey(&g_monitors.monitors[1], g_settings.monitorSelection.keys[0]));
+    UpdateMonitorSelection();
+    CHECK(workerResets == 1 && g_masterTarget == 77 && g_masterTargetValid);
+    CHECK(!Monitor_CanControl(&g_monitors.monitors[0]));
+    ApplyPresetBrightness(20);
+    CHECK(g_monitors.monitors[0].brightnessCur == 92 && g_monitors.monitors[1].brightnessCur == 30);
+
+    wcscpy(g_settings.monitorSelection.keys[0], L"DDC:DISCONNECTED");
+    UpdateMonitorSelection();
+    int oldWrites = actualWrites;
+    CHECK(!g_masterTargetValid && !Monitor_HasSelected(&g_monitors));
+    ApplyStartupBrightness(TRUE);
+    Idle_Dim();
+    Idle_Restore();
+    CHECK(actualWrites == oldWrites);
+    g_rescan.retry = RESCAN_MAX_RETRIES;
+    DeliverRescan(1, TRUE, 75); /* An unrelated monitor must not become a fallback. */
+    CHECK(g_rescan.reapplyBrightness && actualWrites == oldWrites);
+    CHECK(!Monitor_HasSelected(&g_monitors) && g_monitors.monitors[0].brightnessCur == 75);
+
+    g_settings.monitorSelection.selectedOnly = FALSE;
+    UpdateMonitorSelection();
+    ApplyPresetBrightness(45);
+    CHECK(Monitor_HasSelected(&g_monitors) && g_monitors.monitors[0].brightnessCur == 55);
+}
+
+static void TestHotkeysAndFeedbackUseSelectedMonitor(void)
+{
+    ResetState();
+    ConfigureOledSelection();
+    g_monitors.monitors[0].hMonitor = (HMONITOR)(UINT_PTR)1;
+    g_monitors.monitors[1].hMonitor = (HMONITOR)(UINT_PTR)2;
+    g_settings.step = 5;
+    ApplyStartupBrightness(TRUE);
+    HandleHotkey(WM_HOTKEY_BRIGHTEN);
+    CHECK(g_masterTarget == 87 && g_monitors.monitors[0].brightnessCur == 97);
+    CHECK(g_monitors.monitors[1].brightnessCur == 87);
+    CHECK(osdCalls == 1 && osdMonitor == (HMONITOR)(UINT_PTR)1 && osdPercent == 97);
+    g_settings.monitorSelection.count = 0;
+    UpdateMonitorSelection();
+    int writes = actualWrites;
+    HandleHotkey(WM_HOTKEY_DIM);
+    CHECK(actualWrites == writes && osdCalls == 1 && !g_masterTargetValid);
+}
+
+static void TestScopeChangeWhileDimmedKeepsNewDisplayLevel(void)
+{
+    ResetState();
+    ConfigureOledSelection();
+    ApplyStartupBrightness(TRUE);
+    g_settings.idleDimPercent = 5;
+    Idle_Dim();
+    CHECK(g_monitors.monitors[0].brightnessCur == 15);
+    CHECK(Settings_MonitorKey(&g_monitors.monitors[1], g_settings.monitorSelection.keys[0]));
+    int writes = actualWrites;
+    UpdateMonitorSelection();
+    CHECK(!g_idleDimmed && g_masterTarget == 77 && actualWrites == writes);
+    CHECK(g_monitors.monitors[0].brightnessCur == 15 && g_monitors.monitors[1].brightnessCur == 87);
+    Idle_Restore();
+    CHECK(actualWrites == writes && g_monitors.monitors[1].brightnessCur == 87);
+
+    ResetState();
+    ConfigureOledSelection();
+    ApplyStartupBrightness(TRUE);
+    Idle_Dim();
+    writes = actualWrites;
+    g_settings.monitorSelection.selectedOnly = FALSE;
+    UpdateMonitorSelection();
+    CHECK(!g_idleDimmed && actualWrites == writes + 1); /* Only the retained OLED restores. */
+    CHECK(g_monitors.monitors[0].brightnessCur == 92 && g_monitors.monitors[1].brightnessCur == 87);
+    CHECK(g_masterTarget == 79); /* Average of the restored/current bases, 82 and 77. */
+
+    g_settings.monitorSelection.selectedOnly = TRUE;
+    g_settings.monitorSelection.count = 0;
+    UpdateMonitorSelection();
+    Idle_Dim(); /* No display was dimmed; the internal fallback must not transfer. */
+    g_settings.monitorSelection.count = 1;
+    CHECK(Settings_MonitorKey(&g_monitors.monitors[1], g_settings.monitorSelection.keys[0]));
+    writes = actualWrites;
+    UpdateMonitorSelection();
+    CHECK(!g_idleDimmed && actualWrites == writes && g_masterTarget == 77);
+    CHECK(g_monitors.monitors[1].brightnessCur == 87);
+}
+
 int main(void)
 {
     (void)UnusedApplicationEntryPoint; /* Compile the entry point; never run it. */
@@ -489,6 +677,10 @@ int main(void)
     TestResumeAfterTwoDaySleep();
     TestUnavailableThenLateReady();
     TestWriteFailureRetriesLatestIntent();
+    TestAllPoliciesRespectGlobalSelection();
+    TestScopeChangeAndDisconnectedSelection();
+    TestHotkeysAndFeedbackUseSelectedMonitor();
+    TestScopeChangeWhileDimmedKeepsNewDisplayLevel();
     if (failures) {
         printf("startup: %d failure(s)\n", failures);
         return 1;

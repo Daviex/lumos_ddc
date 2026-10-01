@@ -8,7 +8,7 @@
 int Brightness_GetPercent(const BrightMonitor *monitor);
 DWORD Brightness_ToRaw(const BrightMonitor *monitor, DWORD percent);
 
-/* Recover the base target by averaging controllable monitors after subtracting
+/* Recover the base target by averaging selected, controllable monitors after subtracting
    their deltas. Empty/uncontrollable lists use the existing 50% fallback. */
 int Brightness_MasterTarget(const MonitorList *view);
 

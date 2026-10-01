@@ -223,12 +223,44 @@ static void TestLargeBrightnessRange(void)
     CHECK(lastWrite == 100 && monitor.brightnessCur == 100);
 }
 
+static void TestExcludedMonitorsAreNeverWritten(void)
+{
+    MonitorList view = { 0 };
+    ResetMocks();
+    view.count = 3;
+    for (int i = 0; i < view.count; i++) view.monitors[i] = MakeDdc((UINT_PTR)i);
+    view.monitors[0].excludedFromControl = TRUE;
+    view.monitors[0].brightnessCur = 87;
+    view.monitors[1].delta = 10;
+    view.monitors[2].excludedFromControl = TRUE;
+    view.monitors[2].backend = BACKEND_WMI;
+    view.monitors[2].brightnessCur = 65;
+    CHECK(!Monitor_SetBrightness(&view.monitors[0], 5));
+    CHECK(!Monitor_SetBrightnessSync(&view.monitors[0], 5));
+    CHECK(!Monitor_SetBrightnessSync(&view.monitors[2], 5));
+    Monitor_PreviewBrightness(&view.monitors[0], 5);
+    Monitor_AdjustActive(&view, -20);
+    CHECK(setCalls == 0 && view.monitors[0].brightnessCur == 87);
+    Monitor_SetAllBrightness(&view, 20);
+    CHECK(setCalls == 1 && lastWrite == 30 && view.monitors[1].brightnessCur == 30);
+    CHECK(view.monitors[0].brightnessCur == 87 && view.monitors[2].brightnessCur == 65);
+    Monitor_CycleActive(&view, 1);
+    CHECK(view.active == 1);
+    Monitor_CycleActive(&view, -1);
+    CHECK(view.active == 1);
+    view.monitors[1].excludedFromControl = TRUE;
+    CHECK(Monitor_HasControllable(&view) && !Monitor_HasSelected(&view));
+    Monitor_SetAllBrightness(&view, 80);
+    CHECK(setCalls == 1);
+}
+
 int main(void)
 {
     TestReusedZeroHandleLeases();
     TestFlushDoesNotWaitForEnumeration();
     TestRefreshValidatesReadings();
     TestLargeBrightnessRange();
+    TestExcludedMonitorsAreNeverWritten();
     if (failures) {
         printf("%d monitor checks failed\n", failures);
         return 1;

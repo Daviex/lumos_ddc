@@ -1,6 +1,20 @@
 #include "brightness.h"
 #include <wchar.h>
 
+BOOL Monitor_CanControl(const BrightMonitor *monitor)
+{
+    return monitor && monitor->controllable && !monitor->excludedFromControl;
+}
+
+BOOL Monitor_HasSelected(const MonitorList *view)
+{
+    if (view) {
+        for (int i = 0; i < view->count; i++)
+            if (Monitor_CanControl(&view->monitors[i])) return TRUE;
+    }
+    return FALSE;
+}
+
 int Brightness_GetPercent(const BrightMonitor *monitor)
 {
     if (!monitor || monitor->brightnessMax <= monitor->brightnessMin) return 0;
@@ -28,7 +42,7 @@ int Brightness_MasterTarget(const MonitorList *view)
     if (view) {
         for (int i = 0; i < view->count; i++) {
             const BrightMonitor *monitor = &view->monitors[i];
-            if (!monitor->controllable) continue;
+            if (!Monitor_CanControl(monitor)) continue;
             sum += Brightness_GetPercent(monitor) - monitor->delta;
             count++;
         }
@@ -42,7 +56,7 @@ void Brightness_TargetRange(const MonitorList *view, int *minimum, int *maximum)
     if (view) {
         for (int i = 0; i < view->count; i++) {
             const BrightMonitor *monitor = &view->monitors[i];
-            if (!monitor->controllable) continue;
+            if (!Monitor_CanControl(monitor)) continue;
             if (monitor->delta < minimumDelta) minimumDelta = monitor->delta;
             if (monitor->delta > maximumDelta) maximumDelta = monitor->delta;
         }

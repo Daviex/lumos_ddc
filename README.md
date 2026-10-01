@@ -72,6 +72,7 @@ Windows can dim a laptop panel, but it will not touch the brightness of external
 - **Brightness schedule** - Optional time-of-day schedule that smoothly ramps brightness across the day (piecewise-linear, wraps around midnight). A manual change suspends it until the next anchor.
 - **Idle auto-dim** - Optional. After a configurable idle period (default 5 minutes) the brightness drops to a configurable low level (default 5%), and it returns to the previous level as soon as you touch the keyboard or the mouse. Fullscreen video, presentation mode and live calls are skipped, so a movie you are watching or a Teams call you are sitting through without touching anything is not dimmed. Calls are detected by the microphone or the camera being in use, not by the name of the application, so any conferencing tool counts.
 - **Presets** - Night, Day, and Presentation, with editable brightness values.
+- **Choose monitors** - Control all displays (the default) or only the ones you select. The same selection applies to presets, sliders, hotkeys, idle dimming, the schedule and brightness restoration at sign-in or wake.
 - **Day brightness at Windows sign-in** - With Start with Windows enabled, restore the configured Day/Giorno preset instead of inheriting a dim level left by the previous session. An active schedule resumes at its next anchor.
 - **Settings window** - A dark themed screen for the brightness step, the idle dim level and timeout, the schedule and autostart switches, and the preset values. Right-click the tray icon and pick Settings.
 - **On-screen display** - A clean overlay with the current percentage and a progress bar.
@@ -133,8 +134,8 @@ Cross-compile from Linux/WSL with MinGW (outputs land in `build/`):
 mkdir -p build
 x86_64-w64-mingw32-windres lumos.rc -O coff -o build/lumos.res
 x86_64-w64-mingw32-gcc -O2 -Wall -mwindows -DUNICODE -D_UNICODE \
-  lumos.c monitor.c monitor_worker.c brightness.c \
-  ui.c ui_popup.c ui_graphics.c presets.c schedule.c wmibright.c capture.c build/lumos.res \
+  lumos.c monitor.c monitor_worker.c brightness.c monitor_selection.c \
+  ui.c ui_popup.c ui_graphics.c ui_monitor_selection.c presets.c schedule.c wmibright.c capture.c build/lumos.res \
   -o build/lumos.exe \
   -ldxva2 -luser32 -lgdi32 -lshell32 -lcomctl32 -ladvapi32 -lole32 -loleaut32 -lwbemuuid -ldwmapi -lwtsapi32 -lkernel32 -lm
 ```
@@ -154,6 +155,8 @@ build.bat debug      :: debug build, logs to %APPDATA%\Lumos\lumos-*.log
 - `brightness.c`: shared brightness calculations and monitor identity matching, with no hardware access.
 - `ui_popup.c`: brightness popup, drag handling and cached rendering.
 - `ui_graphics.c`: shared GDI/layered-window helpers; `ui.c`: OSD, menus and editors.
+- `monitor_selection.c`: stable monitor identities and the global control selection.
+- `ui_monitor_selection.c`: monitor selection window and its working copy.
 - `presets.c`, `schedule.c`, `capture.c`: settings, time interpolation and local call-detection state.
 
 Regression test commands and their hardware mocks are documented in [tests/README.md](tests/README.md).
@@ -165,8 +168,8 @@ Regression test commands and their hardware mocks are documented in [tests/READM
 | **Left-click** tray icon | Open the brightness popup |
 | **Right-click** tray icon | Context menu (presets, re-scan, settings, schedule, idle dim, autostart, exit) |
 | **Mouse wheel** over tray icon | Brightness up / down by one step (default 5%) |
-| `Ctrl+Alt+Up` / `Ctrl+Alt+Down` | Brightness up / down on all monitors |
-| Drag a slider in the popup | Set that monitor; drag the master slider for all at once |
+| `Ctrl+Alt+Up` / `Ctrl+Alt+Down` | Brightness up / down on the selected monitors |
+| Drag a slider in the popup | Set that selected monitor; drag the master slider for the whole selection |
 | Click the `-` / `+` on a monitor row | Adjust that monitor's delta offset |
 
 ## Configuration
@@ -200,6 +203,19 @@ IdleDimMinutes=5
 ```
 
 In the Settings window a value changes by clicking its `-` and `+` buttons or by scrolling the wheel over the row, a switch flips by clicking it, and nothing is written until you press Save. Clicking outside the window cancels.
+
+To limit Lumos to an OLED or another group of displays, open **Settings > General >
+Choose Monitors**. Keep **All Monitors** to control every display, including newly
+connected ones, or choose specific monitors using the checkboxes. Apply the
+selection, then Save the Settings window. This selection covers every brightness
+control: Day/Night presets, idle dimming and restoration, the schedule, Windows
+sign-in, wake, sliders, offsets, hotkeys and the tray mouse wheel.
+
+Excluded displays are marked in the popup and their controls are disabled. Custom
+selections are saved by monitor identity, survive restarts and reconnection, and
+retain disconnected displays in the chooser. If none of the chosen displays is
+connected, Lumos leaves the other screens alone. New displays are included only
+when All Monitors is selected or you explicitly add them to the custom selection.
 
 The idle auto-dim keys work together. `IdleDimEnabled` turns the feature on and off, and the tray context menu toggles the same key. `IdleDimPercent` is the level held while the session is idle (0 to 100). `IdleDimMinutes` is how long there must be no keyboard or mouse input before the dim happens (1 to 1440 minutes).
 

@@ -20,6 +20,9 @@ typedef struct {
 
 typedef struct {
     int count;
+    BOOL selectedOnly;
+    BOOL enabled[MAX_MONITORS + 1];
+    BOOL excluded[MAX_MONITORS];
     int percent[MAX_MONITORS + 1];
     int delta[MAX_MONITORS];
     WCHAR name[MAX_MONITORS][128];
@@ -54,6 +57,13 @@ static int GetMasterPercent(MonitorList *ml)
 {
     int target = g_masterTargetKnown ? g_masterTarget : Brightness_MasterTarget(ml);
     return Brightness_TargetToSlider(ml, target);
+}
+
+static BOOL CanAdjustSlider(const PopupData *pd, int row)
+{
+    if (!pd || !pd->ml || row < 0 || row > pd->ml->count) return FALSE;
+    return row == pd->ml->count ? Monitor_HasSelected(pd->ml)
+        : Monitor_CanControl(&pd->ml->monitors[row]);
 }
 
 /* Forward declarations for layout helpers */
@@ -107,6 +117,7 @@ static void GetDeltaButtonRects(int row, RECT *rcMinus, RECT *rcValue, RECT *rcP
 static int HitTestDelta(PopupData *pd, int x, int y, int *outRow)
 {
     for (int row = 0; row < pd->ml->count; row++) {
+        if (!Monitor_CanControl(&pd->ml->monitors[row])) continue;
         RECT rcMinus, rcValue, rcPlus;
         GetDeltaButtonRects(row, &rcMinus, &rcValue, &rcPlus);
         if (y >= rcMinus.top && y <= rcMinus.bottom) {
@@ -289,13 +300,16 @@ static void GetPopupFrame(PopupData *pd, PopupFrame *frame)
 {
     memset(frame, 0, sizeof(*frame));
     frame->count = pd->ml->count;
+    frame->selectedOnly = pd->ml->selectedOnly;
     for (int row = 0; row <= frame->count; row++) {
+        frame->enabled[row] = CanAdjustSlider(pd, row);
         if (row == frame->count) {
             frame->percent[row] = pd->masterPercent;
         } else {
             BrightMonitor *mon = &pd->ml->monitors[row];
             frame->percent[row] = Brightness_GetPercent(mon);
             frame->delta[row] = mon->delta;
+            frame->excluded[row] = mon->excludedFromControl;
             wcsncpy(frame->name[row], mon->name, 127);
         }
         if (pd->activeSlider == row && pd->dragPercent >= 0)
@@ -343,12 +357,15 @@ static void RenderPopup(HWND hwnd, PopupData *pd)
 
     for (int row = 0; row < totalRows; row++) {
         BOOL isMaster = (row == ml->count);
+        BOOL enabled = frame.enabled[row];
         int pct = frame.percent[row];
         WCHAR label[140];
         WCHAR pctStr[8];
 
         if (isMaster) {
-            wcscpy(label, L"All Monitors");
+            wcscpy(label, frame.selectedOnly ? L"Selected Monitors" : L"All Monitors");
+        } else if (frame.excluded[row]) {
+            wsprintfW(label, L"%s (excluded)", frame.name[row]);
         } else {
             wcscpy(label, frame.name[row]);
         }
@@ -364,7 +381,8 @@ static void RenderPopup(HWND hwnd, PopupData *pd)
         int labelY = POPUP_PADDING + 24 + row * POPUP_ROW_H + 6;
         RECT rcLabel = { POPUP_PADDING + 4, labelY, w - POPUP_PADDING - 40, labelY + 18 };
         SelectObject(dc, isMaster ? hFontBold : hFont);
-        SetTextColor(dc, UI_ColorRef(isMaster ? CLR_ACCENT : CLR_TEXT));
+        SetTextColor(dc, UI_ColorRef(!enabled ? CLR_SUBTEXT :
+                                    isMaster ? CLR_ACCENT : CLR_TEXT));
         DrawTextW(dc, label, -1, &rcLabel, DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS);
 
         RECT rcPct = { w - POPUP_PADDING - 40, labelY, w - POPUP_PADDING - 4, labelY + 18 };
@@ -380,14 +398,15 @@ static void RenderPopup(HWND hwnd, PopupData *pd)
                   SLIDER_TRACK_H, SLIDER_TRACK_H);
 
         int thumbX = XFromPercent(&rcSlider, pct);
-        SelectObject(dc, fillBrush);
+        SelectObject(dc, enabled ? fillBrush : trackBrush);
         RoundRect(dc, rcSlider.left, rcSlider.top, thumbX, rcSlider.bottom,
                   SLIDER_TRACK_H, SLIDER_TRACK_H);
-        SelectObject(dc, oldBr);
+        SelectObject(dc, enabled ? oldBr : trackBrush);
 
         int cy = (rcSlider.top + rcSlider.bottom) / 2;
         Ellipse(dc, thumbX - SLIDER_THUMB_R, cy - SLIDER_THUMB_R,
                 thumbX + SLIDER_THUMB_R, cy + SLIDER_THUMB_R);
+        SelectObject(dc, oldBr);
 
         /* Delta controls (skip master row) */
         if (!isMaster) {
@@ -399,7 +418,7 @@ static void RenderPopup(HWND hwnd, PopupData *pd)
             FillRect(dc, &rcPlus, cache->surface);
 
             SelectObject(dc, hFontSmall);
-            SetTextColor(dc, UI_ColorRef(CLR_SUBTEXT));
+            SetTextColor(dc, UI_ColorRef(enabled ? CLR_SUBTEXT : CLR_TRACK));
             DrawTextW(dc, L"\x2013", -1, &rcMinus, DT_CENTER | DT_VCENTER | DT_SINGLELINE); /* en dash as minus */
             DrawTextW(dc, L"+", -1, &rcPlus, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
 
@@ -443,6 +462,7 @@ static int HitTestSlider(PopupData *pd, int x, int y)
 {
     int totalRows = pd->ml->count + 1;
     for (int row = 0; row < totalRows; row++) {
+        if (!CanAdjustSlider(pd, row)) continue;
         RECT rc;
         GetSliderRect(row, &rc);
         rc.top -= SLIDER_THUMB_R + 4;
@@ -456,7 +476,7 @@ static int HitTestSlider(PopupData *pd, int x, int y)
 static void ApplySliderValue(PopupData *pd, int row, int percent)
 {
     MonitorList *ml = pd->ml;
-    if (row < 0 || row > ml->count) return;
+    if (!CanAdjustSlider(pd, row)) return;
     BOOL isMaster = (row == ml->count);
     int target = isMaster ? Brightness_SliderToTarget(ml, percent) : percent;
 

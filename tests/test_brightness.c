@@ -155,11 +155,60 @@ static void TestDisplayIdentity(void)
     CHECK(!Monitor_SameDisplay(&source, &candidate));  /* Null HMONITOR is not an identity. */
 }
 
+static void TestSelectedMonitorTargets(void)
+{
+    MonitorList view = { 0 };
+    int minimum, maximum;
+    CHECK(!Monitor_CanControl(NULL) && !Monitor_HasSelected(NULL));
+    CHECK(!Monitor_HasSelected(&view));
+    view.count = 3;
+    view.selectedOnly = TRUE;
+    view.monitors[0] = MakeMonitor(0, 70, 100, 10);
+    view.monitors[1] = MakeMonitor(0, 50, 100, -10);
+    view.monitors[2] = MakeMonitor(0, 5, 100, 40);
+    view.monitors[2].excludedFromControl = TRUE;
+    CHECK(Monitor_CanControl(&view.monitors[0]) && Monitor_HasSelected(&view));
+    CHECK(!Monitor_CanControl(&view.monitors[2]) && view.monitors[2].controllable);
+    CHECK(Brightness_MasterTarget(&view) == 60); /* Excluded base -35 is ignored. */
+    Brightness_TargetRange(&view, &minimum, &maximum);
+    CHECK(minimum == -10 && maximum == 110); /* Excluded +40 offset cannot widen it. */
+    CHECK(Brightness_SliderToTarget(&view, 0) == -10);
+    CHECK(Brightness_SliderToTarget(&view, 100) == 110);
+    CHECK(Brightness_TargetToSlider(&view, 50) == 50);
+    CHECK(Brightness_GetPercent(&view.monitors[2]) == 5); /* Its reading stays available. */
+
+    view.monitors[1].excludedFromControl = TRUE;
+    CHECK(Brightness_MasterTarget(&view) == 60);
+    Brightness_TargetRange(&view, &minimum, &maximum);
+    CHECK(minimum == -10 && maximum == 100);
+    view.monitors[0].excludedFromControl = TRUE;
+    CHECK(!Monitor_HasSelected(&view) && Brightness_MasterTarget(&view) == 50);
+    Brightness_TargetRange(&view, &minimum, &maximum);
+    CHECK(minimum == 0 && maximum == 100);
+    CHECK(Brightness_SliderToTarget(&view, 50) == 50);
+
+    view.monitors[1].excludedFromControl = FALSE;
+    view.monitors[1].controllable = FALSE;
+    CHECK(!Monitor_CanControl(&view.monitors[1]) && !Monitor_HasSelected(&view));
+    view.monitors[1].controllable = TRUE;
+    CHECK(Monitor_HasSelected(&view) && Brightness_MasterTarget(&view) == 60);
+    Brightness_TargetRange(&view, &minimum, &maximum);
+    CHECK(minimum == 0 && maximum == 110);
+
+    view.selectedOnly = FALSE;
+    for (int i = 0; i < view.count; i++) view.monitors[i].excludedFromControl = FALSE;
+    CHECK(Monitor_CanControl(&view.monitors[2]));
+    CHECK(Brightness_MasterTarget(&view) == 28); /* Default All includes all three. */
+    Brightness_TargetRange(&view, &minimum, &maximum);
+    CHECK(minimum == -40 && maximum == 110);
+}
+
 int main(void)
 {
     TestRawConversions();
     TestMasterTargets();
     TestDisplayIdentity();
+    TestSelectedMonitorTargets();
     if (failures) {
         printf("%d brightness checks failed\n", failures);
         return 1;
