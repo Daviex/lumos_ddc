@@ -72,6 +72,7 @@ Windows can dim a laptop panel, but it will not touch the brightness of external
 - **Brightness schedule** - Optional time-of-day schedule that smoothly ramps brightness across the day (piecewise-linear, wraps around midnight). A manual change suspends it until the next anchor.
 - **Idle auto-dim** - Optional. After a configurable idle period (default 5 minutes) the brightness drops to a configurable low level (default 5%), and it returns to the previous level as soon as you touch the keyboard or the mouse. Fullscreen video, presentation mode and live calls are skipped, so a movie you are watching or a Teams call you are sitting through without touching anything is not dimmed. Calls are detected by the microphone or the camera being in use, not by the name of the application, so any conferencing tool counts.
 - **Presets** - Night, Day, and Presentation, with editable brightness values.
+- **Day brightness at Windows sign-in** - With Start with Windows enabled, restore the configured Day/Giorno preset instead of inheriting a dim level left by the previous session. An active schedule resumes at its next anchor.
 - **Settings window** - A dark themed screen for the brightness step, the idle dim level and timeout, the schedule and autostart switches, and the preset values. Right-click the tray icon and pick Settings.
 - **On-screen display** - A clean overlay with the current percentage and a progress bar.
 - **Auto-reconnect and restore** - Re-detects monitors on plug/unplug, session unlock, display power-on, and wake from sleep. Beyond recovering stale DDC handles, it re-applies your brightness (the schedule value, or the last master level) because displays often reset to full brightness across sleep or standby.
@@ -107,6 +108,22 @@ Lumos makes no network requests, downloads no updates and sends no telemetry. Cl
 1. Download the latest `lumos-vX.Y.Z.exe` from the [Releases](https://github.com/sfortis/lumos_ddc/releases/latest) page.
 2. Run it. Lumos lives in the system tray (a small sun icon); there is nothing to install.
 3. Optional: right-click the tray icon and enable **Start with Windows**.
+
+Start with Windows launches Lumos with `--startup`, which applies the current
+`Giorno` preset (or `Day`, case-insensitive), including per-monitor offsets.
+`Giorno` takes precedence if both names exist; if neither exists, the default
+Day value of 80% is used. Set its percentage in Settings > Presets. Opening
+Lumos manually uses the existing brightness/schedule behavior. Unlocking or
+waking an already running instance restores its current target.
+
+After updating, run the new executable once from its registered location to
+upgrade an existing autostart entry. This only adds the login argument to a
+legacy entry for that executable; it does not enable autostart or replace a
+command pointing elsewhere. Enable Start with Windows again if you moved the exe.
+
+If a display is still reconnecting at sign-in, Lumos retries discovery and keeps
+the intended target for when it becomes available. Any subsequent manual change,
+schedule anchor or idle dim takes precedence over the initial Day value.
 
 ### Build from source
 

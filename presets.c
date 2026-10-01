@@ -5,6 +5,7 @@
 
 #define REG_RUN_KEY L"Software\\Microsoft\\Windows\\CurrentVersion\\Run"
 #define APP_NAME    L"Lumos"
+#define AUTOSTART_COMMAND_CAPACITY (MAX_PATH + 2 + ARRAYSIZE(L" " LUMOS_STARTUP_ARGUMENT) - 1)
 
 static void EnsureDirectory(const WCHAR *path)
 {
@@ -41,14 +42,31 @@ void Settings_Init(Settings *s)
 
 void Settings_CreateDefaults(Settings *s)
 {
+    WCHAR dayBrightness[4];
+    StringCchPrintfW(dayBrightness, ARRAYSIZE(dayBrightness), L"%d", DEFAULT_DAY_BRIGHTNESS);
     WritePrivateProfileStringW(L"Presets", L"Night", L"30", s->iniPath);
-    WritePrivateProfileStringW(L"Presets", L"Day", L"80", s->iniPath);
+    WritePrivateProfileStringW(L"Presets", L"Day", dayBrightness, s->iniPath);
     WritePrivateProfileStringW(L"Presets", L"Presentation", L"100", s->iniPath);
     WritePrivateProfileStringW(L"Settings", L"Step", L"5", s->iniPath);
     WritePrivateProfileStringW(L"Settings", L"Autostart", L"0", s->iniPath);
     WritePrivateProfileStringW(L"Settings", L"IdleDimEnabled", L"0", s->iniPath);
     WritePrivateProfileStringW(L"Settings", L"IdleDimPercent", L"5", s->iniPath);
     WritePrivateProfileStringW(L"Settings", L"IdleDimMinutes", L"5", s->iniPath);
+}
+
+int Settings_DayBrightness(const Settings *s)
+{
+    int dayBrightness = -1;
+    if (s) {
+        for (int i = 0; i < s->presetCount && i < MAX_PRESETS; i++) {
+            const Preset *preset = &s->presets[i];
+            int brightness = preset->brightness > 100 ? 100 : (int)preset->brightness;
+            if (_wcsicmp(preset->name, L"Giorno") == 0) return brightness;
+            if (dayBrightness < 0 && _wcsicmp(preset->name, L"Day") == 0)
+                dayBrightness = brightness;
+        }
+    }
+    return dayBrightness >= 0 ? dayBrightness : DEFAULT_DAY_BRIGHTNESS;
 }
 
 void Settings_Load(Settings *s)
@@ -194,18 +212,28 @@ void Settings_Save(Settings *s)
     }
 }
 
+static BOOL GetAutostartExecutable(WCHAR exePath[MAX_PATH])
+{
+    DWORD length = GetModuleFileNameW(NULL, exePath, MAX_PATH);
+    return length > 0 && length < MAX_PATH;
+}
+
+static BOOL FormatAutostartCommand(const WCHAR *exePath,
+                                  WCHAR command[AUTOSTART_COMMAND_CAPACITY])
+{
+    return SUCCEEDED(StringCchPrintfW(command, AUTOSTART_COMMAND_CAPACITY,
+                                      L"\"%s\" " LUMOS_STARTUP_ARGUMENT, exePath));
+}
+
 BOOL Settings_SetAutostart(BOOL enable)
 {
     HKEY hKey;
     LONG status;
-    WCHAR command[MAX_PATH + 2];
+    WCHAR command[AUTOSTART_COMMAND_CAPACITY];
 
     if (enable) {
         WCHAR exePath[MAX_PATH];
-        DWORD length = GetModuleFileNameW(NULL, exePath, ARRAYSIZE(exePath));
-        if (length == 0 || length >= ARRAYSIZE(exePath) ||
-            FAILED(StringCchPrintfW(command, ARRAYSIZE(command),
-                                    L"\"%s\"", exePath)))
+        if (!GetAutostartExecutable(exePath) || !FormatAutostartCommand(exePath, command))
             return FALSE;
 
         status = RegCreateKeyExW(HKEY_CURRENT_USER, REG_RUN_KEY, 0, NULL, 0,
@@ -227,6 +255,48 @@ BOOL Settings_SetAutostart(BOOL enable)
     }
     RegCloseKey(hKey);
     return status == ERROR_SUCCESS;
+}
+
+BOOL Settings_UpgradeAutostart(void)
+{
+    HKEY hKey;
+    LONG status = RegOpenKeyExW(HKEY_CURRENT_USER, REG_RUN_KEY, 0,
+                                KEY_QUERY_VALUE | KEY_SET_VALUE, &hKey);
+    if (status == ERROR_FILE_NOT_FOUND) return TRUE;
+    if (status != ERROR_SUCCESS) return FALSE;
+
+    WCHAR existing[AUTOSTART_COMMAND_CAPACITY];
+    DWORD bytes = sizeof(existing), type = 0;
+    BOOL success = FALSE;
+    status = RegQueryValueExW(hKey, APP_NAME, NULL, &type, (BYTE *)existing, &bytes);
+    if (status == ERROR_FILE_NOT_FOUND) {
+        success = TRUE;
+    } else if (status == ERROR_SUCCESS && type == REG_SZ &&
+               bytes >= sizeof(WCHAR) && bytes <= sizeof(existing) &&
+               bytes % sizeof(WCHAR) == 0) {
+        size_t length;
+        size_t characters = bytes / sizeof(WCHAR);
+        /* The registry does not guarantee termination. Reject truncated or
+           embedded-null data before comparing any command line. */
+        if (SUCCEEDED(StringCchLengthW(existing, characters, &length)) &&
+            length == characters - 1) {
+            WCHAR exePath[MAX_PATH];
+            WCHAR quotedPath[MAX_PATH + 2];
+            if (GetAutostartExecutable(exePath) &&
+                SUCCEEDED(StringCchPrintfW(quotedPath, ARRAYSIZE(quotedPath),
+                                           L"\"%s\"", exePath))) {
+                success = TRUE;
+                if (_wcsicmp(existing, exePath) == 0 || _wcsicmp(existing, quotedPath) == 0) {
+                    WCHAR command[AUTOSTART_COMMAND_CAPACITY];
+                    success = FormatAutostartCommand(exePath, command) &&
+                        RegSetValueExW(hKey, APP_NAME, 0, REG_SZ, (const BYTE *)command,
+                                        (DWORD)((wcslen(command) + 1) * sizeof(WCHAR))) == ERROR_SUCCESS;
+                }
+            }
+        }
+    }
+    RegCloseKey(hKey);
+    return success;
 }
 
 BOOL Settings_GetAutostart(void)

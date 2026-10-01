@@ -81,6 +81,7 @@ static UINT         g_wmTakeover;     /* cross-process "quit, I'm replacing you"
 static BOOL         g_scheduleSuspended = FALSE;
 static int          g_scheduleSuspendMinute = 0;   /* minute-of-day at suspend */
 static int          g_scheduleResumeMinute = 0;    /* next anchor to resume at */
+static ULONGLONG    g_scheduleResumeLocalMinute;   /* dated local-time deadline */
 static int          g_scheduleLastApplied = -1;    /* last brightness pushed by the schedule */
 static int          g_masterTarget;          /* intended base percent, including negative delta compensation */
 static BOOL         g_masterTargetValid;
@@ -111,9 +112,12 @@ static void UnregisterHotkeys(HWND hwnd);
 static void ShowContextMenu(HWND hwnd);
 static void HandleHotkey(int id);
 static void ApplyPreset(int index);
+static void ApplyPresetBrightness(DWORD brightness);
+static void ApplyStartupBrightness(BOOL loginLaunch);
 static void InstallMouseHook(void);
 static void RemoveMouseHook(void);
 static void ScheduleRescan(HWND hwnd);
+static void ScheduleRescanFromTrigger(HWND hwnd);
 static void StartRescan(HWND hwnd);
 static DWORD WINAPI RescanThreadProc(LPVOID param);
 
@@ -135,10 +139,30 @@ static void SaveDeltasCallback(void)
 
 /* ---- Entry Point ---- */
 
+/* The Windows Run entry supplies this switch; opening Lumos manually keeps
+   the current brightness (or the configured schedule) as before. */
+static BOOL IsWindowsLoginLaunch(const WCHAR *commandLine)
+{
+    int argc = 0;
+    BOOL loginLaunch = FALSE;
+    if (!commandLine || !commandLine[0]) return FALSE;
+    WCHAR **argv = CommandLineToArgvW(commandLine, &argc);
+    if (!argv) return FALSE;
+    for (int i = 1; i < argc; i++) {
+        if (_wcsicmp(argv[i], LUMOS_STARTUP_ARGUMENT) == 0) {
+            loginLaunch = TRUE;
+            break;
+        }
+    }
+    LocalFree(argv);
+    return loginLaunch;
+}
+
 int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdLineA, int showCmd)
 {
     (void)hPrev; (void)cmdLineA; (void)showCmd;
     g_hInst = hInst;
+    BOOL loginLaunch = IsWindowsLoginLaunch(GetCommandLineW());
 
     /* Unique cross-process message id (same value in every Lumos build).
        Used both to signal an older instance to quit and to receive that signal. */
@@ -171,6 +195,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdLineA, int showCmd
     memset(&g_monitors, 0, sizeof(g_monitors));
     Monitor_Enumerate(&g_monitors);
     Settings_Init(&g_settings);
+    Settings_UpgradeAutostart(); /* Add the login switch to this exe's legacy Run entry. */
     Settings_LoadDeltas(&g_settings, &g_monitors);
 
     if (!UI_Init(hInst)) {
@@ -226,11 +251,11 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdLineA, int showCmd
     RegisterHotkeys(g_hwndHidden);
     InstallMouseHook();
 
-    /* Brightness schedule: suspend on manual slider changes, tick every minute,
-       and apply the current time slot immediately at startup. */
+    /* Login starts at Day until the next schedule anchor. Manual launches
+       retain the existing schedule behavior. */
     UI_SetManualChangeCallback(SliderManualChange);
     SetTimer(g_hwndHidden, SCHEDULE_TIMER_ID, SCHEDULE_TICK_MS, NULL);
-    Schedule_ApplyNow();
+    ApplyStartupBrightness(loginLaunch);
 
     /* Idle auto-dim tick. Always armed: the handler returns at once when the
        feature is off, which keeps enable/disable free of timer bookkeeping. */
@@ -462,14 +487,37 @@ static void HandleHotkey(int id)
 static void ApplyPreset(int index)
 {
     if (index < 0 || index >= g_settings.presetCount) return;
-    g_masterTarget = (int)g_settings.presets[index].brightness;
+    ApplyPresetBrightness(g_settings.presets[index].brightness);
+}
+
+static void ApplyPresetBrightness(DWORD brightness)
+{
+    g_masterTarget = (int)brightness;
     g_masterTargetValid = TRUE;
     UI_SetMasterTarget(g_masterTarget);
-    Monitor_SetAllBrightness(&g_monitors, g_settings.presets[index].brightness);
+    Monitor_SetAllBrightness(&g_monitors, g_masterTarget);
     Monitor_RefreshBrightness(&g_monitors);
     UI_RefreshPopup(g_hwndPopup, &g_monitors);
 
     ManualChange();
+}
+
+static void ApplyStartupBrightness(BOOL loginLaunch)
+{
+    if (!loginLaunch) {
+        Schedule_ApplyNow();
+        return;
+    }
+
+    /* Treat Day as a preset selection, including per-monitor offsets and
+       suspension of the schedule until its next anchor. */
+    ApplyPresetBrightness((DWORD)Settings_DayBrightness(&g_settings));
+
+    /* Displays can still be reconnecting at login. The existing bounded
+       rescan/retry path re-applies the latest intent, so a later manual,
+       schedule or idle change always takes precedence over this startup value. */
+    g_rescan.reapplyBrightness = TRUE;
+    ScheduleRescanFromTrigger(g_hwndHidden);
 }
 
 /* ---- Monitor rescan (async) ---- */
@@ -574,11 +622,17 @@ static void ScheduleRescanFromTrigger(HWND hwnd)
 
 /* ---- Schedule runtime ---- */
 
-static int CurrentMinuteOfDay(void)
+/* Use FILETIME arithmetic on local calendar fields, without timezone conversion:
+   schedule anchors are wall-clock times. Keeping the date also handles a single
+   anchor at the current minute (next occurrence is tomorrow) and long sleeps. */
+static ULONGLONG CurrentLocalMinute(int *minuteOfDay)
 {
     SYSTEMTIME st;
+    FILETIME ft;
     GetLocalTime(&st);
-    return st.wHour * 60 + st.wMinute;
+    *minuteOfDay = st.wHour * 60 + st.wMinute;
+    if (!SystemTimeToFileTime(&st, &ft)) return 0;
+    return (((ULONGLONG)ft.dwHighDateTime << 32) | ft.dwLowDateTime) / 600000000ULL;
 }
 
 /* Push the schedule's brightness for the current time, unless suspended,
@@ -596,10 +650,14 @@ static void Schedule_ApplyNow(void)
         return;
     }
 
-    int now = CurrentMinuteOfDay();
+    int now;
+    ULONGLONG localMinute = CurrentLocalMinute(&now);
 
     if (g_scheduleSuspended) {
-        if (Schedule_ShouldResume(g_scheduleSuspendMinute, g_scheduleResumeMinute, now))
+        BOOL resume = g_scheduleResumeLocalMinute && localMinute
+            ? localMinute >= g_scheduleResumeLocalMinute
+            : Schedule_ShouldResume(g_scheduleSuspendMinute, g_scheduleResumeMinute, now);
+        if (resume)
             g_scheduleSuspended = FALSE;
         else
             return;
@@ -651,11 +709,15 @@ static void Schedule_Suspend(void)
 {
     if (!g_settings.scheduleEnabled || g_settings.scheduleCount == 0)
         return;
-    int now = CurrentMinuteOfDay();
+    int now;
+    ULONGLONG localMinute = CurrentLocalMinute(&now);
     g_scheduleSuspended = TRUE;
     g_scheduleSuspendMinute = now;
     g_scheduleResumeMinute =
         Schedule_NextAnchorMinute(g_settings.schedule, g_settings.scheduleCount, now);
+    int untilResume = g_scheduleResumeMinute - now;
+    if (untilResume <= 0) untilResume += 1440;
+    g_scheduleResumeLocalMinute = localMinute ? localMinute + (ULONGLONG)untilResume : 0;
     g_scheduleLastApplied = -1;  /* force re-apply after resume */
 }
 
@@ -867,6 +929,9 @@ static void HandleMonitorResult(HWND hwnd, MonitorResult *result)
             monitor->brightnessMax = result->maximum;
             UI_RefreshPopup(g_hwndPopup, &g_monitors);
         } else {
+            /* Failed results are writes. A display can answer reads at login
+               before accepting writes; retry the current intent after recovery. */
+            g_rescan.reapplyBrightness = TRUE;
             Monitor_RefreshBrightness(&g_monitors);
             ScheduleRescanThrottled(hwnd);
         }
@@ -917,8 +982,10 @@ static void AdoptMonitorList(MonitorList *fresh)
     Settings_LoadDeltas(&g_settings, &g_monitors);
     g_hwndPopup = UI_CreatePopup(g_hInst, &g_monitors);
 
-    /* A monitor connected while idle must inherit the idle level too. */
-    if (g_rescan.reapplyBrightness || g_idleDimmed) {
+    /* Keep a pending restore through placeholder results, even after retries
+       expire. A monitor connected while idle must inherit the idle level too. */
+    if ((g_rescan.reapplyBrightness || g_idleDimmed) &&
+        Monitor_HasControllable(&g_monitors)) {
         g_rescan.reapplyBrightness = FALSE;
         TIMED("rescan done: ReapplyBrightness", ReapplyBrightness());
     }

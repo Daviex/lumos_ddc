@@ -2,7 +2,8 @@
 
 `test_settings.c` includes the real `presets.c` implementation and redirects
 every filesystem, INI and registry API it uses to in-memory mocks. It verifies
-path bounds, quoted autostart commands, API errors and idempotent disabling.
+path bounds, quoted autostart commands, safe migration of legacy Run entries,
+API errors, idempotent disabling and the configured Day/Giorno preset lookup.
 Running it does not launch Lumos or change the registry or configuration files.
 
 From the repository root with a Windows Clang/MinGW toolchain in `PATH`:
@@ -82,4 +83,16 @@ endpoints, renamed/reordered displays and ambiguous monitor identities.
 ```powershell
 clang -std=c11 -Wall -Wextra -Werror -DUNICODE -D_UNICODE tests/test_brightness.c brightness.c -o build/test_brightness.exe
 ./build/test_brightness.exe
+```
+
+`test_startup.c` includes the real application orchestration with mocked clock,
+timers, windows, settings and monitor I/O. It checks the login argument, manual
+launch behavior, Day priority until the next dated schedule anchor, idle and
+manual overrides, and recovery of the latest target after delayed monitor
+discovery, exhausted retries and failed writes. The application entry point is never called.
+Day lookup and registry migration are covered separately by `test_settings.c`.
+
+```powershell
+clang -O2 -std=c11 -Wall -Wextra -Werror -DUNICODE -D_UNICODE -ffunction-sections -fdata-sections tests/test_startup.c brightness.c schedule.c '-Wl,--gc-sections' -lshell32 -o build/test_startup.exe
+./build/test_startup.exe
 ```
