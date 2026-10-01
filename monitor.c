@@ -1,8 +1,94 @@
 #include "monitor.h"
 #include "wmibright.h"
+#include "monitor_worker.h"
 #include <physicalmonitorenumerationapi.h>
 #include <highlevelmonitorconfigurationapi.h>
 #include <stdio.h>
+#include <stdarg.h>
+#include <stdlib.h>
+#include <strsafe.h>
+
+typedef struct HandleLease {
+    HANDLE handle;
+    unsigned references;
+    struct HandleLease *next;
+} HandleLease;
+
+static SRWLOCK g_leaseLock = SRWLOCK_INIT;
+/* Serializes native handle acquisition/destruction, never taken by UI setters. */
+static SRWLOCK g_acquireLock = SRWLOCK_INIT;
+static HandleLease *g_leases;
+
+static BOOL TrackHandle(HANDLE handle)
+{
+    HandleLease *lease;
+    AcquireSRWLockExclusive(&g_leaseLock);
+    for (lease = g_leases; lease; lease = lease->next)
+        if (lease->handle == handle) break;
+    if (!lease) {
+        lease = (HandleLease *)malloc(sizeof(*lease));
+        if (lease) {
+            lease->handle = handle;
+            lease->references = 0;
+            lease->next = g_leases;
+            g_leases = lease;
+        }
+    }
+    if (lease) ++lease->references;
+    ReleaseSRWLockExclusive(&g_leaseLock);
+    return lease != NULL;
+}
+
+void Monitor_Retain(const BrightMonitor *mon)
+{
+    if (!mon->hasHandle) return;
+    AcquireSRWLockExclusive(&g_leaseLock);
+    for (HandleLease *lease = g_leases; lease; lease = lease->next) {
+        if (lease->handle == mon->hPhysical) {
+            ++lease->references;
+            break;
+        }
+    }
+    ReleaseSRWLockExclusive(&g_leaseLock);
+}
+
+void Monitor_Release(const BrightMonitor *mon)
+{
+    if (!mon->hasHandle) return;
+    AcquireSRWLockExclusive(&g_leaseLock);
+    for (HandleLease *lease = g_leases; lease; lease = lease->next) {
+        if (lease->handle == mon->hPhysical) {
+            if (lease->references > 0) --lease->references;
+            break;
+        }
+    }
+    ReleaseSRWLockExclusive(&g_leaseLock);
+    MonitorWorker_Wake();
+}
+
+void Monitor_FlushRetiredHandles(void)
+{
+    /* A hung rescan must not prevent writes through still-live handles. */
+    if (!TryAcquireSRWLockExclusive(&g_acquireLock)) return;
+    for (;;) {
+        HandleLease *retired = NULL;
+        AcquireSRWLockExclusive(&g_leaseLock);
+        HandleLease **link = &g_leases;
+        while (*link) {
+            if ((*link)->references == 0) {
+                retired = *link;
+                *link = retired->next;
+                break;
+            }
+            link = &(*link)->next;
+        }
+        ReleaseSRWLockExclusive(&g_leaseLock);
+        if (!retired) break;
+        DestroyPhysicalMonitor(retired->handle);
+        free(retired);
+    }
+    ReleaseSRWLockExclusive(&g_acquireLock);
+}
 
 /* ---- Logging (only in debug builds: -DDEBUG) ---- */
 
@@ -11,6 +97,7 @@
 #include <shlobj.h>
 
 static FILE *g_logFile = NULL;
+static SRWLOCK g_logLock = SRWLOCK_INIT;
 
 /* The log goes to %APPDATA%\Lumos, next to config.ini, and not next to the
    exe: the app normally lives under Program Files, where a non-elevated
@@ -21,9 +108,9 @@ static void LogOpen(void)
     if (g_logFile) return;
     WCHAR path[MAX_PATH];
     if (SUCCEEDED(SHGetFolderPathW(NULL, CSIDL_APPDATA, NULL, 0, path))) {
-        wcscat(path, L"\\Lumos");
+        if (FAILED(StringCchCatW(path, MAX_PATH, L"\\Lumos"))) return;
         CreateDirectoryW(path, NULL);
-        wcscat(path, L"\\lumos-ddc.log");
+        if (FAILED(StringCchCatW(path, MAX_PATH, L"\\lumos-ddc.log"))) return;
     } else {
         wcscpy(path, L".\\lumos-ddc.log");
     }
@@ -32,8 +119,9 @@ static void LogOpen(void)
 
 static void Log(const char *fmt, ...)
 {
+    AcquireSRWLockExclusive(&g_logLock);
     if (!g_logFile) LogOpen();
-    if (!g_logFile) return;
+    if (!g_logFile) { ReleaseSRWLockExclusive(&g_logLock); return; }
 
     SYSTEMTIME st;
     GetLocalTime(&st);
@@ -48,12 +136,14 @@ static void Log(const char *fmt, ...)
 
     fprintf(g_logFile, "\n");
     fflush(g_logFile);
+    ReleaseSRWLockExclusive(&g_logLock);
 }
 
 static void LogW(const char *prefix, const WCHAR *wstr)
 {
+    AcquireSRWLockExclusive(&g_logLock);
     if (!g_logFile) LogOpen();
-    if (!g_logFile) return;
+    if (!g_logFile) { ReleaseSRWLockExclusive(&g_logLock); return; }
 
     SYSTEMTIME st;
     GetLocalTime(&st);
@@ -62,6 +152,7 @@ static void LogW(const char *prefix, const WCHAR *wstr)
             st.wHour, st.wMinute, st.wSecond, st.wMilliseconds,
             prefix, wstr);
     fflush(g_logFile);
+    ReleaseSRWLockExclusive(&g_logLock);
 }
 
 #else
@@ -260,7 +351,7 @@ static BOOL TryAttachWmiPanel(EnumCtx *ctx, HMONITOR hMon, BrightMonitor *bm)
     for (int i = 0; i < ctx->wmiCount; i++) {
         WCHAR wmiKey[256];
         NormalizeWmiInstance(ctx->wmiPanels[i].instanceName, wmiKey, 256);
-        if (_wcsicmp(monKey, wmiKey) == 0) {
+        if (_wcsicmp(monKey, wmiKey) == 0 && ctx->wmiPanels[i].currentBrightness <= 100) {
             bm->backend = BACKEND_WMI;
             bm->controllable = TRUE;
             bm->brightnessMin = 0;
@@ -282,6 +373,7 @@ static BOOL CALLBACK MonitorEnumProc(HMONITOR hMon, HDC hdcMon, LPRECT lpRect, L
     DWORD numPhysical = 0;
 
     (void)hdcMon;
+    (void)lpRect;
 
     Log("EnumProc: hMonitor=%p rect=(%ld,%ld)-(%ld,%ld)",
         (void *)hMon, lpRect->left, lpRect->top, lpRect->right, lpRect->bottom);
@@ -300,8 +392,21 @@ static BOOL CALLBACK MonitorEnumProc(HMONITOR hMon, HDC hdcMon, LPRECT lpRect, L
         return TRUE;
     }
 
-    if (GetPhysicalMonitorsFromHMONITOR(hMon, numPhysical, phys)) {
+    BOOL *tracked = (BOOL *)calloc(numPhysical, sizeof(BOOL));
+    if (!tracked) { free(phys); return TRUE; }
+    AcquireSRWLockExclusive(&g_acquireLock);
+    BOOL acquired = GetPhysicalMonitorsFromHMONITOR(hMon, numPhysical, phys);
+    if (acquired) {
+        for (DWORD i = 0; i < numPhysical; i++) {
+            tracked[i] = TrackHandle(phys[i].hPhysicalMonitor);
+            if (!tracked[i]) DestroyPhysicalMonitor(phys[i].hPhysicalMonitor);
+        }
+    }
+    ReleaseSRWLockExclusive(&g_acquireLock);
+    MonitorWorker_Wake();
+    if (acquired) {
         for (DWORD i = 0; i < numPhysical && ml->count < MAX_MONITORS; i++) {
+            if (!tracked[i]) continue;
             LogW("  Physical monitor", phys[i].szPhysicalMonitorDescription);
             Log("    hPhysical=%p", phys[i].hPhysicalMonitor);
 
@@ -314,6 +419,7 @@ static BOOL CALLBACK MonitorEnumProc(HMONITOR hMon, HDC hdcMon, LPRECT lpRect, L
             bm->hPhysical = phys[i].hPhysicalMonitor;
             bm->hasHandle = TRUE;
             bm->hMonitor = hMon;
+            GetMonitorInstanceKey(hMon, bm->deviceInstance, ARRAYSIZE(bm->deviceInstance));
 
             /* Try to get friendly name from EnumDisplayDevices */
             WCHAR friendly[128] = { 0 };
@@ -336,7 +442,7 @@ static BOOL CALLBACK MonitorEnumProc(HMONITOR hMon, HDC hdcMon, LPRECT lpRect, L
             DWORD bMin = 0, bCur = 0, bMax = 0;
             BOOL brOk = GetMonitorBrightness(phys[i].hPhysicalMonitor, &bMin, &bCur, &bMax);
 
-            if (brOk && bMax > bMin) {
+            if (brOk && bMax > bMin && bCur >= bMin && bCur <= bMax) {
                 bm->backend = BACKEND_DDC;
                 bm->controllable = TRUE;
                 bm->brightnessMin = bMin;
@@ -354,13 +460,22 @@ static BOOL CALLBACK MonitorEnumProc(HMONITOR hMon, HDC hdcMon, LPRECT lpRect, L
             }
 
             ml->count++;
+            tracked[i] = FALSE; /* ownership transferred to the monitor list */
         }
     } else {
         Log("  GetPhysicalMonitorsFromHMONITOR FAILED, err=%lu", GetLastError());
-        for (DWORD i = 0; i < numPhysical; i++)
-            DestroyPhysicalMonitor(phys[i].hPhysicalMonitor);
     }
 
+    for (DWORD i = 0; i < numPhysical; i++) {
+        if (tracked[i]) {
+            BrightMonitor excess = { 0 };
+            excess.hasHandle = TRUE;
+            excess.hPhysical = phys[i].hPhysicalMonitor;
+            Monitor_Release(&excess);
+        }
+    }
+
+    free(tracked);
     free(phys);
     return TRUE;
 }
@@ -401,44 +516,43 @@ void Monitor_Enumerate(MonitorList *ml)
 void Monitor_Cleanup(MonitorList *ml)
 {
     for (int i = 0; i < ml->count; i++) {
-        if (ml->monitors[i].hasHandle)
-            DestroyPhysicalMonitor(ml->monitors[i].hPhysical);
+        Monitor_Release(&ml->monitors[i]);
         ml->monitors[i].hasHandle = FALSE;
     }
     ml->count = 0;
 }
 
-void Monitor_RefreshBrightness(MonitorList *ml)
+DWORD Monitor_RefreshBrightnessSync(MonitorList *ml)
 {
-    /* Throttle: don't hammer DDC bus more than once per 200ms */
-    static DWORD lastRefresh = 0;
-    DWORD now = GetTickCount();
-    if (now - lastRefresh < 200)
-        return;
-    lastRefresh = now;
-
+    DWORD readMask = 0;
     for (int i = 0; i < ml->count; i++) {
         BrightMonitor *bm = &ml->monitors[i];
         if (bm->backend == BACKEND_DDC && bm->hasHandle) {
+            DWORD minimum, current, maximum;
             BOOL ok = GetMonitorBrightness(bm->hPhysical,
-                                 &bm->brightnessMin,
-                                 &bm->brightnessCur,
-                                 &bm->brightnessMax);
-            if (!ok) {
+                                 &minimum, &current, &maximum);
+            if (ok && maximum > minimum && current >= minimum && current <= maximum) {
+                bm->brightnessMin = minimum;
+                bm->brightnessCur = current;
+                bm->brightnessMax = maximum;
+                readMask |= 1u << i;
+            } else {
                 Log("RefreshBrightness[%d] FAILED, err=%lu", i, GetLastError());
             }
         } else if (bm->backend == BACKEND_WMI) {
             DWORD pct = 0;
-            if (Wmi_GetBrightness(bm->wmiInstance, &pct)) {
+            if (Wmi_GetBrightness(bm->wmiInstance, &pct) && pct <= 100) {
                 bm->brightnessCur = pct;   /* WMI range is fixed 0-100 */
+                readMask |= 1u << i;
             } else {
                 Log("RefreshBrightness[%d] WMI failed", i);
             }
         }
     }
+    return readMask;
 }
 
-BOOL Monitor_SetBrightness(BrightMonitor *mon, DWORD percent)
+BOOL Monitor_SetBrightnessSync(BrightMonitor *mon, DWORD percent)
 {
     if (!mon->controllable)
         return FALSE;
@@ -453,11 +567,12 @@ BOOL Monitor_SetBrightness(BrightMonitor *mon, DWORD percent)
         return ok;
     }
 
-    if (!mon->hasHandle)
+    if (!mon->hasHandle || mon->backend != BACKEND_DDC ||
+        mon->brightnessMax <= mon->brightnessMin)
         return FALSE;
 
     DWORD range = mon->brightnessMax - mon->brightnessMin;
-    DWORD value = mon->brightnessMin + (range * percent) / 100;
+    DWORD value = mon->brightnessMin + (DWORD)(((ULONGLONG)range * percent) / 100);
 
     Log("SetBrightness: '%ls' pct=%lu val=%lu (range %lu-%lu) hPhys=%p",
         mon->name, percent, value, mon->brightnessMin, mon->brightnessMax, mon->hPhysical);
@@ -472,30 +587,36 @@ BOOL Monitor_SetBrightness(BrightMonitor *mon, DWORD percent)
     return ok;
 }
 
-static BOOL HandleReferencedBy(const MonitorList *keep, HANDLE h)
+void Monitor_PreviewBrightness(BrightMonitor *mon, DWORD percent)
 {
-    if (!keep) return FALSE;
-    for (int i = 0; i < keep->count; i++)
-        if (keep->monitors[i].hasHandle && keep->monitors[i].hPhysical == h)
-            return TRUE;
-    return FALSE;
+    if (percent > 100) percent = 100;
+    DWORD range = mon->brightnessMax - mon->brightnessMin;
+    mon->brightnessCur = mon->backend == BACKEND_WMI ? percent :
+        mon->brightnessMin + (DWORD)(((ULONGLONG)range * percent) / 100);
+}
+
+BOOL Monitor_SetBrightness(BrightMonitor *mon, DWORD percent)
+{
+    if (!mon->controllable) return FALSE;
+    if (percent > 100) percent = 100;
+    if (!MonitorWorker_Running()) return Monitor_SetBrightnessSync(mon, percent);
+    if (!MonitorWorker_Set(mon, percent)) return FALSE;
+    Monitor_PreviewBrightness(mon, percent);
+    return TRUE;
+}
+
+void Monitor_RefreshBrightness(MonitorList *ml)
+{
+    if (MonitorWorker_Running()) MonitorWorker_Refresh(ml);
+    else Monitor_RefreshBrightnessSync(ml);
 }
 
 void Monitor_CleanupExcept(MonitorList *ml, const MonitorList *keep)
 {
-    for (int i = 0; i < ml->count; i++) {
-        BrightMonitor *bm = &ml->monitors[i];
-        if (!bm->hasHandle)
-            continue;
-        if (HandleReferencedBy(keep, bm->hPhysical)) {
-            /* The other list holds the same handle, so it stays alive and will
-               be released when that list is retired. Worst case we leak one
-               handle; destroying it would break brightness control outright. */
-            Log("Cleanup: keeping handle %p, still referenced", bm->hPhysical);
-            continue;
-        }
-        DestroyPhysicalMonitor(bm->hPhysical);
-    }
+    /* Every enumeration and queued snapshot has its own references. Releasing
+       this list cannot invalidate either keep or an in-flight hardware call. */
+    (void)keep;
+    Monitor_Cleanup(ml);
     memset(ml, 0, sizeof(*ml));
 }
 
@@ -521,7 +642,7 @@ static DWORD BrightnessToPercent(BrightMonitor *mon)
 {
     DWORD range = mon->brightnessMax - mon->brightnessMin;
     if (range == 0) return 0;
-    return ((mon->brightnessCur - mon->brightnessMin) * 100) / range;
+    return (DWORD)(((ULONGLONG)(mon->brightnessCur - mon->brightnessMin) * 100) / range);
 }
 
 void Monitor_AdjustActive(MonitorList *ml, int delta)

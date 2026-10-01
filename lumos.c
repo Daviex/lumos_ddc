@@ -7,9 +7,11 @@
 #include <stdio.h>
 #include <stdarg.h>
 #include <stdlib.h>
+#include <strsafe.h>
 
 #include "resource.h"
 #include "monitor.h"
+#include "monitor_worker.h"
 #include "ui.h"
 #include "presets.h"
 #include "capture.h"
@@ -82,7 +84,8 @@ static BOOL         g_scheduleSuspended = FALSE;
 static int          g_scheduleSuspendMinute = 0;   /* minute-of-day at suspend */
 static int          g_scheduleResumeMinute = 0;    /* next anchor to resume at */
 static int          g_scheduleLastApplied = -1;    /* last brightness pushed by the schedule */
-static int          g_masterTarget = -1;      /* intended base percent, tracked across hotkey presses */
+static int          g_masterTarget;          /* intended base percent, including negative delta compensation */
+static BOOL         g_masterTargetValid;
 static BOOL         g_idleDimmed = FALSE;     /* TRUE while the idle level is on the monitors */
 static DWORD        g_rescanStartTick = 0;    /* when the current worker was launched */
 static DWORD        g_rescanGeneration = 0;   /* incremented per launch */
@@ -114,6 +117,8 @@ typedef struct { HWND hwnd; DWORD gen; } RescanArgs;
 static void Schedule_ApplyNow(void);
 static void Schedule_Suspend(void);
 static void ManualChange(void);
+static void SliderManualChange(int row, int target);
+static BOOL SameDisplay(const BrightMonitor *a, const BrightMonitor *b);
 static int  MasterTargetFromMonitors(void);
 static void Idle_Tick(void);
 static void Idle_Restore(void);
@@ -166,6 +171,11 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdLineA, int showCmd
 
     if (!UI_Init(hInst)) {
         MessageBoxW(NULL, L"Failed to initialize UI", APP_NAME, MB_ICONERROR);
+        Monitor_Cleanup(&g_monitors);
+        Monitor_FlushRetiredHandles();
+        CoUninitialize();
+        ReleaseMutex(hMutex);
+        CloseHandle(hMutex);
         return 1;
     }
 
@@ -183,6 +193,18 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdLineA, int showCmd
     g_hwndHidden = CreateWindowExW(WS_EX_TOOLWINDOW, APPCLASS, APP_NAME,
                                     WS_POPUP, 0, 0, 0, 0,
                                     NULL, NULL, hInst, NULL);
+
+    if (!g_hwndHidden || !MonitorWorker_Start(g_hwndHidden, &g_monitors)) {
+        MessageBoxW(NULL, L"Failed to start monitor worker", APP_NAME, MB_ICONERROR);
+        Monitor_Cleanup(&g_monitors);
+        Monitor_FlushRetiredHandles();
+        UI_Shutdown();
+        if (g_hwndHidden) DestroyWindow(g_hwndHidden);
+        CoUninitialize();
+        ReleaseMutex(hMutex);
+        CloseHandle(hMutex);
+        return 1;
+    }
 
     /* Re-enumerate on session unlock and on display power-on. Windows does not
        reliably send WM_DISPLAYCHANGE across a lock screen, so cached DDC handles
@@ -202,7 +224,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdLineA, int showCmd
 
     /* Brightness schedule: suspend on manual slider changes, tick every minute,
        and apply the current time slot immediately at startup. */
-    UI_SetManualChangeCallback(ManualChange);
+    UI_SetManualChangeCallback(SliderManualChange);
     SetTimer(g_hwndHidden, SCHEDULE_TIMER_ID, SCHEDULE_TICK_MS, NULL);
     Schedule_ApplyNow();
 
@@ -211,11 +233,12 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdLineA, int showCmd
     SetTimer(g_hwndHidden, IDLE_TIMER_ID, IDLE_TICK_MS, NULL);
 
     /* Message loop */
-    MSG msg;
-    while (GetMessageW(&msg, NULL, 0, 0)) {
+    MSG msg = { 0 };
+    while (GetMessageW(&msg, NULL, 0, 0) > 0) {
         TranslateMessage(&msg);
         DispatchMessageW(&msg);
     }
+    int exitCode = (int)msg.wParam;
 
     /* Cleanup */
     RemoveMouseHook();
@@ -223,7 +246,11 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdLineA, int showCmd
     if (g_hPowerNotify) UnregisterPowerSettingNotification(g_hPowerNotify);
     WTSUnRegisterSessionNotification(g_hwndHidden);
     RemoveTrayIcon();
+    if (g_hwndPopup) DestroyWindow(g_hwndPopup);
     Monitor_Cleanup(&g_monitors);
+    MonitorWorker_Stop();
+    while (PeekMessageW(&msg, g_hwndHidden, WM_MONITOR_RESULT, WM_MONITOR_RESULT, PM_REMOVE))
+        free((void *)msg.lParam);
     UI_Shutdown();
     CoUninitialize();
     /* Release before closing so a replacing instance sees WAIT_OBJECT_0 promptly
@@ -231,7 +258,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdLineA, int showCmd
     ReleaseMutex(hMutex);
     CloseHandle(hMutex);
 
-    return (int)msg.wParam;
+    return exitCode;
 }
 
 /* ---- Tray Icon ---- */
@@ -266,9 +293,9 @@ static void DbgLog(const char *fmt, ...)
         /* Same folder as config.ini, for the reason explained in monitor.c. */
         WCHAR path[MAX_PATH];
         if (SUCCEEDED(SHGetFolderPathW(NULL, CSIDL_APPDATA, NULL, 0, path))) {
-            wcscat(path, L"\\Lumos");
+            if (FAILED(StringCchCatW(path, MAX_PATH, L"\\Lumos"))) return;
             CreateDirectoryW(path, NULL);
-            wcscat(path, L"\\lumos-app.log");
+            if (FAILED(StringCchCatW(path, MAX_PATH, L"\\lumos-app.log"))) return;
         } else {
             wcscpy(path, L".\\lumos-app.log");
         }
@@ -315,11 +342,7 @@ static BOOL IsCursorOverTrayIcon(POINT ptPhysical)
     HRESULT hr = Shell_NotifyIconGetRect(&nii, &rcIcon);
     if (SUCCEEDED(hr)) {
         /* Both rcIcon and ptPhysical are in physical (unscaled) pixels */
-        BOOL hit = PtInRect(&rcIcon, ptPhysical);
-        DbgLog("GetRect OK: icon=[%d,%d,%d,%d] cursor=[%d,%d] hit=%d",
-               rcIcon.left, rcIcon.top, rcIcon.right, rcIcon.bottom,
-               ptPhysical.x, ptPhysical.y, hit);
-        return hit;
+        return PtInRect(&rcIcon, ptPhysical);
     }
     DbgLog("GetRect FAILED hr=0x%08X hwnd=%p id=%u",
            (unsigned)hr, (void*)nii.hWnd, nii.uID);
@@ -330,9 +353,8 @@ static LRESULT CALLBACK MouseHookProc(int nCode, WPARAM wParam, LPARAM lParam)
 {
     if (nCode >= 0 && wParam == WM_MOUSEWHEEL) {
         MSLLHOOKSTRUCT *mhs = (MSLLHOOKSTRUCT *)lParam;
-        DbgLog("WM_MOUSEWHEEL at [%d,%d] mouseData=0x%08X",
-               (int)mhs->pt.x, (int)mhs->pt.y, (unsigned)mhs->mouseData);
         if (IsCursorOverTrayIcon(mhs->pt)) {
+            DbgLog("Tray mouse wheel: mouseData=0x%08X", (unsigned)mhs->mouseData);
             short delta = (short)HIWORD(mhs->mouseData);
             PostMessageW(g_hwndHidden, WM_HOTKEY,
                          (WPARAM)(delta > 0 ? WM_HOTKEY_BRIGHTEN : WM_HOTKEY_DIM), 0);
@@ -388,7 +410,7 @@ static int MasterTargetFromMonitors(void)
         BrightMonitor *mon = &g_monitors.monitors[i];
         if (!mon->controllable) continue;
         DWORD range = mon->brightnessMax - mon->brightnessMin;
-        int pct = range > 0 ? (int)(((mon->brightnessCur - mon->brightnessMin) * 100) / range) : 0;
+        int pct = range > 0 ? (int)(((ULONGLONG)(mon->brightnessCur - mon->brightnessMin) * 100) / range) : 0;
         sum += pct - mon->delta;
         cnt++;
     }
@@ -407,8 +429,10 @@ static void HandleHotkey(int id)
     }
 
     /* Initialize target from current state if needed */
-    if (g_masterTarget < 0)
+    if (!g_masterTargetValid) {
         g_masterTarget = MasterTargetFromMonitors();
+        g_masterTargetValid = TRUE;
+    }
 
     g_masterTarget += delta;
 
@@ -425,6 +449,7 @@ static void HandleHotkey(int id)
     int hi = 100 - minDelta;  /* so monitor with min delta can reach 100 */
     if (g_masterTarget < lo) g_masterTarget = lo;
     if (g_masterTarget > hi) g_masterTarget = hi;
+    UI_SetMasterTarget(g_masterTarget);
 
     TIMED("hotkey: SetAllBrightness",
           Monitor_SetAllBrightness(&g_monitors, g_masterTarget));
@@ -441,7 +466,7 @@ static void HandleHotkey(int id)
             if (g_monitors.monitors[i].hMonitor == hCurMon && g_monitors.monitors[i].controllable) {
                 BrightMonitor *mon = &g_monitors.monitors[i];
                 DWORD range = mon->brightnessMax - mon->brightnessMin;
-                pct = range > 0 ? (int)(((mon->brightnessCur - mon->brightnessMin) * 100) / range) : 0;
+                pct = range > 0 ? (int)(((ULONGLONG)(mon->brightnessCur - mon->brightnessMin) * 100) / range) : 0;
                 break;
             }
         }
@@ -460,6 +485,8 @@ static void ApplyPreset(int index)
 {
     if (index < 0 || index >= g_settings.presetCount) return;
     g_masterTarget = (int)g_settings.presets[index].brightness;
+    g_masterTargetValid = TRUE;
+    UI_SetMasterTarget(g_masterTarget);
     Monitor_SetAllBrightness(&g_monitors, g_settings.presets[index].brightness);
     Monitor_RefreshBrightness(&g_monitors);
     UI_RefreshPopup(g_hwndPopup, &g_monitors);
@@ -488,7 +515,10 @@ static DWORD WINAPI RescanThreadProc(LPVOID param)
     /* Post even on alloc failure (fresh == NULL) so the busy flag is cleared.
        The generation lets the main thread recognise a result from a worker it
        already wrote off, which may arrive minutes late or never. */
-    PostMessageW(hwnd, WM_APP_RESCAN_DONE, (WPARAM)gen, (LPARAM)fresh);
+    if (!PostMessageW(hwnd, WM_APP_RESCAN_DONE, (WPARAM)gen, (LPARAM)fresh) && fresh) {
+        Monitor_Cleanup(fresh);
+        free(fresh);
+    }
     return 0;
 }
 
@@ -509,12 +539,15 @@ static void StartRescan(HWND hwnd)
     args->hwnd = hwnd;
     args->gen = ++g_rescanGeneration;
     g_rescanAwaitedGen = args->gen;
+#ifdef DEBUG
+    DWORD generation = args->gen; /* worker frees args as soon as it starts */
+#endif
     g_rescanStartTick = GetTickCount();
 
     HANDLE h = CreateThread(NULL, 0, RescanThreadProc, args, 0, NULL);
     if (h) {
         CloseHandle(h);
-        DbgLog("rescan: worker %lu launched", args->gen);
+        DbgLog("rescan: worker %lu launched", generation);
         g_lastRescanTick = g_rescanStartTick;
         SetTimer(hwnd, RESCAN_WATCHDOG_TIMER_ID, RESCAN_WATCHDOG_MS, NULL);
     } else {
@@ -594,6 +627,8 @@ static void Schedule_ApplyNow(void)
 
     g_scheduleLastApplied = value;
     g_masterTarget = value;
+    g_masterTargetValid = TRUE;
+    UI_SetMasterTarget(value);
     TIMED("schedule: SetAllBrightness", Monitor_SetAllBrightness(&g_monitors, value));
     UI_RefreshPopup(g_hwndPopup, &g_monitors);  /* no-op if popup hidden */
 }
@@ -609,6 +644,7 @@ static void ReapplyBrightness(void)
     /* Woke up with nobody at the keyboard (display power-on, unlock by another
        session): hold the idle level instead of restoring the full one. */
     if (g_idleDimmed) {
+        UI_SetMasterTarget(g_settings.idleDimPercent);
         TIMED("reapply(idle level): SetAllBrightness",
               Monitor_SetAllBrightness(&g_monitors, g_settings.idleDimPercent));
         return;
@@ -618,7 +654,8 @@ static void ReapplyBrightness(void)
         Schedule_ApplyNow();
         return;
     }
-    if (g_masterTarget >= 0) {         /* skip if the user never set a level yet */
+    if (g_masterTargetValid) {        /* skip if the user never set a level yet */
+        UI_SetMasterTarget(g_masterTarget);
         TIMED("reapply(master): SetAllBrightness",
               Monitor_SetAllBrightness(&g_monitors, g_masterTarget));
         UI_RefreshPopup(g_hwndPopup, &g_monitors);
@@ -644,6 +681,24 @@ static void ManualChange(void)
 {
     g_idleDimmed = FALSE;   /* the user just set a level; do not restore over it */
     Schedule_Suspend();
+}
+
+static void SliderManualChange(int row, int target)
+{
+    g_masterTarget = row < 0 ? target : MasterTargetFromMonitors();
+    g_masterTargetValid = TRUE;
+    UI_SetMasterTarget(g_masterTarget);
+    ManualChange();
+}
+
+static BOOL SameDisplay(const BrightMonitor *a, const BrightMonitor *b)
+{
+    if (a->backend != b->backend || !b->controllable) return FALSE;
+    if (a->backend == BACKEND_WMI)
+        return _wcsicmp(a->wmiInstance, b->wmiInstance) == 0;
+    if (a->deviceInstance[0] || b->deviceInstance[0])
+        return _wcsicmp(a->deviceInstance, b->deviceInstance) == 0;
+    return a->hMonitor && a->hMonitor == b->hMonitor;
 }
 
 /* ---- Idle auto-dim ---- */
@@ -696,9 +751,12 @@ static void Idle_Dim(void)
     }
     if (block != DIMBLOCK_NONE)
         return;
-    if (g_masterTarget < 0)
+    if (!g_masterTargetValid) {
         g_masterTarget = MasterTargetFromMonitors();
+        g_masterTargetValid = TRUE;
+    }
     g_idleDimmed = TRUE;
+    UI_SetMasterTarget(g_settings.idleDimPercent);
     DbgLog("Idle dim -> %d%% (restore target %d)", g_settings.idleDimPercent, g_masterTarget);
     TIMED("idle dim: SetAllBrightness",
           Monitor_SetAllBrightness(&g_monitors, g_settings.idleDimPercent));
@@ -764,8 +822,7 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
             break;
         case IDM_AUTOSTART: {
             BOOL current = Settings_GetAutostart();
-            Settings_SetAutostart(!current);
-            g_settings.autostart = !current;
+            g_settings.autostart = Settings_SetAutostart(!current) ? !current : current;
             Settings_Save(&g_settings);
             break;
         }
@@ -788,8 +845,9 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
         case IDM_SETTINGS_SAVED: {
             /* The window already wrote the edited values into g_settings.
                Persist them, then apply the ones with a runtime effect. */
-            if (Settings_GetAutostart() != g_settings.autostart)
-                Settings_SetAutostart(g_settings.autostart);
+            if (Settings_GetAutostart() != g_settings.autostart &&
+                !Settings_SetAutostart(g_settings.autostart))
+                g_settings.autostart = Settings_GetAutostart();
             Settings_Save(&g_settings);
             if (!g_settings.idleDimEnabled)
                 Idle_Restore();           /* undo an active dim right away */
@@ -885,6 +943,24 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
         }
         return 0;
 
+    case WM_MONITOR_RESULT: {
+        MonitorResult *result = (MonitorResult *)lParam;
+        if (result && MonitorWorker_Accept(result)) {
+            if (result->success) {
+                BrightMonitor *monitor = &g_monitors.monitors[result->index];
+                monitor->brightnessMin = result->minimum;
+                monitor->brightnessCur = result->current;
+                monitor->brightnessMax = result->maximum;
+                UI_RefreshPopup(g_hwndPopup, &g_monitors);
+            } else {
+                Monitor_RefreshBrightness(&g_monitors);
+                ScheduleRescanThrottled(hwnd);
+            }
+        }
+        free(result);
+        return 0;
+    }
+
     case WM_APP_RESCAN_DONE: {
         /* Worker finished enumerating. Swap in the fresh list and rebuild the
            popup here on the UI thread (window ops must not run on the worker). */
@@ -930,15 +1006,29 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
         g_rescanRetry = 0;
 
         if (fresh) {
-            /* Release the handles we are replacing, except any the fresh list
-               has acquired again: destroying those would invalidate the list we
-               are about to adopt. */
+            /* Finish any active drag against the old topology before replacing
+               it. In-flight hardware calls retain their own handle leases. */
+            if (g_hwndPopup) DestroyWindow(g_hwndPopup);
+            g_hwndPopup = NULL;
+            MonitorTarget pending[MAX_MONITORS];
+            DWORD pendingMask = MonitorWorker_PendingTargets(pending);
+            for (int i = 0; i < MAX_MONITORS; i++) {
+                if (!(pendingMask & (1u << i))) continue;
+                int matches = 0;
+                for (int j = 0; j < g_monitors.count; j++)
+                    if (SameDisplay(&pending[i].monitor, &g_monitors.monitors[j])) ++matches;
+                if (matches != 1) pendingMask &= ~(1u << i);
+            }
+            if ((g_reapplyOnRescan || g_idleDimmed) &&
+                (g_idleDimmed || (g_settings.scheduleEnabled &&
+                 g_settings.scheduleCount > 0 && !g_scheduleSuspended)))
+                pendingMask = 0; /* current automatic policy supersedes old queued values */
+            MonitorWorker_Reset();
             TIMED("rescan done: cleanup",
                   Monitor_CleanupExcept(&g_monitors, fresh));
             g_monitors = *fresh;            /* adopt fresh list (plain struct copy) */
             free(fresh);
             Settings_LoadDeltas(&g_settings, &g_monitors);
-            if (g_hwndPopup) DestroyWindow(g_hwndPopup);
             g_hwndPopup = UI_CreatePopup(g_hInst, &g_monitors);
             /* g_idleDimmed is included so a monitor plugged in during an idle
                stretch gets the idle level too, instead of staying bright. */
@@ -947,6 +1037,22 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
                 /* restore our level after wake/unlock/display-on */
                 TIMED("rescan done: ReapplyBrightness", ReapplyBrightness());
             }
+            /* Transfer only outstanding requests to an unambiguous match.
+               A reordered or disconnected display must not redirect a write. */
+            for (int i = 0; i < MAX_MONITORS; i++) {
+                if (!(pendingMask & (1u << i))) continue;
+                int match = -1, matches = 0;
+                for (int j = 0; j < g_monitors.count; j++) {
+                    if (SameDisplay(&pending[i].monitor, &g_monitors.monitors[j])) {
+                        match = j;
+                        ++matches;
+                    }
+                }
+                if (matches == 1)
+                    Monitor_SetBrightness(&g_monitors.monitors[match], pending[i].percent);
+            }
+            /* Enumeration may have read before a write completed. */
+            Monitor_RefreshBrightness(&g_monitors);
         }
         g_rescanBusy = 0;
         if (g_rescanPending) {   /* triggers arrived mid-run: coalesce one more */

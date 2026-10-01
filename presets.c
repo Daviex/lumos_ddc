@@ -1,5 +1,6 @@
 #include "presets.h"
 #include <shlobj.h>
+#include <strsafe.h>
 #include <stdio.h>
 
 #define REG_RUN_KEY L"Software\\Microsoft\\Windows\\CurrentVersion\\Run"
@@ -13,17 +14,22 @@ static void EnsureDirectory(const WCHAR *path)
 void Settings_Init(Settings *s)
 {
     WCHAR appData[MAX_PATH];
+    WCHAR settingsDir[MAX_PATH];
 
     memset(s, 0, sizeof(*s));
     s->step = 5;   /* brightness step for hotkeys and mouse wheel */
     s->autostart = FALSE;
 
-    if (SUCCEEDED(SHGetFolderPathW(NULL, CSIDL_APPDATA, NULL, 0, appData))) {
-        wsprintfW(s->iniPath, L"%s\\" APP_NAME, appData);
-        EnsureDirectory(s->iniPath);
-        wsprintfW(s->iniPath, L"%s\\" APP_NAME L"\\config.ini", appData);
+    if (SUCCEEDED(SHGetFolderPathW(NULL, CSIDL_APPDATA, NULL, 0, appData)) &&
+        SUCCEEDED(StringCchPrintfW(settingsDir, ARRAYSIZE(settingsDir),
+                                  L"%s\\" APP_NAME, appData)) &&
+        SUCCEEDED(StringCchPrintfW(s->iniPath, ARRAYSIZE(s->iniPath),
+                                  L"%s\\config.ini", settingsDir))) {
+        EnsureDirectory(settingsDir);
     } else {
-        wcscpy(s->iniPath, L".\\config.ini");
+        /* Preserve the local fallback if AppData or the complete path does
+           not fit; never read or write an INI at a truncated path. */
+        StringCchCopyW(s->iniPath, ARRAYSIZE(s->iniPath), L".\\config.ini");
     }
 
     /* If file doesn't exist, create defaults */
@@ -188,20 +194,39 @@ void Settings_Save(Settings *s)
     }
 }
 
-void Settings_SetAutostart(BOOL enable)
+BOOL Settings_SetAutostart(BOOL enable)
 {
     HKEY hKey;
-    if (RegOpenKeyExW(HKEY_CURRENT_USER, REG_RUN_KEY, 0, KEY_SET_VALUE, &hKey) == ERROR_SUCCESS) {
-        if (enable) {
-            WCHAR exePath[MAX_PATH];
-            GetModuleFileNameW(NULL, exePath, MAX_PATH);
-            RegSetValueExW(hKey, APP_NAME, 0, REG_SZ,
-                           (BYTE *)exePath, (DWORD)((wcslen(exePath) + 1) * sizeof(WCHAR)));
-        } else {
-            RegDeleteValueW(hKey, APP_NAME);
-        }
-        RegCloseKey(hKey);
+    LONG status;
+    WCHAR command[MAX_PATH + 2];
+
+    if (enable) {
+        WCHAR exePath[MAX_PATH];
+        DWORD length = GetModuleFileNameW(NULL, exePath, ARRAYSIZE(exePath));
+        if (length == 0 || length >= ARRAYSIZE(exePath) ||
+            FAILED(StringCchPrintfW(command, ARRAYSIZE(command),
+                                    L"\"%s\"", exePath)))
+            return FALSE;
+
+        status = RegCreateKeyExW(HKEY_CURRENT_USER, REG_RUN_KEY, 0, NULL, 0,
+                                 KEY_SET_VALUE, NULL, &hKey, NULL);
+    } else {
+        status = RegOpenKeyExW(HKEY_CURRENT_USER, REG_RUN_KEY, 0,
+                               KEY_SET_VALUE, &hKey);
+        if (status == ERROR_FILE_NOT_FOUND) return TRUE;
     }
+    if (status != ERROR_SUCCESS) return FALSE;
+
+    if (enable) {
+        status = RegSetValueExW(hKey, APP_NAME, 0, REG_SZ,
+                               (const BYTE *)command,
+                               (DWORD)((wcslen(command) + 1) * sizeof(WCHAR)));
+    } else {
+        status = RegDeleteValueW(hKey, APP_NAME);
+        if (status == ERROR_FILE_NOT_FOUND) status = ERROR_SUCCESS;
+    }
+    RegCloseKey(hKey);
+    return status == ERROR_SUCCESS;
 }
 
 BOOL Settings_GetAutostart(void)

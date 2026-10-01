@@ -21,6 +21,7 @@
 - [Screenshots](#screenshots)
 - [Features](#features)
 - [How it works](#how-it-works)
+- [Privacy and system access](#privacy-and-system-access)
 - [Install](#install)
 - [Usage](#usage)
 - [Configuration](#configuration)
@@ -88,6 +89,19 @@ Internal laptop panels do not answer DDC/CI (that is an I2C protocol meant for e
 
 During enumeration each monitor is probed for DDC/CI first; if that fails, Lumos matches the display to its WMI panel by a normalized PnP instance key (never by hardcoded vendor or product IDs) and drives it over WMI instead. Everything above the backend (sliders, hotkeys, schedule, presets) is backend-agnostic.
 
+Brightness writes and refreshes run on a background worker, so dragging a slider does not wait for DDC/CI or WMI calls. Each monitor has one pending target: newer slider values replace older pending values while the display is busy, and releasing the slider submits its final value. The popup displays the requested level immediately; the display's actual response time still depends on its hardware and driver.
+
+The popup keeps its GDI bitmap, fonts, brushes and rounded-corner mask between frames, and skips unchanged frames. Rendering remains native GDI.
+
+## Privacy and system access
+
+Lumos makes no network requests, downloads no updates and sends no telemetry. Clicking the repository link in About opens GitHub in your browser. The badges in this README contact `img.shields.io` when the document is viewed.
+
+- Brightness control uses local DDC/CI and WMI interfaces.
+- A mouse hook detects wheel input over the tray icon; registered hotkeys and Windows' last-input timestamp support shortcuts and idle dimming. Lumos does not record typed keys.
+- Call detection reads Windows' per-user microphone/camera usage state from the registry. Lumos does not capture audio or video.
+- Settings are stored in `%APPDATA%\Lumos\config.ini`. Optional autostart writes the current user's registry `Run` entry. Debug builds also write local diagnostic logs in `%APPDATA%\Lumos`, including wheel events over the tray icon; release builds omit these logs.
+
 ## Install
 
 1. Download the latest `lumos-vX.Y.Z.exe` from the [Releases](https://github.com/sfortis/lumos_ddc/releases/latest) page.
@@ -102,7 +116,7 @@ Cross-compile from Linux/WSL with MinGW (outputs land in `build/`):
 mkdir -p build
 x86_64-w64-mingw32-windres lumos.rc -O coff -o build/lumos.res
 x86_64-w64-mingw32-gcc -O2 -Wall -mwindows -DUNICODE -D_UNICODE \
-  lumos.c monitor.c ui.c presets.c schedule.c wmibright.c capture.c build/lumos.res \
+  lumos.c monitor.c monitor_worker.c ui.c presets.c schedule.c wmibright.c capture.c build/lumos.res \
   -o build/lumos.exe \
   -ldxva2 -luser32 -lgdi32 -lshell32 -lcomctl32 -ladvapi32 -lole32 -loleaut32 -lwbemuuid -ldwmapi -lwtsapi32 -lkernel32 -lm
 ```

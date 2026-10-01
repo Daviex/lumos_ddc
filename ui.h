@@ -46,6 +46,10 @@ BOOL UI_IsPopupVisible(HWND hwnd);
 /* Refresh popup visuals (call after brightness changes) */
 void UI_RefreshPopup(HWND hwnd, MonitorList *ml);
 
+/* Preserve the application's base target when monitor deltas clamp the
+   hardware values, so the master slider does not infer a different target. */
+void UI_SetMasterTarget(int target);
+
 /* Show brief OSD overlay on a monitor */
 void UI_ShowOSD(HINSTANCE hInst, HMONITOR hMon, int percent);
 
@@ -53,9 +57,10 @@ void UI_ShowOSD(HINSTANCE hInst, HMONITOR hMon, int percent);
 typedef void (*DeltaSaveCallback)(void);
 void UI_SetDeltaSaveCallback(DeltaSaveCallback cb);
 
-/* Called when the user manually changes brightness via the popup slider,
-   so the schedule can suspend itself. */
-typedef void (*ManualChangeCallback)(void);
+/* Called when the user manually changes brightness via the popup slider.
+   row == -1 identifies the master slider and target is its extended base
+   brightness; otherwise row is the monitor index and target is 0-100. */
+typedef void (*ManualChangeCallback)(int row, int target);
 void UI_SetManualChangeCallback(ManualChangeCallback cb);
 
 /* Context menu dimensions */

@@ -42,8 +42,8 @@ void Settings_Save(Settings *s);
 /* Create default INI if it doesn't exist */
 void Settings_CreateDefaults(Settings *s);
 
-/* Toggle autostart registry entry */
-void Settings_SetAutostart(BOOL enable);
+/* Toggle autostart registry entry; returns whether the change succeeded. */
+BOOL Settings_SetAutostart(BOOL enable);
 BOOL Settings_GetAutostart(void);
 
 /* Load delta values from settings into monitors (match by name) */

@@ -26,6 +26,7 @@ typedef struct {
     int      delta;        /* per-monitor brightness offset, -40..+40 */
     MonitorBackend backend;
     WCHAR    wmiInstance[256]; /* WMI InstanceName when backend == BACKEND_WMI */
+    WCHAR    deviceInstance[256]; /* stable PnP key for matching across rescans */
 } BrightMonitor;
 
 typedef struct {
@@ -46,11 +47,8 @@ void Monitor_RefreshBrightness(MonitorList *ml);
 /* Set brightness for a single monitor (0-100 percentage) */
 BOOL Monitor_SetBrightness(BrightMonitor *mon, DWORD percent);
 
-/* Release the handles of *ml that *keep does not also reference, and empty the
-   list. dxva2 hands out the same physical monitor handle for the same display
-   again, so releasing a list wholesale can invalidate a handle another list has
-   just acquired: every write through it then fails with
-   ERROR_GRAPHICS_INVALID_PHYSICAL_MONITOR_HANDLE. */
+/* Release this list's leases and empty it. Other enumerations and queued
+   requests keep independently retained leases, even if dxva2 reuses a handle. */
 void Monitor_CleanupExcept(MonitorList *ml, const MonitorList *keep);
 
 /* TRUE when at least one monitor in the list can actually be set. Tells a real
@@ -66,5 +64,18 @@ void Monitor_AdjustActive(MonitorList *ml, int delta);
 
 /* Cycle active monitor forward/backward */
 void Monitor_CycleActive(MonitorList *ml, int direction);
+
+/* UI setters/refreshes enqueue work after MonitorWorker_Start. These helpers
+   are used only by the hardware worker and the initial startup enumeration. */
+BOOL Monitor_SetBrightnessSync(BrightMonitor *mon, DWORD percent);
+/* Bit i is set only when monitor i was successfully read and validated. */
+DWORD Monitor_RefreshBrightnessSync(MonitorList *ml);
+void Monitor_PreviewBrightness(BrightMonitor *mon, DWORD percent);
+
+/* A queued request owns a lease independently of the UI's monitor list.
+   Handle destruction is deferred to the worker, including during rescans. */
+void Monitor_Retain(const BrightMonitor *mon);
+void Monitor_Release(const BrightMonitor *mon);
+void Monitor_FlushRetiredHandles(void);
 
 #endif /* MONITOR_H */
