@@ -38,7 +38,8 @@ typedef struct {
 /* Enumerate all physical monitors with DDC/CI support */
 void Monitor_Enumerate(MonitorList *ml);
 
-/* Free physical monitor handles */
+/* Release this list's leases and clear it. Other lists and queued requests
+   retain independent ownership even when dxva2 reuses the same handle. */
 void Monitor_Cleanup(MonitorList *ml);
 
 /* Refresh brightness values from hardware */
@@ -46,10 +47,6 @@ void Monitor_RefreshBrightness(MonitorList *ml);
 
 /* Set brightness for a single monitor (0-100 percentage) */
 BOOL Monitor_SetBrightness(BrightMonitor *mon, DWORD percent);
-
-/* Release this list's leases and empty it. Other enumerations and queued
-   requests keep independently retained leases, even if dxva2 reuses a handle. */
-void Monitor_CleanupExcept(MonitorList *ml, const MonitorList *keep);
 
 /* TRUE when at least one monitor in the list can actually be set. Tells a real
    enumeration apart from the placeholder Windows reports while a display is

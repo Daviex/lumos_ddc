@@ -250,6 +250,57 @@ static void TestResetLeasesAndGeneration(void)
     FinishTest();
 }
 
+static void TestWritePriorityRoundRobin(void)
+{
+    MonitorList view = MakeView();
+    MonitorTarget pending[MAX_MONITORS];
+    const int expectedIndices[] = { 0, 1, 2, 0 };
+    const DWORD expectedValues[] = { 10, 21, 32, 20 };
+    view.count = 3;
+    for (int i = 1; i < view.count; i++) {
+        view.monitors[i] = view.monitors[0];
+        view.monitors[i].hPhysical = (HANDLE)(UINT_PTR)(i + 1);
+    }
+
+    StartTest(&view, TRUE, FALSE);
+    InterlockedExchange(&refreshMask, 7);
+    CHECK(MonitorWorker_Set(&view.monitors[0], 10));
+    CHECK(WaitForSingleObject(writeEntered, TEST_TIMEOUT) == WAIT_OBJECT_0);
+    CHECK(MonitorWorker_Set(&view.monitors[0], 20));
+    CHECK(MonitorWorker_Set(&view.monitors[2], 32));
+    CHECK(MonitorWorker_Set(&view.monitors[1], 21));
+    MonitorWorker_Refresh(&view);
+
+    CHECK(MonitorWorker_PendingTargets(pending) == 7u);
+    CHECK(pending[0].percent == 20 && pending[1].percent == 21 && pending[2].percent == 32);
+    CHECK(ReadCounter(&leases) == 7);  /* In-flight + three writes + three reads. */
+    CHECK(ReadCounter(&writes) == 1 && ReadCounter(&refreshes) == 0);
+    SetEvent(allowWrite);
+
+    /* The repeated monitor zero waits for the other monitors' writes, and all
+       writes finish before any refresh result is posted. */
+    for (int i = 0; i < 4; i++) {
+        MonitorResult *result = WaitResult();
+        if (result) {
+            CHECK(result->index == expectedIndices[i]);
+            CHECK(result->current == expectedValues[i] && result->success);
+            CHECK(MonitorWorker_Accept(result) == (i != 0));
+        }
+        free(result);
+        CHECK(writtenValues[i] == expectedValues[i]);
+    }
+    for (int i = 0; i < view.count; i++) {
+        MonitorResult *result = WaitResult();
+        if (result) {
+            CHECK(result->index == i && result->current == 73);
+            CHECK(MonitorWorker_Accept(result));
+        }
+        free(result);
+    }
+    CHECK(ReadCounter(&writes) == 4 && ReadCounter(&refreshes) == 1);
+    FinishTest();
+}
+
 static void TestRefreshStaleSequence(void)
 {
     MonitorList view = MakeView();
@@ -307,6 +358,7 @@ int main(void)
 {
     TestSlowWriteCoalescing();
     TestResetLeasesAndGeneration();
+    TestWritePriorityRoundRobin();
     TestRefreshStaleSequence();
     TestHardwareFailures();
     if (ReadCounter(&failures)) {

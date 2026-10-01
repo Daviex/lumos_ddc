@@ -1,5 +1,5 @@
 /* Exercise the real popup renderer on offscreen DIBs and simulate mouse
-   messages. All window, capture, settings and monitor operations are mocked:
+   messages. All window, capture and monitor operations are mocked:
    this test creates no window and cannot change brightness or the registry. */
 #include <windows.h>
 #include <stdio.h>
@@ -52,7 +52,8 @@ static BOOL WINAPI MockDeleteObject(HGDIOBJ);
 #define CreateSolidBrush MockCreateSolidBrush
 #define DeleteDC MockDeleteDC
 #define DeleteObject MockDeleteObject
-#include "../ui.c"
+#include "../ui_graphics.c"
+#include "../ui_popup.c"
 #undef UpdateLayeredWindow
 #undef GetWindowLongPtrW
 #undef SetWindowLongPtrW
@@ -171,17 +172,6 @@ void Monitor_RefreshBrightness(MonitorList *view)
 {
     CHECK(view == &testMonitors);
     refreshCalls++;
-}
-
-BOOL Settings_GetAutostart(void)
-{
-    CHECK(FALSE); /* The popup never accesses autostart settings. */
-    return FALSE;
-}
-void Schedule_Sort(SchedulePoint *points, int count)
-{
-    (void)points; (void)count;
-    CHECK(FALSE); /* The popup never accesses the schedule editor. */
 }
 
 static void ManualChange(int row, int target)

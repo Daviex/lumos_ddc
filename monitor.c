@@ -1,4 +1,5 @@
 #include "monitor.h"
+#include "brightness.h"
 #include "wmibright.h"
 #include "monitor_worker.h"
 #include <physicalmonitorenumerationapi.h>
@@ -515,11 +516,10 @@ void Monitor_Enumerate(MonitorList *ml)
 
 void Monitor_Cleanup(MonitorList *ml)
 {
-    for (int i = 0; i < ml->count; i++) {
+    /* Other lists and in-flight requests retain their own leases. */
+    for (int i = 0; i < ml->count; i++)
         Monitor_Release(&ml->monitors[i]);
-        ml->monitors[i].hasHandle = FALSE;
-    }
-    ml->count = 0;
+    memset(ml, 0, sizeof(*ml));
 }
 
 DWORD Monitor_RefreshBrightnessSync(MonitorList *ml)
@@ -571,8 +571,7 @@ BOOL Monitor_SetBrightnessSync(BrightMonitor *mon, DWORD percent)
         mon->brightnessMax <= mon->brightnessMin)
         return FALSE;
 
-    DWORD range = mon->brightnessMax - mon->brightnessMin;
-    DWORD value = mon->brightnessMin + (DWORD)(((ULONGLONG)range * percent) / 100);
+    DWORD value = Brightness_ToRaw(mon, percent);
 
     Log("SetBrightness: '%ls' pct=%lu val=%lu (range %lu-%lu) hPhys=%p",
         mon->name, percent, value, mon->brightnessMin, mon->brightnessMax, mon->hPhysical);
@@ -589,10 +588,7 @@ BOOL Monitor_SetBrightnessSync(BrightMonitor *mon, DWORD percent)
 
 void Monitor_PreviewBrightness(BrightMonitor *mon, DWORD percent)
 {
-    if (percent > 100) percent = 100;
-    DWORD range = mon->brightnessMax - mon->brightnessMin;
-    mon->brightnessCur = mon->backend == BACKEND_WMI ? percent :
-        mon->brightnessMin + (DWORD)(((ULONGLONG)range * percent) / 100);
+    mon->brightnessCur = Brightness_ToRaw(mon, percent);
 }
 
 BOOL Monitor_SetBrightness(BrightMonitor *mon, DWORD percent)
@@ -609,15 +605,6 @@ void Monitor_RefreshBrightness(MonitorList *ml)
 {
     if (MonitorWorker_Running()) MonitorWorker_Refresh(ml);
     else Monitor_RefreshBrightnessSync(ml);
-}
-
-void Monitor_CleanupExcept(MonitorList *ml, const MonitorList *keep)
-{
-    /* Every enumeration and queued snapshot has its own references. Releasing
-       this list cannot invalidate either keep or an in-flight hardware call. */
-    (void)keep;
-    Monitor_Cleanup(ml);
-    memset(ml, 0, sizeof(*ml));
 }
 
 BOOL Monitor_HasControllable(const MonitorList *ml)
@@ -638,13 +625,6 @@ void Monitor_SetAllBrightness(MonitorList *ml, int percent)
     }
 }
 
-static DWORD BrightnessToPercent(BrightMonitor *mon)
-{
-    DWORD range = mon->brightnessMax - mon->brightnessMin;
-    if (range == 0) return 0;
-    return (DWORD)(((ULONGLONG)(mon->brightnessCur - mon->brightnessMin) * 100) / range);
-}
-
 void Monitor_AdjustActive(MonitorList *ml, int delta)
 {
     if (ml->count == 0) return;
@@ -654,7 +634,7 @@ void Monitor_AdjustActive(MonitorList *ml, int delta)
     BrightMonitor *mon = &ml->monitors[ml->active];
     if (!mon->controllable) return;
 
-    int pct = (int)BrightnessToPercent(mon) + delta;
+    int pct = Brightness_GetPercent(mon) + delta;
     if (pct < 0) pct = 0;
     if (pct > 100) pct = 100;
 

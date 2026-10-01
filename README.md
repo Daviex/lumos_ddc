@@ -116,7 +116,8 @@ Cross-compile from Linux/WSL with MinGW (outputs land in `build/`):
 mkdir -p build
 x86_64-w64-mingw32-windres lumos.rc -O coff -o build/lumos.res
 x86_64-w64-mingw32-gcc -O2 -Wall -mwindows -DUNICODE -D_UNICODE \
-  lumos.c monitor.c monitor_worker.c ui.c presets.c schedule.c wmibright.c capture.c build/lumos.res \
+  lumos.c monitor.c monitor_worker.c brightness.c \
+  ui.c ui_popup.c ui_graphics.c presets.c schedule.c wmibright.c capture.c build/lumos.res \
   -o build/lumos.exe \
   -ldxva2 -luser32 -lgdi32 -lshell32 -lcomctl32 -ladvapi32 -lole32 -loleaut32 -lwbemuuid -ldwmapi -lwtsapi32 -lkernel32 -lm
 ```
@@ -127,6 +128,18 @@ Or with MSVC from a Developer Command Prompt (also writes to `build/`):
 build.bat            :: release
 build.bat debug      :: debug build, logs to %APPDATA%\Lumos\lumos-*.log
 ```
+
+### Code organization
+
+- `lumos.c`: application lifecycle, tray/hotkeys, scheduling and monitor rescan coordination.
+- `monitor.c`, `wmibright.c`: hardware access and physical handle ownership.
+- `monitor_worker.c`: queued writes, refreshes and result delivery to the UI thread.
+- `brightness.c`: shared brightness calculations and monitor identity matching, with no hardware access.
+- `ui_popup.c`: brightness popup, drag handling and cached rendering.
+- `ui_graphics.c`: shared GDI/layered-window helpers; `ui.c`: OSD, menus and editors.
+- `presets.c`, `schedule.c`, `capture.c`: settings, time interpolation and local call-detection state.
+
+Regression test commands and their hardware mocks are documented in [tests/README.md](tests/README.md).
 
 ## Usage
 

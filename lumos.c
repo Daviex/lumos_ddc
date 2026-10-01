@@ -12,6 +12,7 @@
 #include "resource.h"
 #include "monitor.h"
 #include "monitor_worker.h"
+#include "brightness.h"
 #include "ui.h"
 #include "presets.h"
 #include "capture.h"
@@ -77,9 +78,6 @@ static NOTIFYICONDATAW g_nid;
 static HHOOK        g_mouseHook;
 static HPOWERNOTIFY g_hPowerNotify;   /* GUID_CONSOLE_DISPLAY_STATE registration */
 static UINT         g_wmTakeover;     /* cross-process "quit, I'm replacing you" message */
-static volatile LONG g_rescanBusy;    /* 1 while a rescan worker thread is in flight */
-static BOOL         g_rescanPending;  /* a trigger arrived mid-rescan; run once more (main thread only) */
-static BOOL         g_reapplyOnRescan; /* set by wake/unlock/display-on: re-push brightness after the rescan */
 static BOOL         g_scheduleSuspended = FALSE;
 static int          g_scheduleSuspendMinute = 0;   /* minute-of-day at suspend */
 static int          g_scheduleResumeMinute = 0;    /* next anchor to resume at */
@@ -87,12 +85,20 @@ static int          g_scheduleLastApplied = -1;    /* last brightness pushed by 
 static int          g_masterTarget;          /* intended base percent, including negative delta compensation */
 static BOOL         g_masterTargetValid;
 static BOOL         g_idleDimmed = FALSE;     /* TRUE while the idle level is on the monitors */
-static DWORD        g_rescanStartTick = 0;    /* when the current worker was launched */
-static DWORD        g_rescanGeneration = 0;   /* incremented per launch */
-static DWORD        g_rescanAwaitedGen = 0;   /* the only generation whose result we accept */
-static int          g_rescanRetry = 0;        /* index into kRescanBackoffMs */
-static int          g_rescanWriteOffs = 0;    /* consecutive workers the watchdog gave up on */
-static DWORD        g_lastRescanTick = 0;     /* when the last worker was launched */
+
+typedef struct {
+    volatile LONG busy;          /* one awaited worker; timed-out workers may still finish */
+    BOOL pending;               /* a trigger arrived while busy */
+    BOOL reapplyBrightness;     /* restore the intended level after wake/unlock */
+    DWORD startTick;
+    DWORD generation;
+    DWORD awaitedGeneration;
+    DWORD lastStartTick;
+    int retry;
+    int writeOffs;
+} RescanState;
+
+static RescanState g_rescan;
 
 static const WCHAR APPCLASS[] = L"LumosMain";
 
@@ -118,8 +124,6 @@ static void Schedule_ApplyNow(void);
 static void Schedule_Suspend(void);
 static void ManualChange(void);
 static void SliderManualChange(int row, int target);
-static BOOL SameDisplay(const BrightMonitor *a, const BrightMonitor *b);
-static int  MasterTargetFromMonitors(void);
 static void Idle_Tick(void);
 static void Idle_Restore(void);
 
@@ -401,22 +405,6 @@ static void ShowContextMenu(HWND hwnd)
 
 /* ---- Hotkey Handler ---- */
 
-/* Recover the intended base percent from what the monitors currently report:
-   average the readings, subtracting each monitor's delta to get the base. */
-static int MasterTargetFromMonitors(void)
-{
-    int sum = 0, cnt = 0;
-    for (int i = 0; i < g_monitors.count; i++) {
-        BrightMonitor *mon = &g_monitors.monitors[i];
-        if (!mon->controllable) continue;
-        DWORD range = mon->brightnessMax - mon->brightnessMin;
-        int pct = range > 0 ? (int)(((ULONGLONG)(mon->brightnessCur - mon->brightnessMin) * 100) / range) : 0;
-        sum += pct - mon->delta;
-        cnt++;
-    }
-    return cnt > 0 ? sum / cnt : 50;
-}
-
 static void HandleHotkey(int id)
 {
     int step = g_settings.step;
@@ -430,23 +418,14 @@ static void HandleHotkey(int id)
 
     /* Initialize target from current state if needed */
     if (!g_masterTargetValid) {
-        g_masterTarget = MasterTargetFromMonitors();
+        g_masterTarget = Brightness_MasterTarget(&g_monitors);
         g_masterTargetValid = TRUE;
     }
 
     g_masterTarget += delta;
 
-    /* Allow target to exceed 0-100 so monitors with large deltas can reach full range.
-       Limits: every monitor's (target + delta) should be able to span 0-100. */
-    int minDelta = 0, maxDelta = 0;
-    for (int i = 0; i < g_monitors.count; i++) {
-        if (!g_monitors.monitors[i].controllable) continue;
-        int d = g_monitors.monitors[i].delta;
-        if (d < minDelta) minDelta = d;
-        if (d > maxDelta) maxDelta = d;
-    }
-    int lo = 0 - maxDelta;   /* so monitor with max delta can reach 0 */
-    int hi = 100 - minDelta;  /* so monitor with min delta can reach 100 */
+    int lo, hi;
+    Brightness_TargetRange(&g_monitors, &lo, &hi);
     if (g_masterTarget < lo) g_masterTarget = lo;
     if (g_masterTarget > hi) g_masterTarget = hi;
     UI_SetMasterTarget(g_masterTarget);
@@ -465,8 +444,7 @@ static void HandleHotkey(int id)
         for (int i = 0; i < g_monitors.count; i++) {
             if (g_monitors.monitors[i].hMonitor == hCurMon && g_monitors.monitors[i].controllable) {
                 BrightMonitor *mon = &g_monitors.monitors[i];
-                DWORD range = mon->brightnessMax - mon->brightnessMin;
-                pct = range > 0 ? (int)(((ULONGLONG)(mon->brightnessCur - mon->brightnessMin) * 100) / range) : 0;
+                pct = Brightness_GetPercent(mon);
                 break;
             }
         }
@@ -496,6 +474,14 @@ static void ApplyPreset(int index)
 
 /* ---- Monitor rescan (async) ---- */
 
+/* Release an enumeration that was rejected or could not be delivered. */
+static void FreeMonitorList(MonitorList *list)
+{
+    if (!list) return;
+    Monitor_Cleanup(list);
+    free(list);
+}
+
 /* Worker thread: runs the slow DDC/CI enumeration OFF the UI thread, then hands
    the fresh list back via WM_APP_RESCAN_DONE. Kept off-thread because these
    calls can block for seconds while displays settle after unlock/power-on, and
@@ -515,10 +501,8 @@ static DWORD WINAPI RescanThreadProc(LPVOID param)
     /* Post even on alloc failure (fresh == NULL) so the busy flag is cleared.
        The generation lets the main thread recognise a result from a worker it
        already wrote off, which may arrive minutes late or never. */
-    if (!PostMessageW(hwnd, WM_APP_RESCAN_DONE, (WPARAM)gen, (LPARAM)fresh) && fresh) {
-        Monitor_Cleanup(fresh);
-        free(fresh);
-    }
+    if (!PostMessageW(hwnd, WM_APP_RESCAN_DONE, (WPARAM)gen, (LPARAM)fresh))
+        FreeMonitorList(fresh);
     return 0;
 }
 
@@ -527,33 +511,33 @@ static DWORD WINAPI RescanThreadProc(LPVOID param)
    burst of triggers that a single unlock produces). */
 static void StartRescan(HWND hwnd)
 {
-    if (InterlockedCompareExchange(&g_rescanBusy, 1, 0) != 0) {
-        g_rescanPending = TRUE;
+    if (InterlockedCompareExchange(&g_rescan.busy, 1, 0) != 0) {
+        g_rescan.pending = TRUE;
         return;
     }
     RescanArgs *args = (RescanArgs *)malloc(sizeof(RescanArgs));
     if (!args) {
-        g_rescanBusy = 0;
+        g_rescan.busy = 0;
         return;
     }
     args->hwnd = hwnd;
-    args->gen = ++g_rescanGeneration;
-    g_rescanAwaitedGen = args->gen;
+    args->gen = ++g_rescan.generation;
+    g_rescan.awaitedGeneration = args->gen;
 #ifdef DEBUG
     DWORD generation = args->gen; /* worker frees args as soon as it starts */
 #endif
-    g_rescanStartTick = GetTickCount();
+    g_rescan.startTick = GetTickCount();
 
     HANDLE h = CreateThread(NULL, 0, RescanThreadProc, args, 0, NULL);
     if (h) {
         CloseHandle(h);
         DbgLog("rescan: worker %lu launched", generation);
-        g_lastRescanTick = g_rescanStartTick;
+        g_rescan.lastStartTick = g_rescan.startTick;
         SetTimer(hwnd, RESCAN_WATCHDOG_TIMER_ID, RESCAN_WATCHDOG_MS, NULL);
     } else {
         free(args);
-        g_rescanAwaitedGen = 0;
-        g_rescanBusy = 0;   /* launch failed; keep the current list */
+        g_rescan.awaitedGeneration = 0;
+        g_rescan.busy = 0;   /* launch failed; keep the current list */
     }
 }
 
@@ -569,9 +553,9 @@ static void ScheduleRescan(HWND hwnd)
    real plug or unplug is delayed rather than dropped. */
 static void ScheduleRescanThrottled(HWND hwnd)
 {
-    g_rescanWriteOffs = 0;
-    g_rescanRetry = 0;
-    DWORD since = GetTickCount() - g_lastRescanTick;
+    g_rescan.writeOffs = 0;
+    g_rescan.retry = 0;
+    DWORD since = GetTickCount() - g_rescan.lastStartTick;
     DWORD delay = (since >= RESCAN_MIN_INTERVAL_MS)
                   ? RESCAN_DEBOUNCE_MS
                   : RESCAN_MIN_INTERVAL_MS - since;
@@ -582,8 +566,8 @@ static void ScheduleRescanThrottled(HWND hwnd)
    counters that stopped us retrying on our own. */
 static void ScheduleRescanFromTrigger(HWND hwnd)
 {
-    g_rescanWriteOffs = 0;
-    g_rescanRetry = 0;
+    g_rescan.writeOffs = 0;
+    g_rescan.retry = 0;
     KillTimer(hwnd, RESCAN_RETRY_TIMER_ID);   /* a pending backoff is now moot */
     ScheduleRescan(hwnd);
 }
@@ -685,20 +669,10 @@ static void ManualChange(void)
 
 static void SliderManualChange(int row, int target)
 {
-    g_masterTarget = row < 0 ? target : MasterTargetFromMonitors();
+    g_masterTarget = row < 0 ? target : Brightness_MasterTarget(&g_monitors);
     g_masterTargetValid = TRUE;
     UI_SetMasterTarget(g_masterTarget);
     ManualChange();
-}
-
-static BOOL SameDisplay(const BrightMonitor *a, const BrightMonitor *b)
-{
-    if (a->backend != b->backend || !b->controllable) return FALSE;
-    if (a->backend == BACKEND_WMI)
-        return _wcsicmp(a->wmiInstance, b->wmiInstance) == 0;
-    if (a->deviceInstance[0] || b->deviceInstance[0])
-        return _wcsicmp(a->deviceInstance, b->deviceInstance) == 0;
-    return a->hMonitor && a->hMonitor == b->hMonitor;
 }
 
 /* ---- Idle auto-dim ---- */
@@ -752,7 +726,7 @@ static void Idle_Dim(void)
     if (block != DIMBLOCK_NONE)
         return;
     if (!g_masterTargetValid) {
-        g_masterTarget = MasterTargetFromMonitors();
+        g_masterTarget = Brightness_MasterTarget(&g_monitors);
         g_masterTargetValid = TRUE;
     }
     g_idleDimmed = TRUE;
@@ -785,6 +759,216 @@ static void Idle_Tick(void)
     else if (!idle && g_idleDimmed)  Idle_Restore();
 }
 
+/* ---- Main-thread message handlers ---- */
+
+static void RestartSchedule(void)
+{
+    g_scheduleSuspended = FALSE;
+    g_scheduleLastApplied = -1;
+    Schedule_ApplyNow();
+}
+
+static void HandleCommand(HWND hwnd, int cmd)
+{
+    if (cmd >= IDM_PRESET_BASE && cmd < IDM_PRESET_BASE + MAX_PRESETS) {
+        ApplyPreset(cmd - IDM_PRESET_BASE);
+    } else switch (cmd) {
+    case IDM_RESCAN:
+        ScheduleRescanFromTrigger(hwnd);
+        break;
+    case IDM_AUTOSTART: {
+        BOOL current = Settings_GetAutostart();
+        g_settings.autostart = Settings_SetAutostart(!current) ? !current : current;
+        Settings_Save(&g_settings);
+        break;
+    }
+    case IDM_SCHEDULE_TOGGLE:
+        g_settings.scheduleEnabled = !g_settings.scheduleEnabled;
+        Settings_Save(&g_settings);
+        RestartSchedule();
+        break;
+    case IDM_IDLEDIM_TOGGLE:
+        g_settings.idleDimEnabled = !g_settings.idleDimEnabled;
+        Settings_Save(&g_settings);
+        if (!g_settings.idleDimEnabled)
+            Idle_Restore();   /* undo an active dim immediately */
+        break;
+    case IDM_SETTINGS:
+        UI_ShowSettings(hwnd, &g_settings);
+        break;
+    case IDM_SETTINGS_SAVED: {
+        /* The window already wrote the edited values into g_settings.
+           Persist them, then apply the ones with a runtime effect. */
+        if (Settings_GetAutostart() != g_settings.autostart &&
+            !Settings_SetAutostart(g_settings.autostart))
+            g_settings.autostart = Settings_GetAutostart();
+        Settings_Save(&g_settings);
+        if (!g_settings.idleDimEnabled)
+            Idle_Restore();           /* undo an active dim right away */
+        RestartSchedule();
+        break;
+    }
+    case IDM_SCHEDULE_EDIT:
+        UI_ShowScheduleEditor(hwnd, &g_settings);
+        break;
+    case IDM_SCHEDULE_SAVED:
+        Settings_Save(&g_settings);
+        RestartSchedule();
+        break;
+    case IDM_ABOUT:
+        UI_ShowAbout(hwnd);
+        break;
+    case IDM_EXIT:
+        PostQuitMessage(0);
+        break;
+    }
+}
+
+static void HandleTimer(HWND hwnd, WPARAM wParam)
+{
+    if (wParam == RESCAN_TIMER_ID) {
+        KillTimer(hwnd, RESCAN_TIMER_ID);
+        StartRescan(hwnd);
+    } else if (wParam == SCHEDULE_TIMER_ID) {
+        Schedule_ApplyNow();
+    } else if (wParam == IDLE_TIMER_ID) {
+        Idle_Tick();
+    } else if (wParam == RESCAN_WATCHDOG_TIMER_ID) {
+        KillTimer(hwnd, RESCAN_WATCHDOG_TIMER_ID);
+        if (g_rescan.busy) {
+            /* The worker is stuck inside a display driver call. It cannot be
+               killed safely, so it is left parked and its result will be
+               discarded; what matters is releasing the single-flight guard
+               so the app can rescan again. */
+            DbgLog("rescan: worker %lu written off after %lu ms",
+                   g_rescan.awaitedGeneration, GetTickCount() - g_rescan.startTick);
+            g_rescan.awaitedGeneration = 0;
+            g_rescan.busy = 0;
+            g_rescan.pending = FALSE;
+            if (++g_rescan.writeOffs <= RESCAN_MAX_WRITEOFFS)
+                ScheduleRescan(hwnd);   /* try once more with a fresh worker */
+            else
+                DbgLog("rescan: %d workers hung in a row, waiting for a new trigger",
+                       g_rescan.writeOffs);
+        }
+    } else if (wParam == RESCAN_RETRY_TIMER_ID) {
+        KillTimer(hwnd, RESCAN_RETRY_TIMER_ID);
+        StartRescan(hwnd);
+    }
+}
+
+static void HandleMonitorResult(HWND hwnd, MonitorResult *result)
+{
+    if (result && MonitorWorker_Accept(result)) {
+        if (result->success) {
+            BrightMonitor *monitor = &g_monitors.monitors[result->index];
+            monitor->brightnessMin = result->minimum;
+            monitor->brightnessCur = result->current;
+            monitor->brightnessMax = result->maximum;
+            UI_RefreshPopup(g_hwndPopup, &g_monitors);
+        } else {
+            Monitor_RefreshBrightness(&g_monitors);
+            ScheduleRescanThrottled(hwnd);
+        }
+    }
+    free(result);
+}
+
+/* Snapshot intent while the old topology is still alive. Current automatic
+   policy wins after wake; ambiguous identities never carry a pending write. */
+static DWORD CapturePendingTargets(MonitorTarget pending[MAX_MONITORS])
+{
+    DWORD mask = MonitorWorker_PendingTargets(pending);
+    for (int i = 0; i < MAX_MONITORS; i++) {
+        if ((mask & (1u << i)) &&
+            Monitor_FindUniqueDisplay(&g_monitors, &pending[i].monitor) < 0)
+            mask &= ~(1u << i);
+    }
+    if ((g_rescan.reapplyBrightness || g_idleDimmed) &&
+        (g_idleDimmed || (g_settings.scheduleEnabled &&
+         g_settings.scheduleCount > 0 && !g_scheduleSuspended)))
+        return 0;
+    return mask;
+}
+
+static void ApplyPendingTargets(const MonitorTarget pending[MAX_MONITORS], DWORD mask)
+{
+    for (int i = 0; i < MAX_MONITORS; i++) {
+        if (!(mask & (1u << i))) continue;
+        int match = Monitor_FindUniqueDisplay(&g_monitors, &pending[i].monitor);
+        if (match >= 0)
+            Monitor_SetBrightness(&g_monitors.monitors[match], pending[i].percent);
+    }
+}
+
+/* Takes ownership of fresh and rebuilds the popup on the main thread. */
+static void AdoptMonitorList(MonitorList *fresh)
+{
+    /* Finish any active drag against the old topology before replacing it.
+       In-flight hardware calls retain their own handle leases. */
+    if (g_hwndPopup) DestroyWindow(g_hwndPopup);
+    g_hwndPopup = NULL;
+    MonitorTarget pending[MAX_MONITORS];
+    DWORD pendingMask = CapturePendingTargets(pending);
+    MonitorWorker_Reset();
+    TIMED("rescan done: cleanup", Monitor_Cleanup(&g_monitors));
+    g_monitors = *fresh; /* Transfer ownership of the fresh list's leases. */
+    free(fresh);
+    Settings_LoadDeltas(&g_settings, &g_monitors);
+    g_hwndPopup = UI_CreatePopup(g_hInst, &g_monitors);
+
+    /* A monitor connected while idle must inherit the idle level too. */
+    if (g_rescan.reapplyBrightness || g_idleDimmed) {
+        g_rescan.reapplyBrightness = FALSE;
+        TIMED("rescan done: ReapplyBrightness", ReapplyBrightness());
+    }
+    ApplyPendingTargets(pending, pendingMask);
+    /* Enumeration may have read before a write completed. */
+    Monitor_RefreshBrightness(&g_monitors);
+}
+
+static void HandleRescanResult(HWND hwnd, DWORD gen, MonitorList *fresh)
+{
+    if (gen != g_rescan.awaitedGeneration) {
+        /* A worker the watchdog wrote off has finally returned. Its handles
+           describe a display topology we have already replaced. */
+        DbgLog("rescan: discarding late result from worker %lu", gen);
+        TIMED("rescan late: cleanup", FreeMonitorList(fresh));
+        return;   /* the busy flag belongs to the current worker now */
+    }
+
+    KillTimer(hwnd, RESCAN_WATCHDOG_TIMER_ID);
+    g_rescan.awaitedGeneration = 0;
+    g_rescan.writeOffs = 0;   /* this worker came back, the driver is answering */
+    DbgLog("rescan: worker %lu finished after %lu ms",
+           gen, GetTickCount() - g_rescan.startTick);
+
+    /* Reject a placeholder enumeration instead of adopting it: for a few
+       seconds after a display returns, Windows reports no monitor at all or
+       a generic panel, and adopting that silently kills brightness control
+       until the next display event. Retry on a backoff and keep the list we
+       have, which is either still valid or about to be replaced anyway. */
+    if (fresh && !Monitor_HasControllable(fresh) &&
+        (Monitor_HasControllable(&g_monitors) || g_rescan.reapplyBrightness) &&
+        g_rescan.retry < RESCAN_MAX_RETRIES) {
+        DWORD delay = kRescanBackoffMs[g_rescan.retry++];
+        DbgLog("rescan: nothing controllable, retry %d in %lu ms",
+               g_rescan.retry, delay);
+        TIMED("rescan rejected: cleanup", FreeMonitorList(fresh));
+        SetTimer(hwnd, RESCAN_RETRY_TIMER_ID, delay, NULL);
+        g_rescan.busy = 0;
+        return;
+    }
+    g_rescan.retry = 0;
+
+    if (fresh) AdoptMonitorList(fresh);
+    g_rescan.busy = 0;
+    if (g_rescan.pending) {   /* triggers arrived mid-run: coalesce one more */
+        g_rescan.pending = FALSE;
+        ScheduleRescan(hwnd);
+    }
+}
+
 /* ---- Main Window Proc ---- */
 
 static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
@@ -812,68 +996,9 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
         HandleHotkey((int)wParam);
         return 0;
 
-    case WM_COMMAND: {
-        int cmd = LOWORD(wParam);
-        if (cmd >= IDM_PRESET_BASE && cmd < IDM_PRESET_BASE + MAX_PRESETS) {
-            ApplyPreset(cmd - IDM_PRESET_BASE);
-        } else switch (cmd) {
-        case IDM_RESCAN:
-            ScheduleRescanFromTrigger(hwnd);
-            break;
-        case IDM_AUTOSTART: {
-            BOOL current = Settings_GetAutostart();
-            g_settings.autostart = Settings_SetAutostart(!current) ? !current : current;
-            Settings_Save(&g_settings);
-            break;
-        }
-        case IDM_SCHEDULE_TOGGLE:
-            g_settings.scheduleEnabled = !g_settings.scheduleEnabled;
-            Settings_Save(&g_settings);
-            g_scheduleSuspended = FALSE;      /* re-enable takes effect immediately */
-            g_scheduleLastApplied = -1;
-            Schedule_ApplyNow();
-            break;
-        case IDM_IDLEDIM_TOGGLE:
-            g_settings.idleDimEnabled = !g_settings.idleDimEnabled;
-            Settings_Save(&g_settings);
-            if (!g_settings.idleDimEnabled)
-                Idle_Restore();   /* undo an active dim immediately */
-            break;
-        case IDM_SETTINGS:
-            UI_ShowSettings(hwnd, &g_settings);
-            break;
-        case IDM_SETTINGS_SAVED: {
-            /* The window already wrote the edited values into g_settings.
-               Persist them, then apply the ones with a runtime effect. */
-            if (Settings_GetAutostart() != g_settings.autostart &&
-                !Settings_SetAutostart(g_settings.autostart))
-                g_settings.autostart = Settings_GetAutostart();
-            Settings_Save(&g_settings);
-            if (!g_settings.idleDimEnabled)
-                Idle_Restore();           /* undo an active dim right away */
-            g_scheduleSuspended = FALSE;  /* a schedule toggle takes effect now */
-            g_scheduleLastApplied = -1;
-            Schedule_ApplyNow();
-            break;
-        }
-        case IDM_SCHEDULE_EDIT:
-            UI_ShowScheduleEditor(hwnd, &g_settings);
-            break;
-        case IDM_SCHEDULE_SAVED:
-            Settings_Save(&g_settings);
-            g_scheduleSuspended = FALSE;
-            g_scheduleLastApplied = -1;
-            Schedule_ApplyNow();
-            break;
-        case IDM_ABOUT:
-            UI_ShowAbout(hwnd);
-            break;
-        case IDM_EXIT:
-            PostQuitMessage(0);
-            break;
-        }
+    case WM_COMMAND:
+        HandleCommand(hwnd, LOWORD(wParam));
         return 0;
-    }
 
     case WM_DISPLAYCHANGE:
         /* Monitor plugged/unplugged (resolution/topology change) */
@@ -886,7 +1011,7 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
         /* Session unlocked or reconnected: DDC handles may be stale */
         DbgLog("session change: %u", (unsigned)wParam);
         if (wParam == WTS_SESSION_UNLOCK || wParam == WTS_CONSOLE_CONNECT) {
-            g_reapplyOnRescan = TRUE;   /* restore brightness after the recovery rescan */
+            g_rescan.reapplyBrightness = TRUE;   /* restore brightness after the recovery rescan */
             ScheduleRescanFromTrigger(hwnd);
         }
         return 0;
@@ -900,167 +1025,28 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
                 pbs->DataLength >= 1) {
                 DbgLog("display power state = %u", (unsigned)pbs->Data[0]);
                 if (pbs->Data[0] != 0) {   /* 0 = off, non-zero = on/dimmed */
-                    g_reapplyOnRescan = TRUE;
+                    g_rescan.reapplyBrightness = TRUE;
                     ScheduleRescanFromTrigger(hwnd);
                 }
             }
         } else if (wParam == PBT_APMRESUMEAUTOMATIC || wParam == PBT_APMRESUMESUSPEND) {
             DbgLog("power: APM resume");
-            g_reapplyOnRescan = TRUE;   /* wake from sleep: displays often reset brightness */
+            g_rescan.reapplyBrightness = TRUE;   /* wake from sleep: displays often reset brightness */
             ScheduleRescanFromTrigger(hwnd);
         }
         return TRUE;
 
     case WM_TIMER:
-        if (wParam == RESCAN_TIMER_ID) {
-            KillTimer(hwnd, RESCAN_TIMER_ID);
-            StartRescan(hwnd);
-        } else if (wParam == SCHEDULE_TIMER_ID) {
-            Schedule_ApplyNow();
-        } else if (wParam == IDLE_TIMER_ID) {
-            Idle_Tick();
-        } else if (wParam == RESCAN_WATCHDOG_TIMER_ID) {
-            KillTimer(hwnd, RESCAN_WATCHDOG_TIMER_ID);
-            if (g_rescanBusy) {
-                /* The worker is stuck inside a display driver call. It cannot be
-                   killed safely, so it is left parked and its result will be
-                   discarded; what matters is releasing the single-flight guard
-                   so the app can rescan again. */
-                DbgLog("rescan: worker %lu written off after %lu ms",
-                       g_rescanAwaitedGen, GetTickCount() - g_rescanStartTick);
-                g_rescanAwaitedGen = 0;
-                g_rescanBusy = 0;
-                g_rescanPending = FALSE;
-                if (++g_rescanWriteOffs <= RESCAN_MAX_WRITEOFFS)
-                    ScheduleRescan(hwnd);   /* try once more with a fresh worker */
-                else
-                    DbgLog("rescan: %d workers hung in a row, waiting for a new trigger",
-                           g_rescanWriteOffs);
-            }
-        } else if (wParam == RESCAN_RETRY_TIMER_ID) {
-            KillTimer(hwnd, RESCAN_RETRY_TIMER_ID);
-            StartRescan(hwnd);
-        }
+        HandleTimer(hwnd, wParam);
         return 0;
 
-    case WM_MONITOR_RESULT: {
-        MonitorResult *result = (MonitorResult *)lParam;
-        if (result && MonitorWorker_Accept(result)) {
-            if (result->success) {
-                BrightMonitor *monitor = &g_monitors.monitors[result->index];
-                monitor->brightnessMin = result->minimum;
-                monitor->brightnessCur = result->current;
-                monitor->brightnessMax = result->maximum;
-                UI_RefreshPopup(g_hwndPopup, &g_monitors);
-            } else {
-                Monitor_RefreshBrightness(&g_monitors);
-                ScheduleRescanThrottled(hwnd);
-            }
-        }
-        free(result);
+    case WM_MONITOR_RESULT:
+        HandleMonitorResult(hwnd, (MonitorResult *)lParam);
         return 0;
-    }
 
-    case WM_APP_RESCAN_DONE: {
-        /* Worker finished enumerating. Swap in the fresh list and rebuild the
-           popup here on the UI thread (window ops must not run on the worker). */
-        DWORD gen = (DWORD)wParam;
-        MonitorList *fresh = (MonitorList *)lParam;
-
-        if (gen != g_rescanAwaitedGen) {
-            /* A worker the watchdog wrote off has finally returned. Its handles
-               describe a display topology we have already replaced. */
-            DbgLog("rescan: discarding late result from worker %lu", gen);
-            if (fresh) {
-                TIMED("rescan late: cleanup",
-                      Monitor_CleanupExcept(fresh, &g_monitors));
-                free(fresh);
-            }
-            return 0;   /* the busy flag belongs to the current worker now */
-        }
-
-        KillTimer(hwnd, RESCAN_WATCHDOG_TIMER_ID);
-        g_rescanAwaitedGen = 0;
-        g_rescanWriteOffs = 0;   /* this worker came back, the driver is answering */
-        DbgLog("rescan: worker %lu finished after %lu ms",
-               gen, GetTickCount() - g_rescanStartTick);
-
-        /* Reject a placeholder enumeration instead of adopting it: for a few
-           seconds after a display returns, Windows reports no monitor at all or
-           a generic panel, and adopting that silently kills brightness control
-           until the next display event. Retry on a backoff and keep the list we
-           have, which is either still valid or about to be replaced anyway. */
-        if (fresh && !Monitor_HasControllable(fresh) &&
-            (Monitor_HasControllable(&g_monitors) || g_reapplyOnRescan) &&
-            g_rescanRetry < RESCAN_MAX_RETRIES) {
-            DWORD delay = kRescanBackoffMs[g_rescanRetry++];
-            DbgLog("rescan: nothing controllable, retry %d in %lu ms",
-                   g_rescanRetry, delay);
-            TIMED("rescan rejected: cleanup",
-                  Monitor_CleanupExcept(fresh, &g_monitors));
-            free(fresh);
-            SetTimer(hwnd, RESCAN_RETRY_TIMER_ID, delay, NULL);
-            g_rescanBusy = 0;
-            return 0;
-        }
-        g_rescanRetry = 0;
-
-        if (fresh) {
-            /* Finish any active drag against the old topology before replacing
-               it. In-flight hardware calls retain their own handle leases. */
-            if (g_hwndPopup) DestroyWindow(g_hwndPopup);
-            g_hwndPopup = NULL;
-            MonitorTarget pending[MAX_MONITORS];
-            DWORD pendingMask = MonitorWorker_PendingTargets(pending);
-            for (int i = 0; i < MAX_MONITORS; i++) {
-                if (!(pendingMask & (1u << i))) continue;
-                int matches = 0;
-                for (int j = 0; j < g_monitors.count; j++)
-                    if (SameDisplay(&pending[i].monitor, &g_monitors.monitors[j])) ++matches;
-                if (matches != 1) pendingMask &= ~(1u << i);
-            }
-            if ((g_reapplyOnRescan || g_idleDimmed) &&
-                (g_idleDimmed || (g_settings.scheduleEnabled &&
-                 g_settings.scheduleCount > 0 && !g_scheduleSuspended)))
-                pendingMask = 0; /* current automatic policy supersedes old queued values */
-            MonitorWorker_Reset();
-            TIMED("rescan done: cleanup",
-                  Monitor_CleanupExcept(&g_monitors, fresh));
-            g_monitors = *fresh;            /* adopt fresh list (plain struct copy) */
-            free(fresh);
-            Settings_LoadDeltas(&g_settings, &g_monitors);
-            g_hwndPopup = UI_CreatePopup(g_hInst, &g_monitors);
-            /* g_idleDimmed is included so a monitor plugged in during an idle
-               stretch gets the idle level too, instead of staying bright. */
-            if (g_reapplyOnRescan || g_idleDimmed) {
-                g_reapplyOnRescan = FALSE;
-                /* restore our level after wake/unlock/display-on */
-                TIMED("rescan done: ReapplyBrightness", ReapplyBrightness());
-            }
-            /* Transfer only outstanding requests to an unambiguous match.
-               A reordered or disconnected display must not redirect a write. */
-            for (int i = 0; i < MAX_MONITORS; i++) {
-                if (!(pendingMask & (1u << i))) continue;
-                int match = -1, matches = 0;
-                for (int j = 0; j < g_monitors.count; j++) {
-                    if (SameDisplay(&pending[i].monitor, &g_monitors.monitors[j])) {
-                        match = j;
-                        ++matches;
-                    }
-                }
-                if (matches == 1)
-                    Monitor_SetBrightness(&g_monitors.monitors[match], pending[i].percent);
-            }
-            /* Enumeration may have read before a write completed. */
-            Monitor_RefreshBrightness(&g_monitors);
-        }
-        g_rescanBusy = 0;
-        if (g_rescanPending) {   /* triggers arrived mid-run: coalesce one more */
-            g_rescanPending = FALSE;
-            ScheduleRescan(hwnd);
-        }
+    case WM_APP_RESCAN_DONE:
+        HandleRescanResult(hwnd, (DWORD)wParam, (MonitorList *)lParam);
         return 0;
-    }
 
     case WM_DESTROY:
         PostQuitMessage(0);

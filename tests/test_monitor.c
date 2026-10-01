@@ -136,7 +136,7 @@ static void TestReusedZeroHandleLeases(void)
     CHECK(TrackHandle(NULL));
     queued = first.monitors[0];
     Monitor_Retain(&queued);
-    Monitor_CleanupExcept(&first, &second);
+    Monitor_Cleanup(&first);
     Monitor_FlushRetiredHandles();
     CHECK(first.count == 0 && destroyCalls == 0);
     Monitor_Cleanup(&second);
@@ -208,7 +208,7 @@ static void TestLargeBrightnessRange(void)
     CHECK(lastWrite == 0x80000000u && monitor.brightnessCur == 0x80000000u);
     Monitor_PreviewBrightness(&monitor, 100);
     CHECK(monitor.brightnessCur == MAXDWORD);
-    CHECK(BrightnessToPercent(&monitor) == 100);
+    CHECK(Brightness_GetPercent(&monitor) == 100);
     CHECK(Monitor_SetBrightnessSync(&monitor, 1));
     CHECK(lastWrite == 42949673u);
     setSuccess = FALSE;

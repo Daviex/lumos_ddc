@@ -1,14 +1,12 @@
 #include "ui.h"
+#include "ui_graphics.h"
 #include "resource.h"
 #include <shellapi.h>
 #include <dwmapi.h>
-#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <windowsx.h>
 
 static HINSTANCE g_hInst;
-static const WCHAR POPUP_CLASS[]   = L"LumosPopup";
 static const WCHAR OSD_CLASS[]     = L"LumosOSD";
 static const WCHAR CTXMENU_CLASS[] = L"LumosCtxMenu";
 static const WCHAR SCHED_CLASS[]   = L"LumosSched";
@@ -21,725 +19,8 @@ static HWND g_aboutHwnd = NULL;
 static HWND g_setHwnd = NULL;
 static RECT g_aboutLinkRect = { 0, 0, 0, 0 };  /* hit rect for the repo link */
 
-/* ---- Popup data ---- */
-
-typedef struct {
-    MonitorList *ml;
-    int activeSlider;
-    int masterPercent;
-    int dragPercent;
-} PopupData;
-
-typedef struct {
-    int count;
-    int percent[MAX_MONITORS + 1];
-    int delta[MAX_MONITORS];
-    WCHAR name[MAX_MONITORS][128];
-} PopupFrame;
-
-typedef struct {
-    HDC dc;
-    HBITMAP bitmap;
-    HGDIOBJ originalBitmap;
-    BYTE *bits;
-    BYTE *alpha;
-    int width;
-    int height;
-    HFONT font;
-    HFONT fontBold;
-    HFONT fontSmall;
-    HBRUSH background;
-    HBRUSH track;
-    HBRUSH accent;
-    HBRUSH surface;
-    HPEN noPen;
-    PopupFrame frame;
-    BOOL frameValid;
-} PopupRenderCache;
-
-static PopupData g_popupData;
-static PopupRenderCache g_popupRender;
-static BOOL g_masterTargetKnown;
-static int g_masterTarget;
-
-/* Forward declarations */
-static void GetDeltaRange(MonitorList *ml, int *outMin, int *outMax);
-static int MasterTargetToSlider(MonitorList *ml, int target);
 static LRESULT CALLBACK AboutWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);
 static void RenderAbout(HWND hwnd);
-
-/* ---- Color helpers ---- */
-
-static COLORREF HexToColorRef(DWORD rgb)
-{
-    return RGB((rgb >> 16) & 0xFF, (rgb >> 8) & 0xFF, rgb & 0xFF);
-}
-
-static int GetMonPercent(BrightMonitor *mon)
-{
-    DWORD range = mon->brightnessMax - mon->brightnessMin;
-    if (range == 0) return 0;
-    return (int)(((ULONGLONG)(mon->brightnessCur - mon->brightnessMin) * 100) / range);
-}
-
-static int GetMasterPercent(MonitorList *ml)
-{
-    if (g_masterTargetKnown)
-        return MasterTargetToSlider(ml, g_masterTarget);
-    /* Recover base target by subtracting deltas, then map to slider 0-100 */
-    int sum = 0, cnt = 0;
-    for (int i = 0; i < ml->count; i++) {
-        if (ml->monitors[i].controllable) {
-            sum += GetMonPercent(&ml->monitors[i]) - ml->monitors[i].delta;
-            cnt++;
-        }
-    }
-    int target = cnt > 0 ? sum / cnt : 50;
-    return MasterTargetToSlider(ml, target);
-}
-
-/* ---- 32-bit DIB helpers for layered windows ---- */
-
-static HDC CreateAlphaDC(int w, int h, HBITMAP *outBmp, BYTE **outBits)
-{
-    BITMAPINFO bmi;
-    memset(&bmi, 0, sizeof(bmi));
-    bmi.bmiHeader.biSize = sizeof(bmi.bmiHeader);
-    bmi.bmiHeader.biWidth = w;
-    bmi.bmiHeader.biHeight = -h;  /* top-down */
-    bmi.bmiHeader.biPlanes = 1;
-    bmi.bmiHeader.biBitCount = 32;
-    bmi.bmiHeader.biCompression = BI_RGB;
-
-    HDC hdc = CreateCompatibleDC(NULL);
-    *outBmp = CreateDIBSection(hdc, &bmi, DIB_RGB_COLORS, (void **)outBits, NULL, 0);
-    SelectObject(hdc, *outBmp);
-    return hdc;
-}
-
-/* Apply rounded corner mask with anti-aliasing and premultiply alpha */
-static void ApplyRoundedMask(BYTE *bits, int w, int h, int radius, BYTE baseAlpha)
-{
-    for (int y = 0; y < h; y++) {
-        for (int x = 0; x < w; x++) {
-            BYTE *px = bits + (y * w + x) * 4;
-            BYTE alpha = baseAlpha;
-
-            BOOL inCorner = FALSE;
-            int cx = 0, cy = 0;
-            if      (x < radius && y < radius)              { cx = radius;     cy = radius;     inCorner = TRUE; }
-            else if (x >= w - radius && y < radius)          { cx = w - radius; cy = radius;     inCorner = TRUE; }
-            else if (x < radius && y >= h - radius)          { cx = radius;     cy = h - radius; inCorner = TRUE; }
-            else if (x >= w - radius && y >= h - radius)     { cx = w - radius; cy = h - radius; inCorner = TRUE; }
-
-            if (inCorner) {
-                float dx = (float)x - (float)cx + 0.5f;
-                float dy = (float)y - (float)cy + 0.5f;
-                float dist = sqrtf(dx * dx + dy * dy);
-                float r = (float)radius;
-                if (dist > r + 0.5f)
-                    alpha = 0;
-                else if (dist > r - 0.5f)
-                    alpha = (BYTE)((r + 0.5f - dist) * baseAlpha);
-            }
-
-            /* Premultiply RGB by alpha */
-            px[0] = (BYTE)((px[0] * alpha + 127) / 255);
-            px[1] = (BYTE)((px[1] * alpha + 127) / 255);
-            px[2] = (BYTE)((px[2] * alpha + 127) / 255);
-            px[3] = alpha;
-        }
-    }
-}
-
-/* Call UpdateLayeredWindow with a 32-bit surface */
-static BOOL CommitLayered(HWND hwnd, HDC memDC, int w, int h)
-{
-    POINT ptSrc = { 0, 0 };
-    SIZE sz = { w, h };
-    BLENDFUNCTION bf;
-    bf.BlendOp = AC_SRC_OVER;
-    bf.BlendFlags = 0;
-    bf.SourceConstantAlpha = 255;
-    bf.AlphaFormat = AC_SRC_ALPHA;
-    return UpdateLayeredWindow(hwnd, NULL, NULL, &sz, memDC, &ptSrc, 0, &bf, ULW_ALPHA);
-}
-
-/* Forward declarations for layout helpers */
-static void GetSliderRect(int row, RECT *rc);
-
-/* ---- Callback for saving deltas from UI ---- */
-
-typedef void (*DeltaSaveCallback)(void);
-static DeltaSaveCallback g_deltaSaveCb = NULL;
-
-void UI_SetDeltaSaveCallback(DeltaSaveCallback cb)
-{
-    g_deltaSaveCb = cb;
-}
-
-static ManualChangeCallback g_manualChangeCb = NULL;
-
-void UI_SetManualChangeCallback(ManualChangeCallback cb)
-{
-    g_manualChangeCb = cb;
-}
-
-/* ---- Delta button layout ---- */
-
-#define DELTA_BTN_W   22
-#define DELTA_BTN_H   16
-
-static void GetDeltaButtonRects(int row, RECT *rcMinus, RECT *rcValue, RECT *rcPlus)
-{
-    RECT rcSlider;
-    GetSliderRect(row, &rcSlider);
-    int cy = rcSlider.bottom + 6;
-    int centerX = (rcSlider.left + rcSlider.right) / 2;
-
-    rcMinus->left = centerX - 50;
-    rcMinus->right = rcMinus->left + DELTA_BTN_W;
-    rcMinus->top = cy;
-    rcMinus->bottom = cy + DELTA_BTN_H;
-
-    rcPlus->right = centerX + 50;
-    rcPlus->left = rcPlus->right - DELTA_BTN_W;
-    rcPlus->top = cy;
-    rcPlus->bottom = cy + DELTA_BTN_H;
-
-    rcValue->left = rcMinus->right + 2;
-    rcValue->right = rcPlus->left - 2;
-    rcValue->top = cy;
-    rcValue->bottom = cy + DELTA_BTN_H;
-}
-
-/* Returns: -1 = minus btn, +1 = plus btn, 0 = none. Sets *outRow. */
-static int HitTestDelta(PopupData *pd, int x, int y, int *outRow)
-{
-    for (int row = 0; row < pd->ml->count; row++) {
-        RECT rcMinus, rcValue, rcPlus;
-        GetDeltaButtonRects(row, &rcMinus, &rcValue, &rcPlus);
-        if (y >= rcMinus.top && y <= rcMinus.bottom) {
-            if (x >= rcMinus.left && x <= rcMinus.right) {
-                *outRow = row;
-                return -1;
-            }
-            if (x >= rcPlus.left && x <= rcPlus.right) {
-                *outRow = row;
-                return 1;
-            }
-        }
-    }
-    *outRow = -1;
-    return 0;
-}
-
-/* ---- Popup layout ---- */
-
-static int GetPopupHeight(PopupData *pd)
-{
-    int rows = pd->ml->count + 1;
-    return POPUP_PADDING + 24 + (rows * POPUP_ROW_H) + POPUP_PADDING;
-}
-
-static void GetSliderRect(int row, RECT *rc)
-{
-    int y = POPUP_PADDING + 24 + row * POPUP_ROW_H + 28;
-    rc->left = POPUP_PADDING + 4;
-    rc->right = POPUP_WIDTH - POPUP_PADDING - 4;
-    rc->top = y - SLIDER_TRACK_H / 2;
-    rc->bottom = y + SLIDER_TRACK_H / 2;
-}
-
-static int PercentFromX(RECT *sliderRect, int x)
-{
-    int trackLeft = sliderRect->left + SLIDER_THUMB_R;
-    int trackRight = sliderRect->right - SLIDER_THUMB_R;
-    if (trackRight <= trackLeft) return 0;
-    int pct = ((x - trackLeft) * 100) / (trackRight - trackLeft);
-    if (pct < 0) pct = 0;
-    if (pct > 100) pct = 100;
-    return pct;
-}
-
-static int XFromPercent(RECT *sliderRect, int pct)
-{
-    int trackLeft = sliderRect->left + SLIDER_THUMB_R;
-    int trackRight = sliderRect->right - SLIDER_THUMB_R;
-    return trackLeft + (pct * (trackRight - trackLeft)) / 100;
-}
-
-/* ---- Popup rendering (UpdateLayeredWindow) ---- */
-
-static void ReleasePopupSurface(void)
-{
-    PopupRenderCache *cache = &g_popupRender;
-    if (cache->dc) {
-        if (cache->originalBitmap)
-            SelectObject(cache->dc, cache->originalBitmap);
-        DeleteDC(cache->dc);
-    }
-    if (cache->bitmap) DeleteObject(cache->bitmap);
-    free(cache->alpha);
-    cache->dc = NULL;
-    cache->bitmap = NULL;
-    cache->originalBitmap = NULL;
-    cache->bits = NULL;
-    cache->alpha = NULL;
-    cache->width = 0;
-    cache->height = 0;
-    cache->frameValid = FALSE;
-}
-
-static void ReleasePopupRenderCache(void)
-{
-    PopupRenderCache *cache = &g_popupRender;
-    ReleasePopupSurface();
-    if (cache->font) DeleteObject(cache->font);
-    if (cache->fontBold) DeleteObject(cache->fontBold);
-    if (cache->fontSmall) DeleteObject(cache->fontSmall);
-    if (cache->background) DeleteObject(cache->background);
-    if (cache->track) DeleteObject(cache->track);
-    if (cache->accent) DeleteObject(cache->accent);
-    if (cache->surface) DeleteObject(cache->surface);
-    if (cache->noPen) DeleteObject(cache->noPen);
-    memset(cache, 0, sizeof(*cache));
-}
-
-static HFONT CreatePopupFont(int height, int weight)
-{
-    return CreateFontW(height, 0, 0, 0, weight, FALSE, FALSE, FALSE,
-                       DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-                       CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_SWISS, L"Segoe UI");
-}
-
-/* Keep all GDI objects across frames. Recreate the backing bitmap and alpha
-   mask only when the monitor count changes the popup dimensions. */
-static BOOL EnsurePopupRenderCache(int w, int h)
-{
-    PopupRenderCache *cache = &g_popupRender;
-    if (!cache->font) {
-        cache->font = CreatePopupFont(-13, FW_NORMAL);
-        cache->fontBold = CreatePopupFont(-14, FW_SEMIBOLD);
-        cache->fontSmall = CreatePopupFont(-11, FW_NORMAL);
-        cache->background = CreateSolidBrush(HexToColorRef(CLR_BG));
-        cache->track = CreateSolidBrush(HexToColorRef(CLR_TRACK));
-        cache->accent = CreateSolidBrush(HexToColorRef(CLR_ACCENT));
-        cache->surface = CreateSolidBrush(HexToColorRef(CLR_SURFACE));
-        cache->noPen = CreatePen(PS_NULL, 0, 0);
-        if (!cache->font || !cache->fontBold || !cache->fontSmall ||
-            !cache->background || !cache->track || !cache->accent ||
-            !cache->surface || !cache->noPen) {
-            ReleasePopupRenderCache();
-            return FALSE;
-        }
-    }
-
-    if (cache->dc && cache->width == w && cache->height == h)
-        return TRUE;
-
-    BITMAPINFO bmi = { 0 };
-    bmi.bmiHeader.biSize = sizeof(bmi.bmiHeader);
-    bmi.bmiHeader.biWidth = w;
-    bmi.bmiHeader.biHeight = -h;
-    bmi.bmiHeader.biPlanes = 1;
-    bmi.bmiHeader.biBitCount = 32;
-    bmi.bmiHeader.biCompression = BI_RGB;
-
-    HDC dc = CreateCompatibleDC(NULL);
-    BYTE *bits = NULL;
-    BYTE *alpha = NULL;
-    HBITMAP bitmap = NULL;
-    HGDIOBJ originalBitmap = NULL;
-    if (dc) bitmap = CreateDIBSection(dc, &bmi, DIB_RGB_COLORS, (void **)&bits, NULL, 0);
-    if (bitmap && bits) {
-        originalBitmap = SelectObject(dc, bitmap);
-        if (originalBitmap && originalBitmap != HGDI_ERROR)
-            alpha = (BYTE *)malloc((size_t)w * (size_t)h);
-    }
-    if (!alpha) {
-        if (dc) DeleteDC(dc);
-        if (bitmap) DeleteObject(bitmap);
-        return FALSE;
-    }
-
-    /* The rounded edge does not move while sliding, so its expensive distance
-       calculation is done once instead of on every mouse movement. */
-    for (int y = 0; y < h; y++) {
-        for (int x = 0; x < w; x++) {
-            BYTE a = 245;
-            int cx = x < POPUP_CORNER ? POPUP_CORNER : w - POPUP_CORNER;
-            int cy = y < POPUP_CORNER ? POPUP_CORNER : h - POPUP_CORNER;
-            if ((x < POPUP_CORNER || x >= w - POPUP_CORNER) &&
-                (y < POPUP_CORNER || y >= h - POPUP_CORNER)) {
-                float dx = (float)(x - cx) + 0.5f;
-                float dy = (float)(y - cy) + 0.5f;
-                float distance = sqrtf(dx * dx + dy * dy);
-                if (distance > POPUP_CORNER + 0.5f)
-                    a = 0;
-                else if (distance > POPUP_CORNER - 0.5f)
-                    a = (BYTE)((POPUP_CORNER + 0.5f - distance) * 245);
-            }
-            alpha[y * w + x] = a;
-        }
-    }
-
-    ReleasePopupSurface();
-    cache->dc = dc;
-    cache->bitmap = bitmap;
-    cache->originalBitmap = originalBitmap;
-    cache->bits = bits;
-    cache->alpha = alpha;
-    cache->width = w;
-    cache->height = h;
-    return TRUE;
-}
-
-static void GetPopupFrame(PopupData *pd, PopupFrame *frame)
-{
-    memset(frame, 0, sizeof(*frame));
-    frame->count = pd->ml->count;
-    for (int row = 0; row <= frame->count; row++) {
-        if (row == frame->count) {
-            frame->percent[row] = pd->masterPercent;
-        } else {
-            BrightMonitor *mon = &pd->ml->monitors[row];
-            frame->percent[row] = GetMonPercent(mon);
-            frame->delta[row] = mon->delta;
-            wcsncpy(frame->name[row], mon->name, 127);
-        }
-        if (pd->activeSlider == row && pd->dragPercent >= 0)
-            frame->percent[row] = pd->dragPercent;
-    }
-}
-
-static void RenderPopup(HWND hwnd, PopupData *pd)
-{
-    if (!pd || !pd->ml) return;
-    int w = POPUP_WIDTH;
-    int h = GetPopupHeight(pd);
-    if (!EnsurePopupRenderCache(w, h)) return;
-
-    PopupRenderCache *cache = &g_popupRender;
-    PopupFrame frame;
-    GetPopupFrame(pd, &frame);
-    if (cache->frameValid && memcmp(&cache->frame, &frame, sizeof(frame)) == 0)
-        return;
-
-    HDC dc = cache->dc;
-    int savedDC = SaveDC(dc);
-    if (!savedDC) return;
-
-    /* Fill background */
-    RECT rcAll = { 0, 0, w, h };
-    FillRect(dc, &rcAll, cache->background);
-
-    SetBkMode(dc, TRANSPARENT);
-    HFONT hFont = cache->font;
-    HFONT hFontBold = cache->fontBold;
-    HFONT hFontSmall = cache->fontSmall;
-
-    /* Title */
-    SelectObject(dc, hFontBold);
-    SetTextColor(dc, HexToColorRef(CLR_TEXT));
-    RECT rcTitle = { POPUP_PADDING, POPUP_PADDING, w - POPUP_PADDING, POPUP_PADDING + 20 };
-    DrawTextW(dc, L"Brightness", -1, &rcTitle, DT_LEFT | DT_SINGLELINE);
-
-    MonitorList *ml = pd->ml;
-    int totalRows = ml->count + 1;
-    HBRUSH trackBrush = cache->track;
-    HBRUSH fillBrush = cache->accent;
-    SelectObject(dc, cache->noPen);
-
-    for (int row = 0; row < totalRows; row++) {
-        BOOL isMaster = (row == ml->count);
-        int pct = frame.percent[row];
-        WCHAR label[140];
-        WCHAR pctStr[8];
-
-        if (isMaster) {
-            wcscpy(label, L"All Monitors");
-        } else {
-            wcscpy(label, frame.name[row]);
-        }
-
-        wsprintfW(pctStr, L"%d%%", pct);
-
-        if (isMaster) {
-            int sepY = POPUP_PADDING + 24 + row * POPUP_ROW_H + 2;
-            RECT rcSep = { POPUP_PADDING, sepY, w - POPUP_PADDING, sepY + 1 };
-            FillRect(dc, &rcSep, trackBrush);
-        }
-
-        int labelY = POPUP_PADDING + 24 + row * POPUP_ROW_H + 6;
-        RECT rcLabel = { POPUP_PADDING + 4, labelY, w - POPUP_PADDING - 40, labelY + 18 };
-        SelectObject(dc, isMaster ? hFontBold : hFont);
-        SetTextColor(dc, HexToColorRef(isMaster ? CLR_ACCENT : CLR_TEXT));
-        DrawTextW(dc, label, -1, &rcLabel, DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS);
-
-        RECT rcPct = { w - POPUP_PADDING - 40, labelY, w - POPUP_PADDING - 4, labelY + 18 };
-        SelectObject(dc, hFontSmall);
-        SetTextColor(dc, HexToColorRef(CLR_SUBTEXT));
-        DrawTextW(dc, pctStr, -1, &rcPct, DT_RIGHT | DT_SINGLELINE);
-
-        RECT rcSlider;
-        GetSliderRect(row, &rcSlider);
-
-        HBRUSH oldBr = (HBRUSH)SelectObject(dc, trackBrush);
-        RoundRect(dc, rcSlider.left, rcSlider.top, rcSlider.right, rcSlider.bottom,
-                  SLIDER_TRACK_H, SLIDER_TRACK_H);
-
-        int thumbX = XFromPercent(&rcSlider, pct);
-        SelectObject(dc, fillBrush);
-        RoundRect(dc, rcSlider.left, rcSlider.top, thumbX, rcSlider.bottom,
-                  SLIDER_TRACK_H, SLIDER_TRACK_H);
-        SelectObject(dc, oldBr);
-
-        int cy = (rcSlider.top + rcSlider.bottom) / 2;
-        Ellipse(dc, thumbX - SLIDER_THUMB_R, cy - SLIDER_THUMB_R,
-                thumbX + SLIDER_THUMB_R, cy + SLIDER_THUMB_R);
-
-        /* Delta controls (skip master row) */
-        if (!isMaster) {
-            RECT rcMinus, rcValue, rcPlus;
-            GetDeltaButtonRects(row, &rcMinus, &rcValue, &rcPlus);
-
-            /* [-] button */
-            FillRect(dc, &rcMinus, cache->surface);
-            FillRect(dc, &rcPlus, cache->surface);
-
-            SelectObject(dc, hFontSmall);
-            SetTextColor(dc, HexToColorRef(CLR_SUBTEXT));
-            DrawTextW(dc, L"\x2013", -1, &rcMinus, DT_CENTER | DT_VCENTER | DT_SINGLELINE); /* en dash as minus */
-            DrawTextW(dc, L"+", -1, &rcPlus, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-
-            /* Delta value */
-            WCHAR deltaStr[16];
-            int d = frame.delta[row];
-            if (d > 0)
-                wsprintfW(deltaStr, L"\x25B3+%d", d);
-            else if (d < 0)
-                wsprintfW(deltaStr, L"\x25B3%d", d);
-            else
-                wsprintfW(deltaStr, L"\x25B3 0");
-            SetTextColor(dc, HexToColorRef(CLR_SUBTEXT));
-            DrawTextW(dc, deltaStr, -1, &rcValue, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-        }
-    }
-
-    RestoreDC(dc, savedDC);
-    GdiFlush();
-
-    /* Premultiply freshly drawn RGB using the cached corner mask. */
-    for (int i = 0; i < w * h; i++) {
-        BYTE *pixel = cache->bits + i * 4;
-        BYTE alpha = cache->alpha[i];
-        pixel[0] = (BYTE)((pixel[0] * alpha + 127) / 255);
-        pixel[1] = (BYTE)((pixel[1] * alpha + 127) / 255);
-        pixel[2] = (BYTE)((pixel[2] * alpha + 127) / 255);
-        pixel[3] = alpha;
-    }
-    if (CommitLayered(hwnd, dc, w, h)) {
-        cache->frame = frame;
-        cache->frameValid = TRUE;
-    } else {
-        cache->frameValid = FALSE;
-    }
-}
-
-/* ---- Popup hit testing ---- */
-
-static int HitTestSlider(PopupData *pd, int x, int y)
-{
-    int totalRows = pd->ml->count + 1;
-    for (int row = 0; row < totalRows; row++) {
-        RECT rc;
-        GetSliderRect(row, &rc);
-        rc.top -= SLIDER_THUMB_R + 4;
-        rc.bottom += SLIDER_THUMB_R + 4;
-        if (x >= rc.left && x <= rc.right && y >= rc.top && y <= rc.bottom)
-            return row;
-    }
-    return -1;
-}
-
-/* Get delta range across all DDC monitors */
-static void GetDeltaRange(MonitorList *ml, int *outMin, int *outMax)
-{
-    int lo = 0, hi = 0;
-    for (int i = 0; i < ml->count; i++) {
-        if (!ml->monitors[i].controllable) continue;
-        int d = ml->monitors[i].delta;
-        if (d < lo) lo = d;
-        if (d > hi) hi = d;
-    }
-    *outMin = lo;
-    *outMax = hi;
-}
-
-/* Map slider 0-100 to extended master target so all monitors can reach full range */
-static int SliderToMasterTarget(MonitorList *ml, int sliderPct)
-{
-    int minD, maxD;
-    GetDeltaRange(ml, &minD, &maxD);
-    int lo = -maxD;          /* slider 0%   → all monitors at 0 */
-    int hi = 100 - minD;     /* slider 100% → all monitors at 100 */
-    return lo + (sliderPct * (hi - lo)) / 100;
-}
-
-/* Map extended master target back to slider 0-100 */
-static int MasterTargetToSlider(MonitorList *ml, int target)
-{
-    int minD, maxD;
-    GetDeltaRange(ml, &minD, &maxD);
-    int lo = -maxD;
-    int hi = 100 - minD;
-    if (hi == lo) return 50;
-    int s = ((target - lo) * 100) / (hi - lo);
-    if (s < 0) s = 0;
-    if (s > 100) s = 100;
-    return s;
-}
-
-static void ApplySliderValue(PopupData *pd, int row, int percent)
-{
-    MonitorList *ml = pd->ml;
-    if (row < 0 || row > ml->count) return;
-    BOOL isMaster = (row == ml->count);
-    int target = isMaster ? SliderToMasterTarget(ml, percent) : percent;
-
-    if (isMaster) {
-        pd->masterPercent = percent;
-        Monitor_SetAllBrightness(ml, target);
-    } else {
-        Monitor_SetBrightness(&ml->monitors[row], (DWORD)percent);
-        pd->masterPercent = GetMasterPercent(ml);
-    }
-
-    if (g_manualChangeCb) g_manualChangeCb(isMaster ? -1 : row, target);
-}
-
-/* Capture can be lost without receiving button-up (for example on Alt-Tab).
-   All changed values are queued while moving; closing the drag also submits
-   its final target and clears state before releasing capture reenters us. */
-static void FinishSliderDrag(HWND hwnd, PopupData *pd, int releasePercent)
-{
-    if (!pd || pd->activeSlider < 0) return;
-    int row = pd->activeSlider;
-    int percent = releasePercent >= 0 ? releasePercent : pd->dragPercent;
-    pd->activeSlider = -1;
-    pd->dragPercent = -1;
-    if (percent >= 0)
-        ApplySliderValue(pd, row, percent);
-    if (GetCapture() == hwnd)
-        ReleaseCapture();
-    Monitor_RefreshBrightness(pd->ml);
-    if (row != pd->ml->count)
-        pd->masterPercent = GetMasterPercent(pd->ml);
-    RenderPopup(hwnd, pd);
-}
-
-/* ---- Popup Window Procedure ---- */
-
-static LRESULT CALLBACK PopupWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
-{
-    PopupData *pd = (PopupData *)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
-
-    switch (msg) {
-    case WM_CREATE: {
-        CREATESTRUCTW *cs = (CREATESTRUCTW *)lParam;
-        pd = (PopupData *)cs->lpCreateParams;
-        SetWindowLongPtrW(hwnd, GWLP_USERDATA, (LONG_PTR)pd);
-        return 0;
-    }
-
-    case WM_LBUTTONDOWN: {
-        if (!pd) break;
-        int x = GET_X_LPARAM(lParam), y = GET_Y_LPARAM(lParam);
-
-        /* Check delta buttons first */
-        int deltaRow;
-        int deltaDir = HitTestDelta(pd, x, y, &deltaRow);
-        if (deltaDir != 0 && deltaRow >= 0) {
-            BrightMonitor *mon = &pd->ml->monitors[deltaRow];
-            int oldDelta = mon->delta;
-            mon->delta += deltaDir;
-            if (mon->delta < -40) mon->delta = -40;
-            if (mon->delta > 40) mon->delta = 40;
-            if (mon->delta == oldDelta) return 0;
-            if (g_deltaSaveCb) g_deltaSaveCb();
-            pd->masterPercent = GetMasterPercent(pd->ml);
-            RenderPopup(hwnd, pd);
-            return 0;
-        }
-
-        int row = HitTestSlider(pd, x, y);
-        if (row >= 0) {
-            pd->activeSlider = row;
-            RECT rc;
-            GetSliderRect(row, &rc);
-            int pct = PercentFromX(&rc, x);
-            pd->dragPercent = pct;
-            ApplySliderValue(pd, row, pct);
-            SetCapture(hwnd);
-            RenderPopup(hwnd, pd);
-        }
-        return 0;
-    }
-
-    case WM_MOUSEMOVE: {
-        if (!pd || pd->activeSlider < 0) break;
-        if (!(wParam & MK_LBUTTON)) {
-            FinishSliderDrag(hwnd, pd, -1);
-            return 0;
-        }
-        int x = GET_X_LPARAM(lParam);
-        int row = pd->activeSlider;
-        RECT rc;
-        GetSliderRect(row, &rc);
-        int pct = PercentFromX(&rc, x);
-        if (pct == pd->dragPercent) return 0;
-        pd->dragPercent = pct;
-        ApplySliderValue(pd, row, pct);
-        RenderPopup(hwnd, pd);
-        return 0;
-    }
-
-    case WM_LBUTTONUP:
-        if (pd && pd->activeSlider >= 0) {
-            RECT rc;
-            GetSliderRect(pd->activeSlider, &rc);
-            FinishSliderDrag(hwnd, pd, PercentFromX(&rc, GET_X_LPARAM(lParam)));
-        }
-        return 0;
-
-    case WM_CAPTURECHANGED:
-        if ((HWND)lParam != hwnd)
-            FinishSliderDrag(hwnd, pd, -1);
-        return 0;
-
-    case WM_CANCELMODE:
-        FinishSliderDrag(hwnd, pd, -1);
-        return 0;
-
-    case WM_DESTROY:
-        if (pd) {
-            pd->activeSlider = -1;
-            pd->dragPercent = -1;
-        }
-        ReleasePopupRenderCache();
-        return 0;
-
-    case WM_ACTIVATE:
-        if (LOWORD(wParam) == WA_INACTIVE && pd)
-            UI_HidePopup(hwnd);
-        return 0;
-
-    default:
-        break;
-    }
-    return DefWindowProcW(hwnd, msg, wParam, lParam);
-}
 
 /* ---- OSD ---- */
 
@@ -767,10 +48,10 @@ static void RenderOSD(HWND hwnd)
 {
     BYTE *bits = NULL;
     HBITMAP bmp = NULL;
-    HDC dc = CreateAlphaDC(OSD_W, OSD_H, &bmp, &bits);
+    HDC dc = UI_CreateAlphaDC(OSD_W, OSD_H, &bmp, &bits);
 
     /* Background */
-    HBRUSH bg = CreateSolidBrush(HexToColorRef(CLR_BG));
+    HBRUSH bg = CreateSolidBrush(UI_ColorRef(CLR_BG));
     RECT rcAll = { 0, 0, OSD_W, OSD_H };
     FillRect(dc, &rcAll, bg);
     DeleteObject(bg);
@@ -781,7 +62,7 @@ static void RenderOSD(HWND hwnd)
     WCHAR pctStr[8];
     wsprintfW(pctStr, L"%d%%", g_osd.percent);
 
-    SetTextColor(dc, HexToColorRef(CLR_TEXT));
+    SetTextColor(dc, UI_ColorRef(CLR_TEXT));
     HFONT hf = CreateFontW(-20, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE,
                             DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
                             CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_SWISS, L"Segoe UI");
@@ -798,14 +79,14 @@ static void RenderOSD(HWND hwnd)
     int fillW = (barW * g_osd.percent) / 100;
 
     /* Track */
-    HBRUSH trackBr = CreateSolidBrush(HexToColorRef(CLR_TRACK));
+    HBRUSH trackBr = CreateSolidBrush(UI_ColorRef(CLR_TRACK));
     HPEN noPen = CreatePen(PS_NULL, 0, 0);
     HPEN oldPen = (HPEN)SelectObject(dc, noPen);
     HBRUSH oldBr = (HBRUSH)SelectObject(dc, trackBr);
     RoundRect(dc, barL, barY, barR, barY + OSD_BAR_H, OSD_BAR_H, OSD_BAR_H);
 
     /* Fill */
-    HBRUSH fillBr = CreateSolidBrush(HexToColorRef(CLR_ACCENT));
+    HBRUSH fillBr = CreateSolidBrush(UI_ColorRef(CLR_ACCENT));
     SelectObject(dc, fillBr);
     if (fillW > 0)
         RoundRect(dc, barL, barY, barL + fillW, barY + OSD_BAR_H, OSD_BAR_H, OSD_BAR_H);
@@ -817,8 +98,8 @@ static void RenderOSD(HWND hwnd)
     DeleteObject(fillBr);
 
     /* Apply rounded mask with current alpha */
-    ApplyRoundedMask(bits, OSD_W, OSD_H, OSD_CORNER, g_osd.alpha);
-    CommitLayered(hwnd, dc, OSD_W, OSD_H);
+    UI_ApplyRoundedMask(bits, OSD_W, OSD_H, OSD_CORNER, g_osd.alpha);
+    UI_CommitLayered(hwnd, dc, OSD_W, OSD_H);
 
     DeleteObject(bmp);
     DeleteDC(dc);
@@ -1023,10 +304,10 @@ static void RenderContextMenu(HWND hwnd, CtxMenuData *d)
 
     BYTE *bits = NULL;
     HBITMAP bmp = NULL;
-    HDC dc = CreateAlphaDC(w, h, &bmp, &bits);
+    HDC dc = UI_CreateAlphaDC(w, h, &bmp, &bits);
 
     /* Background */
-    HBRUSH bgBrush = CreateSolidBrush(HexToColorRef(CLR_BG));
+    HBRUSH bgBrush = CreateSolidBrush(UI_ColorRef(CLR_BG));
     RECT rcAll = { 0, 0, w, h };
     FillRect(dc, &rcAll, bgBrush);
     DeleteObject(bgBrush);
@@ -1047,7 +328,7 @@ static void RenderContextMenu(HWND hwnd, CtxMenuData *d)
         if (it->type == CTX_ITEM_SEPARATOR) {
             /* Horizontal line */
             int lineY = cy + CTXMENU_SEP_H / 2;
-            HBRUSH sepBrush = CreateSolidBrush(HexToColorRef(CLR_TRACK));
+            HBRUSH sepBrush = CreateSolidBrush(UI_ColorRef(CLR_TRACK));
             RECT rcSep = { 12, lineY, w - 12, lineY + 1 };
             FillRect(dc, &rcSep, sepBrush);
             DeleteObject(sepBrush);
@@ -1057,7 +338,7 @@ static void RenderContextMenu(HWND hwnd, CtxMenuData *d)
 
         /* Hover highlight */
         if (i == d->hoverIndex) {
-            HBRUSH hoverBrush = CreateSolidBrush(HexToColorRef(CLR_SURFACE));
+            HBRUSH hoverBrush = CreateSolidBrush(UI_ColorRef(CLR_SURFACE));
             HPEN noPen = CreatePen(PS_NULL, 0, 0);
             HPEN oldPen = (HPEN)SelectObject(dc, noPen);
             HBRUSH oldBr = (HBRUSH)SelectObject(dc, hoverBrush);
@@ -1073,7 +354,7 @@ static void RenderContextMenu(HWND hwnd, CtxMenuData *d)
         /* Checkmark */
         if (it->checked) {
             SelectObject(dc, hFontCheck);
-            SetTextColor(dc, HexToColorRef(CLR_ACCENT));
+            SetTextColor(dc, UI_ColorRef(CLR_ACCENT));
             RECT rcCheck = { textX - 2, cy, textX + 14, cy + CTXMENU_ITEM_H };
             DrawTextW(dc, L"\x2713", 1, &rcCheck, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
             textX += 18;
@@ -1081,7 +362,7 @@ static void RenderContextMenu(HWND hwnd, CtxMenuData *d)
 
         /* Label */
         SelectObject(dc, hFont);
-        SetTextColor(dc, HexToColorRef(CLR_TEXT));
+        SetTextColor(dc, UI_ColorRef(CLR_TEXT));
         RECT rcLabel = { textX, cy, w - 12, cy + CTXMENU_ITEM_H };
         DrawTextW(dc, it->label, -1, &rcLabel,
                   DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
@@ -1093,8 +374,8 @@ static void RenderContextMenu(HWND hwnd, CtxMenuData *d)
     DeleteObject(hFont);
     DeleteObject(hFontCheck);
 
-    ApplyRoundedMask(bits, w, h, CTXMENU_CORNER, 245);
-    CommitLayered(hwnd, dc, w, h);
+    UI_ApplyRoundedMask(bits, w, h, CTXMENU_CORNER, 245);
+    UI_CommitLayered(hwnd, dc, w, h);
 
     DeleteObject(bmp);
     DeleteDC(dc);
@@ -1244,9 +525,9 @@ static void RenderSchedEditor(HWND hwnd, SchedEditData *d)
 
     BYTE *bits = NULL;
     HBITMAP bmp = NULL;
-    HDC dc = CreateAlphaDC(w, h, &bmp, &bits);
+    HDC dc = UI_CreateAlphaDC(w, h, &bmp, &bits);
 
-    HBRUSH bg = CreateSolidBrush(HexToColorRef(CLR_BG));
+    HBRUSH bg = CreateSolidBrush(UI_ColorRef(CLR_BG));
     RECT rcAll = { 0, 0, w, h };
     FillRect(dc, &rcAll, bg);
     DeleteObject(bg);
@@ -1264,11 +545,11 @@ static void RenderSchedEditor(HWND hwnd, SchedEditData *d)
 
     /* Title + hint */
     SelectObject(dc, hFontBold);
-    SetTextColor(dc, HexToColorRef(CLR_TEXT));
+    SetTextColor(dc, UI_ColorRef(CLR_TEXT));
     RECT rcTitle = { 16, 12, w - 16, 32 };
     DrawTextW(dc, L"Brightness Schedule", -1, &rcTitle, DT_LEFT | DT_SINGLELINE);
     SelectObject(dc, hFontSmall);
-    SetTextColor(dc, HexToColorRef(CLR_SUBTEXT));
+    SetTextColor(dc, UI_ColorRef(CLR_SUBTEXT));
     RECT rcHint = { 16, 12, w - 16, 32 };
     DrawTextW(dc, L"wheel = adjust", -1, &rcHint, DT_RIGHT | DT_SINGLELINE);
 
@@ -1279,7 +560,7 @@ static void RenderSchedEditor(HWND hwnd, SchedEditData *d)
         int y = SCHED_HEADER_H + row * SCHED_ROW_H;
 
         if (row == d->selectedRow) {
-            HBRUSH hb = CreateSolidBrush(HexToColorRef(CLR_SURFACE));
+            HBRUSH hb = CreateSolidBrush(UI_ColorRef(CLR_SURFACE));
             HBRUSH ob = (HBRUSH)SelectObject(dc, hb);
             RoundRect(dc, 8, y + 2, w - 8, y + SCHED_ROW_H - 2, 8, 8);
             SelectObject(dc, ob);
@@ -1291,7 +572,7 @@ static void RenderSchedEditor(HWND hwnd, SchedEditData *d)
         RECT rc;
 
         SelectObject(dc, hFont);
-        SetTextColor(dc, HexToColorRef(CLR_TEXT));
+        SetTextColor(dc, UI_ColorRef(CLR_TEXT));
         SchedFieldRect(row, SF_HOUR, &rc);
         wsprintfW(s, L"%02d", p->minutes / 60);
         DrawTextW(dc, s, -1, &rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
@@ -1304,20 +585,20 @@ static void RenderSchedEditor(HWND hwnd, SchedEditData *d)
         DrawTextW(dc, s, -1, &rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
 
         SchedFieldRect(row, SF_BRI, &rc);
-        SetTextColor(dc, HexToColorRef(CLR_ACCENT));
+        SetTextColor(dc, UI_ColorRef(CLR_ACCENT));
         wsprintfW(s, L"%d%%", p->brightness);
         DrawTextW(dc, s, -1, &rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
 
         SchedFieldRect(row, SF_DEL, &rc);
-        SetTextColor(dc, HexToColorRef(CLR_SUBTEXT));
+        SetTextColor(dc, UI_ColorRef(CLR_SUBTEXT));
         DrawTextW(dc, L"\x2715", -1, &rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE); /* x */
     }
 
     /* Footer buttons */
     RECT rcAdd, rcSave;
     SchedButtonRects(d, &rcAdd, &rcSave);
-    HBRUSH btn = CreateSolidBrush(HexToColorRef(CLR_SURFACE));
-    HBRUSH acc = CreateSolidBrush(HexToColorRef(CLR_ACCENT));
+    HBRUSH btn = CreateSolidBrush(UI_ColorRef(CLR_SURFACE));
+    HBRUSH acc = CreateSolidBrush(UI_ColorRef(CLR_ACCENT));
     HBRUSH ob = (HBRUSH)SelectObject(dc, btn);
     RoundRect(dc, rcAdd.left, rcAdd.top, rcAdd.right, rcAdd.bottom, 8, 8);
     SelectObject(dc, acc);
@@ -1327,9 +608,9 @@ static void RenderSchedEditor(HWND hwnd, SchedEditData *d)
     DeleteObject(acc);
 
     SelectObject(dc, hFont);
-    SetTextColor(dc, HexToColorRef(CLR_TEXT));
+    SetTextColor(dc, UI_ColorRef(CLR_TEXT));
     DrawTextW(dc, L"+ Add", -1, &rcAdd, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-    SetTextColor(dc, HexToColorRef(CLR_BG));
+    SetTextColor(dc, UI_ColorRef(CLR_BG));
     DrawTextW(dc, L"Save", -1, &rcSave, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
 
     SelectObject(dc, oldPen);
@@ -1338,8 +619,8 @@ static void RenderSchedEditor(HWND hwnd, SchedEditData *d)
     DeleteObject(hFontBold);
     DeleteObject(hFontSmall);
 
-    ApplyRoundedMask(bits, w, h, SCHED_CORNER, 245);
-    CommitLayered(hwnd, dc, w, h);
+    UI_ApplyRoundedMask(bits, w, h, SCHED_CORNER, 245);
+    UI_CommitLayered(hwnd, dc, w, h);
 
     DeleteObject(bmp);
     DeleteDC(dc);
@@ -1624,9 +905,9 @@ static void RenderSettings(HWND hwnd, SetEditData *d)
 
     BYTE *bits = NULL;
     HBITMAP bmp = NULL;
-    HDC dc = CreateAlphaDC(w, h, &bmp, &bits);
+    HDC dc = UI_CreateAlphaDC(w, h, &bmp, &bits);
 
-    HBRUSH bg = CreateSolidBrush(HexToColorRef(CLR_BG));
+    HBRUSH bg = CreateSolidBrush(UI_ColorRef(CLR_BG));
     RECT rcAll = { 0, 0, w, h };
     FillRect(dc, &rcAll, bg);
     DeleteObject(bg);
@@ -1645,10 +926,10 @@ static void RenderSettings(HWND hwnd, SetEditData *d)
     /* Title + hint */
     RECT rcTitle = { 16, 12, w - 16, 32 };
     SelectObject(dc, hFontBold);
-    SetTextColor(dc, HexToColorRef(CLR_TEXT));
+    SetTextColor(dc, UI_ColorRef(CLR_TEXT));
     DrawTextW(dc, L"Settings", -1, &rcTitle, DT_LEFT | DT_SINGLELINE);
     SelectObject(dc, hFontSmall);
-    SetTextColor(dc, HexToColorRef(CLR_SUBTEXT));
+    SetTextColor(dc, UI_ColorRef(CLR_SUBTEXT));
     DrawTextW(dc, L"wheel = adjust", -1, &rcTitle, DT_RIGHT | DT_SINGLELINE);
 
     HPEN noPen = CreatePen(PS_NULL, 0, 0);
@@ -1661,14 +942,14 @@ static void RenderSettings(HWND hwnd, SetEditData *d)
         if (r->kind == SET_SECTION) {
             RECT rc = { 16, y, w - 16, y + SET_SECTION_H };
             SelectObject(dc, hFontSmall);
-            SetTextColor(dc, HexToColorRef(CLR_SUBTEXT));
+            SetTextColor(dc, UI_ColorRef(CLR_SUBTEXT));
             DrawTextW(dc, r->label, -1, &rc, DT_LEFT | DT_BOTTOM | DT_SINGLELINE);
             y += SET_SECTION_H;
             continue;
         }
 
         if (i == d->hoverRow) {
-            HBRUSH hb = CreateSolidBrush(HexToColorRef(CLR_SURFACE));
+            HBRUSH hb = CreateSolidBrush(UI_ColorRef(CLR_SURFACE));
             HBRUSH ob = (HBRUSH)SelectObject(dc, hb);
             RoundRect(dc, 8, y + 2, w - 8, y + SET_ROW_H - 2, 8, 8);
             SelectObject(dc, ob);
@@ -1677,7 +958,7 @@ static void RenderSettings(HWND hwnd, SetEditData *d)
 
         RECT rcLabel = { 16, y, w - 124, y + SET_ROW_H };
         SelectObject(dc, hFont);
-        SetTextColor(dc, HexToColorRef(CLR_TEXT));
+        SetTextColor(dc, UI_ColorRef(CLR_TEXT));
         DrawTextW(dc, r->label, -1, &rcLabel,
                   DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
 
@@ -1685,8 +966,8 @@ static void RenderSettings(HWND hwnd, SetEditData *d)
             RECT rcT;
             SetToggleRect(y, &rcT);
             BOOL on = (r->bval && *r->bval);
-            HBRUSH track = CreateSolidBrush(HexToColorRef(on ? CLR_ACCENT : CLR_TRACK));
-            HBRUSH knob  = CreateSolidBrush(HexToColorRef(on ? CLR_BG : CLR_SUBTEXT));
+            HBRUSH track = CreateSolidBrush(UI_ColorRef(on ? CLR_ACCENT : CLR_TRACK));
+            HBRUSH knob  = CreateSolidBrush(UI_ColorRef(on ? CLR_BG : CLR_SUBTEXT));
             HBRUSH ob = (HBRUSH)SelectObject(dc, track);
             RoundRect(dc, rcT.left, rcT.top, rcT.right, rcT.bottom, 20, 20);
             SelectObject(dc, knob);
@@ -1700,7 +981,7 @@ static void RenderSettings(HWND hwnd, SetEditData *d)
             RECT rcMinus, rcValue, rcPlus;
             SetControlRects(y, &rcMinus, &rcValue, &rcPlus);
 
-            HBRUSH btn = CreateSolidBrush(HexToColorRef(CLR_TRACK));
+            HBRUSH btn = CreateSolidBrush(UI_ColorRef(CLR_TRACK));
             HBRUSH ob = (HBRUSH)SelectObject(dc, btn);
             RoundRect(dc, rcMinus.left, rcMinus.top, rcMinus.right, rcMinus.bottom, 6, 6);
             RoundRect(dc, rcPlus.left, rcPlus.top, rcPlus.right, rcPlus.bottom, 6, 6);
@@ -1708,7 +989,7 @@ static void RenderSettings(HWND hwnd, SetEditData *d)
             DeleteObject(btn);
 
             SelectObject(dc, hFontSmall);
-            SetTextColor(dc, HexToColorRef(CLR_SUBTEXT));
+            SetTextColor(dc, UI_ColorRef(CLR_SUBTEXT));
             DrawTextW(dc, L"\x2013", -1, &rcMinus, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
             DrawTextW(dc, L"+", -1, &rcPlus, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
 
@@ -1718,7 +999,7 @@ static void RenderSettings(HWND hwnd, SetEditData *d)
             else if (r->unit == SET_UNIT_PERCENT) wsprintfW(val, L"%d%%", v);
             else                                  wsprintfW(val, L"%d", v);
             SelectObject(dc, hFont);
-            SetTextColor(dc, HexToColorRef(CLR_ACCENT));
+            SetTextColor(dc, UI_ColorRef(CLR_ACCENT));
             DrawTextW(dc, val, -1, &rcValue, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
         }
 
@@ -1728,19 +1009,19 @@ static void RenderSettings(HWND hwnd, SetEditData *d)
     /* Footer: Save on the right, cancel hint on the left */
     RECT rcSave;
     SetSaveRect(d, &rcSave);
-    HBRUSH acc = CreateSolidBrush(HexToColorRef(CLR_ACCENT));
+    HBRUSH acc = CreateSolidBrush(UI_ColorRef(CLR_ACCENT));
     HBRUSH oldBr = (HBRUSH)SelectObject(dc, acc);
     RoundRect(dc, rcSave.left, rcSave.top, rcSave.right, rcSave.bottom, 8, 8);
     SelectObject(dc, oldBr);
     DeleteObject(acc);
 
     SelectObject(dc, hFont);
-    SetTextColor(dc, HexToColorRef(CLR_BG));
+    SetTextColor(dc, UI_ColorRef(CLR_BG));
     DrawTextW(dc, L"Save", -1, &rcSave, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
 
     RECT rcNote = { 16, rcSave.top, rcSave.left - 8, rcSave.bottom };
     SelectObject(dc, hFontSmall);
-    SetTextColor(dc, HexToColorRef(CLR_SUBTEXT));
+    SetTextColor(dc, UI_ColorRef(CLR_SUBTEXT));
     DrawTextW(dc, L"click outside to cancel", -1, &rcNote,
               DT_LEFT | DT_VCENTER | DT_SINGLELINE);
 
@@ -1750,8 +1031,8 @@ static void RenderSettings(HWND hwnd, SetEditData *d)
     DeleteObject(hFontBold);
     DeleteObject(hFontSmall);
 
-    ApplyRoundedMask(bits, w, h, SET_CORNER, 245);
-    CommitLayered(hwnd, dc, w, h);
+    UI_ApplyRoundedMask(bits, w, h, SET_CORNER, 245);
+    UI_CommitLayered(hwnd, dc, w, h);
 
     DeleteObject(bmp);
     DeleteDC(dc);
@@ -1852,14 +1133,7 @@ BOOL UI_Init(HINSTANCE hInst)
 {
     g_hInst = hInst;
 
-    WNDCLASSEXW wc = { 0 };
-    wc.cbSize = sizeof(wc);
-    wc.lpfnWndProc = PopupWndProc;
-    wc.hInstance = hInst;
-    wc.hCursor = LoadCursor(NULL, IDC_ARROW);
-    wc.lpszClassName = POPUP_CLASS;
-    if (!RegisterClassExW(&wc))
-        return FALSE;
+    if (!UI_PopupInit(hInst)) return FALSE;
 
     WNDCLASSEXW wcOsd = { 0 };
     wcOsd.cbSize = sizeof(wcOsd);
@@ -1905,7 +1179,7 @@ BOOL UI_Init(HINSTANCE hInst)
 
 void UI_Shutdown(void)
 {
-    ReleasePopupRenderCache();
+    UI_PopupShutdown();
     if (g_ctxHwnd) {
         DestroyWindow(g_ctxHwnd);
         g_ctxHwnd = NULL;
@@ -1922,117 +1196,6 @@ void UI_Shutdown(void)
         DestroyWindow(g_setHwnd);
         g_setHwnd = NULL;
     }
-}
-
-HWND UI_CreatePopup(HINSTANCE hInst, MonitorList *ml)
-{
-    memset(&g_popupData, 0, sizeof(g_popupData));
-    g_popupData.ml = ml;
-    g_popupData.activeSlider = -1;
-    g_popupData.dragPercent = -1;
-    g_popupData.masterPercent = GetMasterPercent(ml);
-
-    int h = GetPopupHeight(&g_popupData);
-
-    HWND hwnd = CreateWindowExW(
-        WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_LAYERED,
-        POPUP_CLASS, L"",
-        WS_POPUP,
-        0, 0, POPUP_WIDTH, h,
-        NULL, NULL, hInst, &g_popupData);
-
-    return hwnd;
-}
-
-void UI_ShowPopup(HWND hwnd, MonitorList *ml)
-{
-    if (!hwnd) return;
-
-    Monitor_RefreshBrightness(ml);
-    g_popupData.ml = ml;
-    g_popupData.masterPercent = GetMasterPercent(ml);
-
-    int h = GetPopupHeight(&g_popupData);
-    SetWindowPos(hwnd, NULL, 0, 0, POPUP_WIDTH, h, SWP_NOMOVE | SWP_NOZORDER);
-
-    /* Position near cursor (tray icon), adjusted to stay on-screen */
-    POINT pt;
-    GetCursorPos(&pt);
-
-    HMONITOR hMon = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
-    MONITORINFO mi = { 0 };
-    mi.cbSize = sizeof(mi);
-    GetMonitorInfoW(hMon, &mi);
-
-    APPBARDATA abd = { 0 };
-    abd.cbSize = sizeof(abd);
-    SHAppBarMessage(ABM_GETTASKBARPOS, &abd);
-
-    int x, y;
-
-    /* Horizontal: center on cursor, clamp to work area */
-    x = pt.x - POPUP_WIDTH / 2;
-    if (x + POPUP_WIDTH > mi.rcWork.right)
-        x = mi.rcWork.right - POPUP_WIDTH - 4;
-    if (x < mi.rcWork.left)
-        x = mi.rcWork.left + 4;
-
-    /* Vertical: place above or below taskbar depending on edge */
-    if (abd.uEdge == ABE_TOP) {
-        y = abd.rc.bottom + 8;
-    } else if (abd.uEdge == ABE_LEFT || abd.uEdge == ABE_RIGHT) {
-        y = pt.y - h;
-        if (y < mi.rcWork.top) y = pt.y;
-    } else {
-        /* Bottom taskbar (default) — place above cursor */
-        y = pt.y - h - 8;
-        if (y < mi.rcWork.top)
-            y = pt.y + 8;
-    }
-
-    SetWindowPos(hwnd, HWND_TOPMOST, x, y, 0, 0, SWP_NOSIZE);
-    RenderPopup(hwnd, &g_popupData);
-    ShowWindow(hwnd, SW_SHOWNOACTIVATE);
-    SetForegroundWindow(hwnd);
-}
-
-void UI_HidePopup(HWND hwnd)
-{
-    if (!hwnd) return;
-    FinishSliderDrag(hwnd, &g_popupData, -1);
-    ShowWindow(hwnd, SW_HIDE);
-}
-
-void UI_TogglePopup(HWND hwnd, MonitorList *ml)
-{
-    if (IsWindowVisible(hwnd))
-        UI_HidePopup(hwnd);
-    else
-        UI_ShowPopup(hwnd, ml);
-}
-
-BOOL UI_IsPopupVisible(HWND hwnd)
-{
-    return hwnd && IsWindowVisible(hwnd);
-}
-
-void UI_SetMasterTarget(int target)
-{
-    if (g_masterTargetKnown && g_masterTarget == target) return;
-    g_masterTargetKnown = TRUE;
-    g_masterTarget = target;
-    if (g_popupData.ml)
-        g_popupData.masterPercent = MasterTargetToSlider(g_popupData.ml, target);
-    g_popupRender.frameValid = FALSE;
-}
-
-void UI_RefreshPopup(HWND hwnd, MonitorList *ml)
-{
-    if (!hwnd || !IsWindowVisible(hwnd)) return;
-    g_popupData.ml = ml;
-    if (g_popupData.activeSlider != ml->count)
-        g_popupData.masterPercent = GetMasterPercent(ml);
-    RenderPopup(hwnd, &g_popupData);
 }
 
 void UI_ShowOSD(HINSTANCE hInst, HMONITOR hMon, int percent)
@@ -2223,9 +1386,9 @@ static void RenderAbout(HWND hwnd)
 
     BYTE *bits = NULL;
     HBITMAP bmp = NULL;
-    HDC dc = CreateAlphaDC(w, h, &bmp, &bits);
+    HDC dc = UI_CreateAlphaDC(w, h, &bmp, &bits);
 
-    HBRUSH bgBrush = CreateSolidBrush(HexToColorRef(CLR_BG));
+    HBRUSH bgBrush = CreateSolidBrush(UI_ColorRef(CLR_BG));
     RECT rcAll = { 0, 0, w, h };
     FillRect(dc, &rcAll, bgBrush);
     DeleteObject(bgBrush);
@@ -2249,31 +1412,31 @@ static void RenderAbout(HWND hwnd)
 
     /* Title */
     SelectObject(dc, hTitle);
-    SetTextColor(dc, HexToColorRef(CLR_TEXT));
+    SetTextColor(dc, UI_ColorRef(CLR_TEXT));
     rc = (RECT){ 0, 18, w, 50 };
     DrawTextW(dc, APP_NAME, -1, &rc, DT_CENTER | DT_SINGLELINE);
 
     /* Subtitle */
     SelectObject(dc, hSmall);
-    SetTextColor(dc, HexToColorRef(CLR_SUBTEXT));
+    SetTextColor(dc, UI_ColorRef(CLR_SUBTEXT));
     rc = (RECT){ 0, 54, w, 72 };
     DrawTextW(dc, L"Monitor brightness for DDC/CI + WMI", -1, &rc, DT_CENTER | DT_SINGLELINE);
 
     /* Version */
     SelectObject(dc, hBody);
-    SetTextColor(dc, HexToColorRef(CLR_TEXT));
+    SetTextColor(dc, UI_ColorRef(CLR_TEXT));
     rc = (RECT){ 0, 84, w, 104 };
     DrawTextW(dc, L"Version " APP_VERSION, -1, &rc, DT_CENTER | DT_SINGLELINE);
 
     /* Author */
     SelectObject(dc, hSmall);
-    SetTextColor(dc, HexToColorRef(CLR_SUBTEXT));
+    SetTextColor(dc, UI_ColorRef(CLR_SUBTEXT));
     rc = (RECT){ 0, 106, w, 124 };
     DrawTextW(dc, L"by " APP_AUTHOR, -1, &rc, DT_CENTER | DT_SINGLELINE);
 
     /* Clickable repo link (measured so the hit rect is exact) */
     SelectObject(dc, hLink);
-    SetTextColor(dc, HexToColorRef(CLR_ACCENT));
+    SetTextColor(dc, UI_ColorRef(CLR_ACCENT));
     const WCHAR *link = APP_REPO_DISPLAY;
     int linkLen = lstrlenW(link);
     SIZE sz = { 0, 0 };
@@ -2288,7 +1451,7 @@ static void RenderAbout(HWND hwnd)
 
     /* Hint */
     SelectObject(dc, hSmall);
-    SetTextColor(dc, HexToColorRef(CLR_SUBTEXT));
+    SetTextColor(dc, UI_ColorRef(CLR_SUBTEXT));
     rc = (RECT){ 0, 160, w, 178 };
     DrawTextW(dc, L"Esc to close", -1, &rc, DT_CENTER | DT_SINGLELINE);
 
@@ -2299,8 +1462,8 @@ static void RenderAbout(HWND hwnd)
     DeleteObject(hSmall);
     DeleteObject(hLink);
 
-    ApplyRoundedMask(bits, w, h, ABOUT_CORNER, 245);
-    CommitLayered(hwnd, dc, w, h);
+    UI_ApplyRoundedMask(bits, w, h, ABOUT_CORNER, 245);
+    UI_CommitLayered(hwnd, dc, w, h);
 
     DeleteObject(bmp);
     DeleteDC(dc);

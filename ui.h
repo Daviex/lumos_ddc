@@ -22,11 +22,15 @@
 #define SLIDER_TRACK_H  6
 #define SLIDER_THUMB_R  8
 
-/* Initialize and register popup window class */
+/* Initialize window classes and shut down the UI subsystem. */
 BOOL UI_Init(HINSTANCE hInst);
 
 /* Shutdown UI subsystem */
 void UI_Shutdown(void);
+
+/* Popup lifecycle used by the UI subsystem. */
+BOOL UI_PopupInit(HINSTANCE hInst);
+void UI_PopupShutdown(void);
 
 /* Create the popup window (hidden initially) */
 HWND UI_CreatePopup(HINSTANCE hInst, MonitorList *ml);

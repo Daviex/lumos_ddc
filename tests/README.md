@@ -46,23 +46,24 @@ nonblocking cleanup during enumeration, rejected invalid readings and scaling
 across the full 32-bit brightness range.
 
 ```powershell
-clang -std=c11 -Wall -Wextra -Werror -DUNICODE -D_UNICODE tests/test_monitor.c -ldxva2 -luser32 -lgdi32 -ladvapi32 -o build/test_monitor.exe
+clang -std=c11 -Wall -Wextra -Werror -DUNICODE -D_UNICODE tests/test_monitor.c brightness.c -ldxva2 -luser32 -lgdi32 -ladvapi32 -o build/test_monitor.exe
 ./build/test_monitor.exe
 ```
 
 ```bat
-cl /nologo /std:c11 /W4 /DUNICODE /D_UNICODE tests\test_monitor.c /Fe:build\test_monitor.exe /Fo"build\\" /link dxva2.lib user32.lib gdi32.lib advapi32.lib
+cl /nologo /std:c11 /W4 /DUNICODE /D_UNICODE tests\test_monitor.c brightness.c /Fe:build\test_monitor.exe /Fo"build\\" /link dxva2.lib user32.lib gdi32.lib advapi32.lib
 build\test_monitor.exe
 ```
 
-`test_ui.c` renders the real popup into offscreen DIBs and simulates mouse
+`test_ui.c` includes `ui_popup.c` and `ui_graphics.c` with instrumented Windows
+APIs, renders the real popup into offscreen DIBs and simulates mouse
 messages. It verifies GDI resource reuse and cleanup, pixel stability, resize
 and allocation errors, the final drag value, capture loss, cancellation and
-master target bookkeeping. Window, settings and monitor operations are mocked;
+master target bookkeeping. Window and monitor operations are mocked;
 no window is shown and no monitor or registry setting is changed.
 
 ```powershell
-clang -std=c11 -Wall -Wextra -Werror -DUNICODE -D_UNICODE tests/test_ui.c -o build/test_ui.exe -lgdi32 -luser32 -lshell32 -ldwmapi
+clang -std=c11 -Wall -Wextra -Werror -DUNICODE -D_UNICODE tests/test_ui.c brightness.c -o build/test_ui.exe -lgdi32 -luser32 -lshell32 -ldwmapi
 ./build/test_ui.exe
 ```
 
@@ -72,4 +73,13 @@ schedule suspension/resumption without accessing the system clock or settings.
 ```powershell
 clang -std=c11 -Wall -Wextra -Werror test_schedule.c schedule.c -o build/test_schedule.exe
 ./build/test_schedule.exe
+```
+
+`test_brightness.c` exercises the shared pure calculations and identity matching:
+nonzero offsets, rounding, full DWORD ranges, delta compensation, master slider
+endpoints, renamed/reordered displays and ambiguous monitor identities.
+
+```powershell
+clang -std=c11 -Wall -Wextra -Werror -DUNICODE -D_UNICODE tests/test_brightness.c brightness.c -o build/test_brightness.exe
+./build/test_brightness.exe
 ```
