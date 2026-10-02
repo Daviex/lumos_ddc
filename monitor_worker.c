@@ -4,6 +4,8 @@
 typedef struct {
     BrightMonitor monitor;
     DWORD percent, sequence, generation;
+    MonitorWritePurpose purpose;
+    DWORD otherInput;
     BOOL pending;
 } WriteRequest;
 
@@ -12,9 +14,10 @@ typedef struct {
     DWORD sequences[MAX_MONITORS];
     DWORD generation;
     BOOL pending;
+    BOOL allMonitors;
 } RefreshRequest;
 
-typedef enum { WORK_WAIT, WORK_WRITE, WORK_REFRESH, WORK_STOP } WorkKind;
+typedef enum { WORK_WAIT, WORK_WRITE, WORK_REFRESH, WORK_SOURCES, WORK_STOP } WorkKind;
 
 typedef struct {
     int index;
@@ -33,9 +36,11 @@ typedef struct {
     DWORD generation;
     DWORD sequences[MAX_MONITORS];
     DWORD targets[MAX_MONITORS];
+    MonitorWritePurpose purposes[MAX_MONITORS];
     BOOL inFlight[MAX_MONITORS];
     WriteRequest writes[MAX_MONITORS];
     RefreshRequest refresh;
+    RefreshRequest sources;
 } Worker;
 
 static Worker g_worker;
@@ -75,6 +80,11 @@ static WorkKind DequeueLocked(int *nextIndex, WorkItem *work)
         return WORK_WRITE;
     }
 
+    if (g_worker.sources.pending) {
+        work->request.refresh = g_worker.sources;
+        ZeroMemory(&g_worker.sources, sizeof(g_worker.sources));
+        if (work->request.refresh.monitors.count > 0) return WORK_SOURCES;
+    }
     if (g_worker.refresh.pending) {
         work->request.refresh = g_worker.refresh;
         ZeroMemory(&g_worker.refresh, sizeof(g_worker.refresh));
@@ -90,11 +100,11 @@ static void CancelPendingLocked(void)
         g_worker.inFlight[i] = FALSE;
     }
     ReleaseRefreshRequest(&g_worker.refresh);
+    ReleaseRefreshRequest(&g_worker.sources);
 }
 
-static void SnapshotRefreshLocked(const MonitorList *view)
+static void SnapshotRefreshLocked(RefreshRequest *request, const MonitorList *view)
 {
-    RefreshRequest *request = &g_worker.refresh;
     ReleaseRefreshRequest(request);
     request->monitors = *view;
     for (int i = 0; i < view->count; i++)
@@ -111,6 +121,7 @@ static DWORD SnapshotTargetsLocked(MonitorTarget targets[MAX_MONITORS])
     DWORD mask = 0;
     for (int i = 0; i < g_worker.view->count; i++) {
         if (!g_worker.writes[i].pending && !g_worker.inFlight[i]) continue;
+        if (g_worker.purposes[i] == MONITOR_WRITE_IDLE_RELEASE) continue;
         targets[i].monitor = g_worker.view->monitors[i];
         targets[i].percent = g_worker.targets[i];
         mask |= 1u << i;
@@ -119,7 +130,8 @@ static DWORD SnapshotTargetsLocked(MonitorTarget targets[MAX_MONITORS])
 }
 
 static void PostResult(int index, DWORD generation, DWORD sequence,
-                       const BrightMonitor *monitor, BOOL success)
+                       const BrightMonitor *monitor, BOOL success, MonitorResultKind kind,
+                       BOOL sourceUpdated, MonitorWritePurpose purpose, BOOL brightnessWritten)
 {
     MonitorResult *result = (MonitorResult *)malloc(sizeof(*result));
     if (!result) return;
@@ -130,19 +142,60 @@ static void PostResult(int index, DWORD generation, DWORD sequence,
     result->minimum = monitor->brightnessMin;
     result->current = monitor->brightnessCur;
     result->maximum = monitor->brightnessMax;
+    result->kind = kind;
+    result->currentInput = monitor->currentInput;
+    result->sourceKnown = monitor->sourceKnown;
+    result->sourceUpdated = sourceUpdated;
+    result->sourceCheckedTick = monitor->sourceCheckedTick;
+    result->purpose = purpose;
+    result->idleEpoch = monitor->idleEpoch;
+    result->preIdleBrightnessValid = monitor->preIdleBrightnessValid;
+    result->preIdleBrightness = monitor->preIdleBrightness;
+    result->brightnessWritten = brightnessWritten;
+    CopyMemory(result->deviceInstance, monitor->deviceInstance, sizeof(result->deviceInstance));
+    result->deviceInstance[ARRAYSIZE(result->deviceInstance) - 1] = L'\0';
+    result->backend = monitor->backend;
+    result->sourceFilter = monitor->sourceFilter;
+    result->expectedInput = monitor->expectedInput;
     if (!PostMessageW(g_worker.owner, WM_MONITOR_RESULT, 0, (LPARAM)result))
         free(result);
 }
 
 /* Hardware calls and result delivery never hold the request lock. */
+typedef struct {
+    int index;
+    DWORD generation, sequence;
+} WriteGuardContext;
+
+static BOOL WriteIsCurrent(void *context)
+{
+    const WriteGuardContext *guard = (const WriteGuardContext *)context;
+    BOOL current;
+    EnterCriticalSection(&g_worker.lock);
+    current = !g_worker.stop && guard->generation == g_worker.generation &&
+              guard->sequence == g_worker.sequences[guard->index];
+    LeaveCriticalSection(&g_worker.lock);
+    return current;
+}
+
 static void ApplyWrite(int index, WriteRequest *request)
 {
-    BOOL success = Monitor_SetBrightnessSync(&request->monitor, request->percent);
+    WriteGuardContext guard = { index, request->generation, request->sequence };
+    BOOL sourceUpdated;
+    MonitorWriteOutcome outcome = Monitor_SetBrightnessForPurposeGuardedSync(
+        &request->monitor, request->percent, request->purpose, request->otherInput,
+        WriteIsCurrent, &guard, &sourceUpdated);
+    MonitorResultKind kind = outcome == MONITOR_WRITE_SKIPPED ? MONITOR_RESULT_SKIPPED :
+                             outcome == MONITOR_WRITE_CANCELLED ? MONITOR_RESULT_CANCELLED :
+                             MONITOR_RESULT_BRIGHTNESS;
     PostResult(index, request->generation, request->sequence,
-               &request->monitor, success);
+               &request->monitor, outcome == MONITOR_WRITE_APPLIED, kind, sourceUpdated,
+               request->purpose, outcome == MONITOR_WRITE_APPLIED);
     ReleaseWriteRequest(request);
     EnterCriticalSection(&g_worker.lock);
-    g_worker.inFlight[index] = FALSE;
+    /* Reset may have already cancelled this generation's outstanding intent. */
+    if (request->generation == g_worker.generation)
+        g_worker.inFlight[index] = FALSE;
     LeaveCriticalSection(&g_worker.lock);
 }
 
@@ -152,7 +205,23 @@ static void ApplyRefresh(RefreshRequest *request)
     for (int i = 0; i < request->monitors.count; i++) {
         if (readMask & (1u << i))
             PostResult(i, request->generation, request->sequences[i],
-                       &request->monitors.monitors[i], TRUE);
+                       &request->monitors.monitors[i], TRUE, MONITOR_RESULT_BRIGHTNESS, FALSE,
+                       MONITOR_WRITE_NORMAL, FALSE);
+    }
+    ReleaseRefreshRequest(request);
+}
+
+static void ApplySourceRefresh(RefreshRequest *request)
+{
+    for (int i = 0; i < request->monitors.count; i++) {
+        BrightMonitor *monitor = &request->monitors.monitors[i];
+        if (monitor->backend != BACKEND_DDC) continue;
+        if (!request->allMonitors && (!monitor->controllable || monitor->excludedFromControl ||
+                                      !monitor->sourceFilter)) continue;
+        BOOL success = Monitor_ReadSourceSync(monitor);
+        /* A failed read must replace stale success with "unknown" in the UI. */
+        PostResult(i, request->generation, request->sequences[i], monitor,
+                   success, MONITOR_RESULT_SOURCE, TRUE, MONITOR_WRITE_NORMAL, FALSE);
     }
     ReleaseRefreshRequest(request);
 }
@@ -173,6 +242,8 @@ static DWORD WINAPI WorkerProc(LPVOID unused)
             ApplyWrite(work.index, &work.request.write);
         else if (kind == WORK_REFRESH)
             ApplyRefresh(&work.request.refresh);
+        else if (kind == WORK_SOURCES)
+            ApplySourceRefresh(&work.request.refresh);
         else {
             Monitor_FlushRetiredHandles();
             WaitForSingleObject(g_worker.event, INFINITE);
@@ -213,12 +284,18 @@ void MonitorWorker_Wake(void)
     ReleaseSRWLockShared(&g_lifecycleLock);
 }
 
-BOOL MonitorWorker_Set(BrightMonitor *monitor, DWORD percent)
+static int FindMonitorIndex(const BrightMonitor *monitor)
 {
-    int index = -1;
-    if (!MonitorWorker_Running()) return FALSE;
     for (int i = 0; i < g_worker.view->count; i++)
-        if (monitor == &g_worker.view->monitors[i]) { index = i; break; }
+        if (monitor == &g_worker.view->monitors[i]) return i;
+    return -1;
+}
+
+static BOOL QueueWrite(BrightMonitor *monitor, DWORD percent,
+                       MonitorWritePurpose purpose, DWORD otherInput)
+{
+    if (!MonitorWorker_Running()) return FALSE;
+    int index = FindMonitorIndex(monitor);
     if (index < 0) return FALSE;
 
     EnterCriticalSection(&g_worker.lock);
@@ -227,7 +304,10 @@ BOOL MonitorWorker_Set(BrightMonitor *monitor, DWORD percent)
     request->monitor = *monitor;
     Monitor_Retain(&request->monitor);
     request->percent = percent;
+    request->purpose = purpose;
+    request->otherInput = otherInput;
     g_worker.targets[index] = percent;
+    g_worker.purposes[index] = purpose;
     request->sequence = ++g_worker.sequences[index];
     request->generation = g_worker.generation;
     request->pending = TRUE;
@@ -236,11 +316,49 @@ BOOL MonitorWorker_Set(BrightMonitor *monitor, DWORD percent)
     return TRUE;
 }
 
+BOOL MonitorWorker_Set(BrightMonitor *monitor, DWORD percent)
+{
+    return QueueWrite(monitor, percent, MONITOR_WRITE_NORMAL, 0);
+}
+
+BOOL MonitorWorker_SetIdle(BrightMonitor *monitor, DWORD percent)
+{
+    return QueueWrite(monitor, percent, MONITOR_WRITE_IDLE, 0);
+}
+
+BOOL MonitorWorker_ReleaseIdle(BrightMonitor *monitor, DWORD rawBrightness, DWORD otherInput)
+{
+    return QueueWrite(monitor, rawBrightness, MONITOR_WRITE_IDLE_RELEASE, otherInput);
+}
+
+void MonitorWorker_Cancel(BrightMonitor *monitor)
+{
+    if (!MonitorWorker_Running()) return;
+    int index = FindMonitorIndex(monitor);
+    if (index < 0) return;
+    EnterCriticalSection(&g_worker.lock);
+    ++g_worker.sequences[index];
+    ReleaseWriteRequest(&g_worker.writes[index]);
+    g_worker.inFlight[index] = FALSE;
+    LeaveCriticalSection(&g_worker.lock);
+    SetEvent(g_worker.event);
+}
+
 void MonitorWorker_Refresh(const MonitorList *view)
 {
     if (!MonitorWorker_Running()) return;
     EnterCriticalSection(&g_worker.lock);
-    SnapshotRefreshLocked(view);
+    SnapshotRefreshLocked(&g_worker.refresh, view);
+    LeaveCriticalSection(&g_worker.lock);
+    SetEvent(g_worker.event);
+}
+
+void MonitorWorker_RefreshSources(const MonitorList *view, BOOL allMonitors)
+{
+    if (!MonitorWorker_Running()) return;
+    EnterCriticalSection(&g_worker.lock);
+    SnapshotRefreshLocked(&g_worker.sources, view);
+    g_worker.sources.allMonitors = allMonitors;
     LeaveCriticalSection(&g_worker.lock);
     SetEvent(g_worker.event);
 }
@@ -272,6 +390,17 @@ BOOL MonitorWorker_Accept(const MonitorResult *result)
     EnterCriticalSection(&g_worker.lock);
     accept = result->generation == g_worker.generation &&
              result->sequence == g_worker.sequences[result->index];
+    LeaveCriticalSection(&g_worker.lock);
+    return accept;
+}
+
+BOOL MonitorWorker_AcceptState(const MonitorResult *result)
+{
+    BOOL accept;
+    if (!MonitorWorker_Running() || result->index < 0 || result->index >= g_worker.view->count)
+        return FALSE;
+    EnterCriticalSection(&g_worker.lock);
+    accept = result->generation == g_worker.generation;
     LeaveCriticalSection(&g_worker.lock);
     return accept;
 }

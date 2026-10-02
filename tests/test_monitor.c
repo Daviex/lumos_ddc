@@ -3,6 +3,7 @@
 #include <windows.h>
 #include <physicalmonitorenumerationapi.h>
 #include <highlevelmonitorconfigurationapi.h>
+#include <lowlevelmonitorconfigurationapi.h>
 #include <stdio.h>
 #include <string.h>
 #include "../monitor.h"
@@ -26,6 +27,23 @@ static HANDLE destroyed[MAX_MONITORS];
 static int destroyCalls, setCalls, wakeCalls;
 static DWORD lastWrite, wmiRead;
 static BOOL setSuccess, wmiReadSuccess;
+static int sourceCalls;
+static int brightnessReadCalls;
+static DWORD sourceInput;
+static DWORD sourceAfterBrightnessRead;
+static BOOL sourceReadSuccess;
+
+static BOOL WINAPI MockGetVCPFeatureAndVCPFeatureReply(HANDLE handle, BYTE code,
+        LPMC_VCP_CODE_TYPE type, LPDWORD current, LPDWORD maximum)
+{
+    (void)handle;
+    CHECK(code == 0x60);
+    sourceCalls++;
+    *type = MC_SET_PARAMETER;
+    *current = sourceInput;
+    *maximum = 0x12;
+    return sourceReadSuccess;
+}
 
 static BOOL WINAPI MockDestroyPhysicalMonitor(HANDLE handle)
 {
@@ -39,6 +57,8 @@ static BOOL WINAPI MockGetMonitorBrightness(HANDLE handle, LPDWORD minimum,
                                             LPDWORD current, LPDWORD maximum)
 {
     size_t index = (size_t)(UINT_PTR)handle;
+    brightnessReadCalls++;
+    if (sourceAfterBrightnessRead) sourceInput = sourceAfterBrightnessRead;
     CHECK(index < MAX_MONITORS);
     if (index >= MAX_MONITORS) return FALSE;
     *minimum = readings[index].minimum;
@@ -85,6 +105,15 @@ BOOL MonitorWorker_Set(BrightMonitor *monitor, DWORD percent)
     CHECK(FALSE);
     return FALSE;
 }
+BOOL MonitorWorker_SetIdle(BrightMonitor *monitor, DWORD percent)
+{
+    return MonitorWorker_Set(monitor, percent);
+}
+BOOL MonitorWorker_ReleaseIdle(BrightMonitor *monitor, DWORD rawBrightness, DWORD otherInput)
+{
+    (void)otherInput;
+    return MonitorWorker_Set(monitor, rawBrightness);
+}
 void MonitorWorker_Refresh(const MonitorList *view)
 {
     (void)view;
@@ -94,6 +123,7 @@ void MonitorWorker_Refresh(const MonitorList *view)
 #define DestroyPhysicalMonitor MockDestroyPhysicalMonitor
 #define GetMonitorBrightness MockGetMonitorBrightness
 #define SetMonitorBrightness MockSetMonitorBrightness
+#define GetVCPFeatureAndVCPFeatureReply MockGetVCPFeatureAndVCPFeatureReply
 #include "../monitor.c"
 
 static BrightMonitor MakeDdc(UINT_PTR handle)
@@ -123,6 +153,11 @@ static void ResetMocks(void)
     lastWrite = 0;
     setSuccess = wmiReadSuccess = TRUE;
     wmiRead = 52;
+    sourceCalls = 0;
+    brightnessReadCalls = 0;
+    sourceInput = 0x0F;
+    sourceAfterBrightnessRead = 0;
+    sourceReadSuccess = TRUE;
 }
 
 static void TestReusedZeroHandleLeases(void)
@@ -254,6 +289,209 @@ static void TestExcludedMonitorsAreNeverWritten(void)
     CHECK(setCalls == 1);
 }
 
+static BOOL RejectAfterSourceRead(void *context)
+{
+    int expectedCalls = *(int *)context;
+    CHECK(sourceCalls == expectedCalls);
+    return FALSE;
+}
+
+static void TestSourceFilterChecksBeforeEveryWrite(void)
+{
+    BrightMonitor monitor = MakeDdc(0);
+    ResetMocks();
+    monitor.sourceFilter = TRUE;
+    monitor.expectedInput = 0x0F;
+    CHECK(Monitor_SetBrightness(&monitor, 40));
+    CHECK(sourceCalls == 1 && setCalls == 1 && lastWrite == 40);
+    CHECK(monitor.sourceKnown && monitor.currentInput == 0x0F);
+    CHECK(monitor.desiredBrightnessValid && monitor.desiredBrightness == 40);
+
+    sourceInput = 0x12;  /* A cached match must never authorize another write. */
+    CHECK(!Monitor_SetBrightness(&monitor, 60));
+    CHECK(sourceCalls == 2 && setCalls == 1 && monitor.brightnessCur == 40);
+    CHECK(monitor.sourceKnown && monitor.currentInput == 0x12);
+    CHECK(monitor.desiredBrightness == 60);
+    Monitor_PreviewBrightness(&monitor, 80);
+    CHECK(monitor.brightnessCur == 40);
+
+    sourceReadSuccess = FALSE;
+    CHECK(Monitor_SetBrightnessGuardedSync(&monitor, 70, NULL, NULL) == MONITOR_WRITE_SKIPPED);
+    CHECK(sourceCalls == 3 && setCalls == 1 && !monitor.sourceKnown);
+    CHECK(monitor.currentInput == 0);
+    sourceReadSuccess = TRUE;
+    sourceInput = 0;  /* Invalid replies also suspend control. */
+    CHECK(!Monitor_SetBrightnessSync(&monitor, 70));
+    CHECK(!monitor.sourceKnown && setCalls == 1);
+    sourceInput = 0x0F;
+    monitor.expectedInput = 0;
+    CHECK(!Monitor_SetBrightnessSync(&monitor, 70));
+    CHECK(sourceCalls == 5 && setCalls == 1);
+    monitor.expectedInput = 0x0F;
+    int expectedCalls = 6;
+    CHECK(Monitor_SetBrightnessGuardedSync(&monitor, 70, RejectAfterSourceRead,
+                                          &expectedCalls) == MONITOR_WRITE_CANCELLED);
+    CHECK(setCalls == 1 && monitor.brightnessCur == 40);
+    CHECK(Monitor_SetBrightnessSync(&monitor, 70));
+    CHECK(sourceCalls == 7 && setCalls == 2 && monitor.brightnessCur == 70);
+    sourceInput = 256;
+    CHECK(!Monitor_SetBrightnessSync(&monitor, 80));
+    CHECK(sourceCalls == 8 && !monitor.sourceKnown && monitor.currentInput == 0 && setCalls == 2);
+
+    monitor.sourceFilter = FALSE;
+    sourceReadSuccess = FALSE;
+    CHECK(Monitor_SetBrightnessSync(&monitor, 80));
+    CHECK(sourceCalls == 8 && setCalls == 3);  /* Legacy unfiltered behavior. */
+    monitor.sourceFilter = TRUE;
+    monitor.backend = BACKEND_WMI;
+    monitor.hasHandle = FALSE;
+    CHECK(Monitor_SetBrightnessSync(&monitor, 90));
+    CHECK(sourceCalls == 8 && setCalls == 4 && monitor.brightnessCur == 90);
+}
+
+static void TestIdleRestoresExactRawBrightness(void)
+{
+    BrightMonitor monitor = MakeDdc(0);
+    ResetMocks();
+    monitor.sourceFilter = TRUE;
+    monitor.expectedInput = 0x0F;
+    monitor.desiredBrightnessValid = TRUE;
+    monitor.desiredBrightness = 77;
+    readings[0].minimum = 0;
+    readings[0].maximum = 255;
+    readings[0].current = 128;
+    CHECK(Monitor_SetIdleBrightness(&monitor, 10));
+    CHECK(brightnessReadCalls == 1 && sourceCalls == 1 && setCalls == 1);
+    CHECK(monitor.preIdleBrightnessValid && monitor.preIdleBrightness == 128);
+    CHECK(monitor.brightnessCur == 25 && lastWrite == 25);
+    CHECK(!monitor.idleApplied); /* Only the app consumes ownership acknowledgements. */
+    CHECK(monitor.desiredBrightnessValid && monitor.desiredBrightness == 77);
+
+    sourceInput = 0x12;
+    CHECK(Monitor_ReleaseIdleBrightness(&monitor, monitor.preIdleBrightness, 0x12));
+    CHECK(lastWrite == 128 && monitor.brightnessCur == 128 && setCalls == 2);
+    CHECK(monitor.desiredBrightness == 77);
+    CHECK(brightnessReadCalls == 1 && sourceCalls == 2);
+
+    sourceInput = 0x0F;
+    readings[0].current = 25; /* An existing session baseline must not be captured again. */
+    CHECK(Monitor_SetIdleBrightness(&monitor, 10));
+    CHECK(lastWrite == 25 && monitor.preIdleBrightness == 128 && brightnessReadCalls == 1);
+    CHECK(monitor.desiredBrightness == 77);
+}
+
+static void TestIdleReleaseNeverBypassesUnknownOrChangedSource(void)
+{
+    BrightMonitor monitor = MakeDdc(0);
+    ResetMocks();
+    monitor.sourceFilter = TRUE;
+    monitor.expectedInput = 0x0F;
+    monitor.currentInput = 0x12;
+    monitor.sourceKnown = TRUE;
+    CHECK(!Monitor_ReleaseIdleBrightness(&monitor, 80, 0x12)); /* Already returned to PC. */
+    CHECK(setCalls == 0 && sourceCalls == 1 && monitor.currentInput == 0x0F);
+    sourceInput = 0x11;
+    CHECK(!Monitor_ReleaseIdleBrightness(&monitor, 80, 0x12)); /* Another external input. */
+    CHECK(setCalls == 0 && sourceCalls == 2 && monitor.currentInput == 0x11);
+    sourceReadSuccess = FALSE;
+    CHECK(!Monitor_ReleaseIdleBrightness(&monitor, 80, 0x12));
+    CHECK(setCalls == 0 && sourceCalls == 3 && !monitor.sourceKnown);
+    sourceReadSuccess = TRUE;
+    sourceInput = 0;
+    CHECK(!Monitor_ReleaseIdleBrightness(&monitor, 80, 0x12));
+    sourceInput = 0x12;
+    int expectedCalls = 5;
+    BOOL sourceUpdated = FALSE;
+    CHECK(Monitor_SetBrightnessForPurposeGuardedSync(&monitor, 80, MONITOR_WRITE_IDLE_RELEASE,
+        0x12, RejectAfterSourceRead, &expectedCalls, &sourceUpdated) == MONITOR_WRITE_CANCELLED);
+    CHECK(sourceUpdated && setCalls == 0);
+    CHECK(!Monitor_ReleaseIdleBrightness(&monitor, 101, 0x12)); /* Native range is enforced. */
+    CHECK(!Monitor_ReleaseIdleBrightness(&monitor, 80, 0x0F));
+    CHECK(!Monitor_ReleaseIdleBrightness(&monitor, 80, 0));
+    CHECK(!Monitor_ReleaseIdleBrightness(&monitor, 80, 256));
+    monitor.expectedInput = 0;
+    CHECK(!Monitor_ReleaseIdleBrightness(&monitor, 80, 0x12));
+    monitor.expectedInput = 0x0F;
+    monitor.sourceFilter = FALSE;
+    CHECK(!Monitor_ReleaseIdleBrightness(&monitor, 80, 0x12));
+    monitor.sourceFilter = TRUE;
+    monitor.excludedFromControl = TRUE;
+    CHECK(!Monitor_ReleaseIdleBrightness(&monitor, 80, 0x12));
+    monitor.excludedFromControl = FALSE;
+    monitor.backend = BACKEND_WMI;
+    CHECK(!Monitor_ReleaseIdleBrightness(&monitor, 80, 0x12));
+    CHECK(setCalls == 0 && sourceCalls == 6);
+}
+
+static void TestIdleRequiresValidatedBaselineAndAppliedWrite(void)
+{
+    BrightMonitor monitor = MakeDdc(0);
+    ResetMocks();
+    monitor.sourceFilter = TRUE;
+    monitor.expectedInput = 0x0F;
+    readings[0].success = FALSE;
+    CHECK(!Monitor_SetIdleBrightness(&monitor, 10));
+    CHECK(!monitor.preIdleBrightnessValid && setCalls == 0 && sourceCalls == 0);
+    readings[0].success = TRUE;
+    readings[0].current = readings[0].maximum + 1;
+    CHECK(!Monitor_SetIdleBrightness(&monitor, 10));
+    CHECK(!monitor.preIdleBrightnessValid && setCalls == 0 && sourceCalls == 0);
+    readings[0].current = 50;
+    setSuccess = FALSE;
+    CHECK(!Monitor_SetIdleBrightness(&monitor, 10));
+    CHECK(!monitor.preIdleBrightnessValid && setCalls == 1 && sourceCalls == 1);
+    setSuccess = TRUE;
+    sourceAfterBrightnessRead = 0x12; /* Source changes during the potentially slow baseline read. */
+    CHECK(!Monitor_SetIdleBrightness(&monitor, 10));
+    CHECK(!monitor.preIdleBrightnessValid && setCalls == 1 && sourceCalls == 2);
+    sourceAfterBrightnessRead = 0;
+    sourceInput = 0x0F;
+    CHECK(Monitor_SetIdleBrightness(&monitor, 10));
+    CHECK(monitor.preIdleBrightnessValid && monitor.preIdleBrightness == 50);
+    CHECK(setCalls == 2 && sourceCalls == 3 && brightnessReadCalls == 5);
+    CHECK(!monitor.desiredBrightnessValid);
+
+    monitor.backend = BACKEND_WMI;
+    monitor.preIdleBrightnessValid = FALSE;
+    wmiReadSuccess = FALSE;
+    CHECK(!Monitor_SetIdleBrightness(&monitor, 10));
+    wmiReadSuccess = TRUE;
+    wmiRead = 101;
+    CHECK(!Monitor_SetIdleBrightness(&monitor, 10));
+    wmiRead = 67;
+    CHECK(Monitor_SetIdleBrightness(&monitor, 10));
+    CHECK(monitor.preIdleBrightnessValid && monitor.preIdleBrightness == 67 && lastWrite == 10);
+}
+
+static void TestNormalSyncWriteClearsIdleOwnershipOnlyWhenApplied(void)
+{
+    BrightMonitor monitor = MakeDdc(0);
+    ResetMocks();
+    monitor.sourceFilter = TRUE;
+    monitor.expectedInput = 0x0F;
+    monitor.preIdleBrightnessValid = TRUE;
+    monitor.preIdleBrightness = 80;
+    monitor.idleApplied = TRUE;
+    monitor.idleDimPending = TRUE;
+    monitor.idleReleasePending = TRUE;
+
+    sourceInput = 0x12;
+    CHECK(!Monitor_SetBrightness(&monitor, 70));
+    CHECK(monitor.idleApplied && monitor.idleDimPending && monitor.idleReleasePending);
+    CHECK(setCalls == 0);
+
+    sourceInput = 0x0F;
+    setSuccess = FALSE;
+    CHECK(!Monitor_SetBrightness(&monitor, 70));
+    CHECK(monitor.idleApplied && monitor.idleDimPending && monitor.idleReleasePending);
+
+    setSuccess = TRUE;
+    CHECK(Monitor_SetBrightness(&monitor, 70));
+    CHECK(!monitor.idleApplied && !monitor.idleDimPending && !monitor.idleReleasePending);
+    CHECK(monitor.preIdleBrightnessValid && monitor.preIdleBrightness == 80);
+    CHECK(monitor.brightnessCur == 70 && monitor.desiredBrightness == 70);
+}
+
 int main(void)
 {
     TestReusedZeroHandleLeases();
@@ -261,6 +499,11 @@ int main(void)
     TestRefreshValidatesReadings();
     TestLargeBrightnessRange();
     TestExcludedMonitorsAreNeverWritten();
+    TestSourceFilterChecksBeforeEveryWrite();
+    TestIdleRestoresExactRawBrightness();
+    TestIdleReleaseNeverBypassesUnknownOrChangedSource();
+    TestIdleRequiresValidatedBaselineAndAppliedWrite();
+    TestNormalSyncWriteClearsIdleOwnershipOnlyWhenApplied();
     if (failures) {
         printf("%d monitor checks failed\n", failures);
         return 1;

@@ -4,6 +4,7 @@
 #include "monitor_worker.h"
 #include <physicalmonitorenumerationapi.h>
 #include <highlevelmonitorconfigurationapi.h>
+#include <lowlevelmonitorconfigurationapi.h>
 #include <stdio.h>
 #include <stdarg.h>
 #include <stdlib.h>
@@ -460,6 +461,9 @@ static BOOL CALLBACK MonitorEnumProc(HMONITOR hMon, HDC hdcMon, LPRECT lpRect, L
                 Log("    No brightness control (no DDC, no WMI match, err=%lu)", GetLastError());
             }
 
+            if (bm->backend == BACKEND_DDC)
+                Monitor_ReadSourceSync(bm);
+
             ml->count++;
             tracked[i] = FALSE; /* ownership transferred to the monitor list */
         }
@@ -552,26 +556,82 @@ DWORD Monitor_RefreshBrightnessSync(MonitorList *ml)
     return readMask;
 }
 
-BOOL Monitor_SetBrightnessSync(BrightMonitor *mon, DWORD percent)
+BOOL Monitor_ReadSourceSync(BrightMonitor *mon)
 {
-    if (!Monitor_CanControl(mon))
-        return FALSE;
+    DWORD input = 0, maximum = 0;
+    MC_VCP_CODE_TYPE type;
+    BOOL ok = mon->backend == BACKEND_DDC && mon->hasHandle &&
+              GetVCPFeatureAndVCPFeatureReply(mon->hPhysical, 0x60, &type,
+                                             &input, &maximum);
+    mon->sourceKnown = ok && input > 0 && input <= 255;
+    mon->currentInput = mon->sourceKnown ? input : 0;
+    mon->sourceCheckedTick = GetTickCount64();
+    return mon->sourceKnown;
+}
 
-    if (percent > 100) percent = 100;
+MonitorWriteOutcome Monitor_SetBrightnessForPurposeGuardedSync(
+    BrightMonitor *mon, DWORD value, MonitorWritePurpose purpose, DWORD otherInput,
+    MonitorWriteGuard guard, void *context, BOOL *sourceUpdated)
+{
+    BOOL captureBaseline = purpose == MONITOR_WRITE_IDLE && !mon->preIdleBrightnessValid;
+    DWORD baseline = 0;
+    if (sourceUpdated) *sourceUpdated = FALSE;
+    if (!Monitor_CanControl(mon))
+        return MONITOR_WRITE_SKIPPED;
+
+    if (purpose == MONITOR_WRITE_IDLE_RELEASE &&
+        (mon->backend != BACKEND_DDC || !mon->sourceFilter ||
+         !mon->expectedInput || mon->expectedInput > 255 ||
+         !otherInput || otherInput > 255 || otherInput == mon->expectedInput))
+        return MONITOR_WRITE_SKIPPED;
+
+    DWORD percent = value > 100 ? 100 : value;
 
     if (mon->backend == BACKEND_WMI) {
+        if (captureBaseline && (!Wmi_GetBrightness(mon->wmiInstance, &baseline) || baseline > 100))
+            return MONITOR_WRITE_FAILED;
+        if (guard && !guard(context)) return MONITOR_WRITE_CANCELLED;
         BOOL ok = Wmi_SetBrightness(mon->wmiInstance, percent);
         Log("SetBrightness(WMI): '%ls' pct=%lu -> %s", mon->name, percent, ok ? "OK" : "FAILED");
-        if (ok)
+        if (ok) {
             mon->brightnessCur = percent;   /* WMI range is fixed 0-100 */
-        return ok;
+            if (captureBaseline) {
+                mon->preIdleBrightness = baseline;
+                mon->preIdleBrightnessValid = TRUE;
+            }
+        }
+        return ok ? MONITOR_WRITE_APPLIED : MONITOR_WRITE_FAILED;
     }
 
     if (!mon->hasHandle || mon->backend != BACKEND_DDC ||
         mon->brightnessMax <= mon->brightnessMin)
-        return FALSE;
+        return MONITOR_WRITE_FAILED;
 
-    DWORD value = Brightness_ToRaw(mon, percent);
+    if (captureBaseline) {
+        DWORD minimum, maximum;
+        if (!GetMonitorBrightness(mon->hPhysical, &minimum, &baseline, &maximum) ||
+            maximum <= minimum || baseline < minimum || baseline > maximum)
+            return MONITOR_WRITE_FAILED;
+        mon->brightnessMin = minimum;
+        mon->brightnessMax = maximum;
+    }
+
+    if (mon->sourceFilter) {
+        Monitor_ReadSourceSync(mon);
+        if (sourceUpdated) *sourceUpdated = TRUE;
+    }
+    if (guard && !guard(context)) return MONITOR_WRITE_CANCELLED;
+    if (purpose == MONITOR_WRITE_IDLE_RELEASE) {
+        if (!mon->sourceKnown || mon->currentInput != otherInput)
+            return MONITOR_WRITE_SKIPPED;
+    } else if (!Monitor_SourceAllowsControl(mon)) return MONITOR_WRITE_SKIPPED;
+
+    if (purpose == MONITOR_WRITE_IDLE_RELEASE) {
+        if (value < mon->brightnessMin || value > mon->brightnessMax)
+            return MONITOR_WRITE_FAILED;
+    } else {
+        value = Brightness_ToRaw(mon, percent);
+    }
 
     Log("SetBrightness: '%ls' pct=%lu val=%lu (range %lu-%lu) hPhys=%p",
         mon->name, percent, value, mon->brightnessMin, mon->brightnessMax, mon->hPhysical);
@@ -579,16 +639,34 @@ BOOL Monitor_SetBrightnessSync(BrightMonitor *mon, DWORD percent)
     BOOL ok = SetMonitorBrightness(mon->hPhysical, value);
     if (ok) {
         mon->brightnessCur = value;
+        if (captureBaseline) {
+            mon->preIdleBrightness = baseline;
+            mon->preIdleBrightnessValid = TRUE;
+        }
         Log("  -> OK");
     } else {
         Log("  -> FAILED, err=%lu", GetLastError());
     }
-    return ok;
+    return ok ? MONITOR_WRITE_APPLIED : MONITOR_WRITE_FAILED;
+}
+
+MonitorWriteOutcome Monitor_SetBrightnessGuardedSync(BrightMonitor *mon, DWORD percent,
+                                                      MonitorWriteGuard guard, void *context)
+{
+    return Monitor_SetBrightnessForPurposeGuardedSync(mon, percent, MONITOR_WRITE_NORMAL,
+                                                     0, guard, context, NULL);
+}
+
+BOOL Monitor_SetBrightnessSync(BrightMonitor *mon, DWORD percent)
+{
+    return Monitor_SetBrightnessGuardedSync(mon, percent, NULL, NULL) == MONITOR_WRITE_APPLIED;
 }
 
 void Monitor_PreviewBrightness(BrightMonitor *mon, DWORD percent)
 {
     if (!Monitor_CanControl(mon)) return;
+    /* A filtered request may be skipped after its fresh source read. */
+    if (mon->sourceFilter && mon->backend != BACKEND_WMI) return;
     mon->brightnessCur = Brightness_ToRaw(mon, percent);
 }
 
@@ -596,10 +674,41 @@ BOOL Monitor_SetBrightness(BrightMonitor *mon, DWORD percent)
 {
     if (!Monitor_CanControl(mon)) return FALSE;
     if (percent > 100) percent = 100;
-    if (!MonitorWorker_Running()) return Monitor_SetBrightnessSync(mon, percent);
+    mon->desiredBrightnessValid = TRUE;
+    mon->desiredBrightness = percent;
+    if (!MonitorWorker_Running()) {
+        BOOL applied = Monitor_SetBrightnessSync(mon, percent);
+        if (applied) {
+            mon->idleApplied = FALSE;
+            mon->idleDimPending = FALSE;
+            mon->idleReleasePending = FALSE;
+        }
+        return applied;
+    }
     if (!MonitorWorker_Set(mon, percent)) return FALSE;
     Monitor_PreviewBrightness(mon, percent);
     return TRUE;
+}
+
+BOOL Monitor_SetIdleBrightness(BrightMonitor *mon, DWORD percent)
+{
+    if (!Monitor_CanControl(mon)) return FALSE;
+    if (percent > 100) percent = 100;
+    if (!MonitorWorker_Running())
+        return Monitor_SetBrightnessForPurposeGuardedSync(mon, percent, MONITOR_WRITE_IDLE,
+                                                          0, NULL, NULL, NULL) == MONITOR_WRITE_APPLIED;
+    if (!MonitorWorker_SetIdle(mon, percent)) return FALSE;
+    Monitor_PreviewBrightness(mon, percent);
+    return TRUE;
+}
+
+BOOL Monitor_ReleaseIdleBrightness(BrightMonitor *mon, DWORD rawBrightness, DWORD otherInput)
+{
+    if (!Monitor_CanControl(mon)) return FALSE;
+    if (!MonitorWorker_Running())
+        return Monitor_SetBrightnessForPurposeGuardedSync(mon, rawBrightness, MONITOR_WRITE_IDLE_RELEASE,
+                                                          otherInput, NULL, NULL, NULL) == MONITOR_WRITE_APPLIED;
+    return MonitorWorker_ReleaseIdle(mon, rawBrightness, otherInput);
 }
 
 void Monitor_RefreshBrightness(MonitorList *ml)

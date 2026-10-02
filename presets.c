@@ -7,6 +7,7 @@
 #define APP_NAME    L"Lumos"
 #define AUTOSTART_COMMAND_CAPACITY (MAX_PATH + 2 + ARRAYSIZE(L" " LUMOS_STARTUP_ARGUMENT) - 1)
 #define MONITOR_SELECTION_SECTION L"MonitorSelection"
+#define MONITOR_INPUT_SECTION L"MonitorInputs"
 
 static void EnsureDirectory(const WCHAR *path)
 {
@@ -55,6 +56,7 @@ void Settings_CreateDefaults(Settings *s)
     WritePrivateProfileStringW(L"Settings", L"IdleDimMinutes", L"5", s->iniPath);
     WritePrivateProfileStringW(MONITOR_SELECTION_SECTION, L"Mode", L"All", s->iniPath);
     WritePrivateProfileStringW(MONITOR_SELECTION_SECTION, L"Count", L"0", s->iniPath);
+    WritePrivateProfileStringW(MONITOR_INPUT_SECTION, L"Count", L"0", s->iniPath);
 }
 
 int Settings_DayBrightness(const Settings *s)
@@ -131,6 +133,98 @@ static void SaveMonitorSelection(const Settings *s)
     }
     StringCchPrintfW(value, ARRAYSIZE(value), L"%d", count);
     WritePrivateProfileStringW(MONITOR_SELECTION_SECTION, L"Count", value, s->iniPath);
+}
+
+static BOOL ParseMonitorInput(const WCHAR *value, DWORD *input)
+{
+    DWORD parsed = 0;
+    if (!value[0]) return FALSE;
+    for (size_t i = 0; value[i]; i++) {
+        if (value[i] < L'0' || value[i] > L'9') return FALSE;
+        parsed = parsed * 10 + (DWORD)(value[i] - L'0');
+        if (parsed > 255) return FALSE;
+    }
+    *input = parsed;
+    return TRUE;
+}
+
+static void AddMonitorInputRule(MonitorInputRule *rules, int *count,
+                                const MonitorInputRule *rule)
+{
+    if (!Settings_MonitorKeyValid(rule->key) || _wcsnicmp(rule->key, L"DDC:", 4) != 0)
+        return;
+    for (int i = 0; i < *count; i++) {
+        if (_wcsicmp(rules[i].key, rule->key) == 0) {
+            /* Conflicting or duplicate identities need explicit reconfiguration.
+               A later disabled record must not bypass an earlier enabled filter. */
+            rules[i].enabled = rules[i].enabled || rule->enabled;
+            rules[i].input = 0;
+            return;
+        }
+    }
+    if (*count >= MAX_MONITORS) return;
+    rules[*count] = *rule;
+    rules[*count].enabled = rule->enabled != FALSE;
+    if (rules[*count].input > 255) rules[*count].input = 0;
+    (*count)++;
+}
+
+static void LoadMonitorInputs(Settings *s)
+{
+    MonitorSelection *selection = &s->monitorSelection;
+    selection->inputRuleCount = 0;
+    int count = (int)GetPrivateProfileIntW(MONITOR_INPUT_SECTION, L"Count", 0, s->iniPath);
+    if (count < 0) count = 0;
+    if (count > MAX_MONITORS) count = MAX_MONITORS;
+    for (int i = 0; i < count; i++) {
+        MonitorInputRule rule = { 0 };
+        WCHAR field[16], key[MONITOR_SELECTION_KEY_LEN + 1], value[16];
+        StringCchPrintfW(field, ARRAYSIZE(field), L"Key%d", i);
+        DWORD length = GetPrivateProfileStringW(MONITOR_INPUT_SECTION, field, L"",
+                                                key, ARRAYSIZE(key), s->iniPath);
+        if (length >= MONITOR_SELECTION_KEY_LEN || !Settings_MonitorKeyValid(key)) continue;
+        StringCchCopyW(rule.key, ARRAYSIZE(rule.key), key);
+        StringCchPrintfW(field, ARRAYSIZE(field), L"Name%d", i);
+        GetPrivateProfileStringW(MONITOR_INPUT_SECTION, field, L"",
+                                 rule.name, ARRAYSIZE(rule.name), s->iniPath);
+        StringCchPrintfW(field, ARRAYSIZE(field), L"Enabled%d", i);
+        GetPrivateProfileStringW(MONITOR_INPUT_SECTION, field, L"",
+                                 value, ARRAYSIZE(value), s->iniPath);
+        BOOL validEnabled = wcscmp(value, L"0") == 0 || wcscmp(value, L"1") == 0;
+        /* An existing rule with a missing/corrupt flag stays protected. */
+        rule.enabled = wcscmp(value, L"0") != 0;
+        StringCchPrintfW(field, ARRAYSIZE(field), L"Input%d", i);
+        length = GetPrivateProfileStringW(MONITOR_INPUT_SECTION, field, L"",
+                                          value, ARRAYSIZE(value), s->iniPath);
+        if (!validEnabled || length >= ARRAYSIZE(value) - 1 ||
+            !ParseMonitorInput(value, &rule.input)) rule.input = 0;
+        AddMonitorInputRule(selection->inputRules, &selection->inputRuleCount, &rule);
+    }
+}
+
+static void SaveMonitorInputs(const Settings *s)
+{
+    const MonitorSelection *selection = &s->monitorSelection;
+    MonitorInputRule rules[MAX_MONITORS];
+    int count = 0;
+    WCHAR field[16], value[16];
+    for (int i = 0; i < selection->inputRuleCount && i < MAX_MONITORS; i++)
+        AddMonitorInputRule(rules, &count, &selection->inputRules[i]);
+    WritePrivateProfileSectionW(MONITOR_INPUT_SECTION, L"", s->iniPath);
+    for (int i = 0; i < count; i++) {
+        StringCchPrintfW(field, ARRAYSIZE(field), L"Key%d", i);
+        WritePrivateProfileStringW(MONITOR_INPUT_SECTION, field, rules[i].key, s->iniPath);
+        StringCchPrintfW(field, ARRAYSIZE(field), L"Name%d", i);
+        WritePrivateProfileStringW(MONITOR_INPUT_SECTION, field, rules[i].name, s->iniPath);
+        StringCchPrintfW(field, ARRAYSIZE(field), L"Enabled%d", i);
+        WritePrivateProfileStringW(MONITOR_INPUT_SECTION, field,
+                                   rules[i].enabled ? L"1" : L"0", s->iniPath);
+        StringCchPrintfW(field, ARRAYSIZE(field), L"Input%d", i);
+        StringCchPrintfW(value, ARRAYSIZE(value), L"%lu", (unsigned long)rules[i].input);
+        WritePrivateProfileStringW(MONITOR_INPUT_SECTION, field, value, s->iniPath);
+    }
+    StringCchPrintfW(value, ARRAYSIZE(value), L"%d", count);
+    WritePrivateProfileStringW(MONITOR_INPUT_SECTION, L"Count", value, s->iniPath);
 }
 
 void Settings_Load(Settings *s)
@@ -221,6 +315,7 @@ void Settings_Load(Settings *s)
         Schedule_Sort(s->schedule, s->scheduleCount);
     }
     LoadMonitorSelection(s);
+    LoadMonitorInputs(s);
 }
 
 void Settings_Save(Settings *s)
@@ -276,6 +371,7 @@ void Settings_Save(Settings *s)
         WritePrivateProfileSectionW(L"Schedule", section, s->iniPath);
     }
     SaveMonitorSelection(s);
+    SaveMonitorInputs(s);
 }
 
 static BOOL GetAutostartExecutable(WCHAR exePath[MAX_PATH])

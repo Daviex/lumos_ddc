@@ -18,10 +18,12 @@ static volatile LONG failures;
 #define RESULT_CAPACITY 16
 static CRITICAL_SECTION resultLock;
 static HANDLE resultReady, writeEntered, allowWrite, refreshEntered, allowRefresh;
+static HANDLE sourceEntered, allowSource;
 static MonitorResult *results[RESULT_CAPACITY];
 static int resultCount, resultHead;
 static volatile LONG writes, refreshes, retains, releases, leases;
 static volatile LONG writeSuccess, refreshMask;
+static volatile LONG sourceReads, sourceInput, sourceSuccess;
 static DWORD writtenValues[RESULT_CAPACITY];
 
 static LONG ReadCounter(volatile LONG *counter)
@@ -88,6 +90,44 @@ BOOL Monitor_SetBrightnessSync(BrightMonitor *monitor, DWORD percent)
     return TRUE;
 }
 
+BOOL Monitor_ReadSourceSync(BrightMonitor *monitor)
+{
+    InterlockedIncrement(&sourceReads);
+    SetEvent(sourceEntered);
+    CHECK(WaitForSingleObject(allowSource, TEST_TIMEOUT) == WAIT_OBJECT_0);
+    monitor->sourceKnown = ReadCounter(&sourceSuccess);
+    monitor->currentInput = monitor->sourceKnown ? (DWORD)ReadCounter(&sourceInput) : 0;
+    monitor->sourceCheckedTick = GetTickCount64();
+    return monitor->sourceKnown;
+}
+
+MonitorWriteOutcome Monitor_SetBrightnessForPurposeGuardedSync(
+    BrightMonitor *monitor, DWORD percent, MonitorWritePurpose purpose, DWORD otherInput,
+    MonitorWriteGuard guard, void *context, BOOL *sourceUpdated)
+{
+    DWORD baseline = monitor->brightnessCur;
+    *sourceUpdated = FALSE;
+    if (monitor->sourceFilter) {
+        Monitor_ReadSourceSync(monitor);
+        *sourceUpdated = TRUE;
+    }
+    if (guard && !guard(context)) return MONITOR_WRITE_CANCELLED;
+    if (purpose == MONITOR_WRITE_IDLE_RELEASE) {
+        if (!monitor->sourceFilter || !monitor->sourceKnown ||
+            !monitor->expectedInput || otherInput == monitor->expectedInput ||
+            monitor->currentInput != otherInput)
+            return MONITOR_WRITE_SKIPPED;
+    } else if (monitor->sourceFilter && (!monitor->expectedInput || !monitor->sourceKnown ||
+                                  monitor->currentInput != monitor->expectedInput))
+        return MONITOR_WRITE_SKIPPED;
+    if (!Monitor_SetBrightnessSync(monitor, percent)) return MONITOR_WRITE_FAILED;
+    if (purpose == MONITOR_WRITE_IDLE && !monitor->preIdleBrightnessValid) {
+        monitor->preIdleBrightnessValid = TRUE;
+        monitor->preIdleBrightness = baseline;
+    }
+    return MONITOR_WRITE_APPLIED;
+}
+
 DWORD Monitor_RefreshBrightnessSync(MonitorList *view)
 {
     InterlockedIncrement(&refreshes);
@@ -123,10 +163,15 @@ static void StartTest(MonitorList *view, BOOL blockWrites, BOOL blockRefresh)
     allowWrite = CreateEventW(NULL, TRUE, !blockWrites, NULL);
     refreshEntered = CreateEventW(NULL, FALSE, FALSE, NULL);
     allowRefresh = CreateEventW(NULL, TRUE, !blockRefresh, NULL);
+    sourceEntered = CreateEventW(NULL, FALSE, FALSE, NULL);
+    allowSource = CreateEventW(NULL, TRUE, TRUE, NULL);
     CHECK(resultReady && writeEntered && allowWrite && refreshEntered && allowRefresh);
     resultCount = resultHead = 0;
     writes = refreshes = retains = releases = leases = 0;
     writeSuccess = TRUE;
+    sourceReads = 0;
+    sourceInput = 0x0F;
+    sourceSuccess = TRUE;
     refreshMask = 1;
     memset(writtenValues, 0, sizeof(writtenValues));
     CHECK(MonitorWorker_Start((HWND)(UINT_PTR)1, view));
@@ -152,6 +197,7 @@ static void FinishTest(void)
 {
     SetEvent(allowWrite);
     SetEvent(allowRefresh);
+    SetEvent(allowSource);
     MonitorWorker_Stop();
     CHECK(!MonitorWorker_Running());
     CHECK(ReadCounter(&leases) == 0);
@@ -167,6 +213,8 @@ static void FinishTest(void)
     CloseHandle(allowWrite);
     CloseHandle(refreshEntered);
     CloseHandle(allowRefresh);
+    CloseHandle(sourceEntered);
+    CloseHandle(allowSource);
     DeleteCriticalSection(&resultLock);
 }
 
@@ -199,7 +247,10 @@ static void TestSlowWriteCoalescing(void)
     latest = WaitResult();
     if (first && latest) {
         CHECK(first->current == 10 && first->success);
+        CHECK(first->brightnessWritten && first->purpose == MONITOR_WRITE_NORMAL);
+        CHECK(!first->sourceUpdated);
         CHECK(!MonitorWorker_Accept(first));
+        CHECK(MonitorWorker_AcceptState(first));
         CHECK(latest->current == 45 && latest->success);
         CHECK(MonitorWorker_Accept(latest));
         CHECK(ReadCounter(&writes) == 2);
@@ -241,6 +292,7 @@ static void TestResetLeasesAndGeneration(void)
     if (stale && latest) {
         CHECK(stale->generation != latest->generation);
         CHECK(!MonitorWorker_Accept(stale));
+        CHECK(!MonitorWorker_AcceptState(stale));
         CHECK(MonitorWorker_Accept(latest) && latest->current == 30);
         CHECK(ReadCounter(&writes) == 2 && writtenValues[1] == 30);
         CHECK(ReadCounter(&refreshes) == 0);
@@ -293,6 +345,8 @@ static void TestWritePriorityRoundRobin(void)
         MonitorResult *result = WaitResult();
         if (result) {
             CHECK(result->index == i && result->current == 73);
+            CHECK(!result->brightnessWritten);
+            CHECK(!result->sourceUpdated);
             CHECK(MonitorWorker_Accept(result));
         }
         free(result);
@@ -354,6 +408,270 @@ static void TestHardwareFailures(void)
     FinishTest();
 }
 
+static void TestSourcePollingAndWriteOutcomes(void)
+{
+    MonitorList view = MakeView();
+    MonitorResult *result;
+    view.monitors[0].sourceFilter = TRUE;
+    view.monitors[0].expectedInput = 0x0F;
+    view.monitors[0].excludedFromControl = TRUE;
+    StartTest(&view, FALSE, FALSE);
+    MonitorWorker_RefreshSources(&view, TRUE);
+    result = WaitResult();
+    if (result) {
+        CHECK(result->kind == MONITOR_RESULT_SOURCE && result->sourceKnown && result->success);
+        CHECK(result->sourceUpdated);
+        CHECK(result->currentInput == 0x0F && result->current == 50);
+        CHECK(MonitorWorker_Accept(result));
+    }
+    free(result);
+    CHECK(ReadCounter(&sourceReads) == 1 && ReadCounter(&refreshes) == 0);
+    CHECK(ReadCounter(&writes) == 0);  /* Source polling works even for deselected displays. */
+    view.monitors[0].excludedFromControl = FALSE;
+
+    InterlockedExchange(&sourceInput, 0x12);
+    CHECK(MonitorWorker_Set(&view.monitors[0], 60));
+    result = WaitResult();
+    if (result) {
+        CHECK(result->kind == MONITOR_RESULT_SKIPPED && !result->success);
+        CHECK(result->sourceUpdated);
+        CHECK(result->sourceKnown && result->currentInput == 0x12 && result->current == 50);
+        CHECK(MonitorWorker_Accept(result));
+    }
+    free(result);
+    CHECK(ReadCounter(&writes) == 0);
+
+    InterlockedExchange(&sourceSuccess, FALSE);
+    MonitorWorker_RefreshSources(&view, TRUE);
+    result = WaitResult();
+    if (result) {
+        CHECK(result->kind == MONITOR_RESULT_SOURCE && !result->sourceKnown && !result->success);
+        CHECK(result->sourceUpdated);
+        CHECK(result->currentInput == 0 && MonitorWorker_Accept(result));
+    }
+    free(result);
+    CHECK(ReadCounter(&refreshes) == 0);
+    CHECK(MonitorWorker_Set(&view.monitors[0], 60));
+    result = WaitResult();
+    if (result) CHECK(result->kind == MONITOR_RESULT_SKIPPED && !result->sourceKnown);
+    free(result);
+    CHECK(ReadCounter(&writes) == 0);
+
+    InterlockedExchange(&sourceSuccess, TRUE);
+    InterlockedExchange(&sourceInput, 0x0F);
+    CHECK(MonitorWorker_Set(&view.monitors[0], 60));
+    result = WaitResult();
+    if (result) {
+        CHECK(result->kind == MONITOR_RESULT_BRIGHTNESS && result->success && result->current == 60);
+        CHECK(result->sourceUpdated);
+    }
+    free(result);
+    CHECK(ReadCounter(&writes) == 1 && ReadCounter(&sourceReads) == 5);
+    view.monitors[0].sourceKnown = TRUE;
+    view.monitors[0].currentInput = 0x12;
+    view.monitors[0].sourceCheckedTick = GetTickCount64();
+    MonitorWorker_Refresh(&view);
+    result = WaitResult();
+    if (result) {
+        CHECK(result->kind == MONITOR_RESULT_BRIGHTNESS && result->success);
+        CHECK(!result->sourceUpdated && result->currentInput == 0x12);
+    }
+    free(result);
+    CHECK(ReadCounter(&sourceReads) == 5);  /* The cached source was never re-read. */
+    FinishTest();
+}
+
+static void TestSourceReadCancellation(void)
+{
+    /* A source read can block while selection/settings or the target changes.
+       Both generation reset and superseding writes must cancel before native I/O. */
+    for (int reset = 0; reset < 2; reset++) {
+        MonitorList view = MakeView();
+        MonitorResult *stale, *latest;
+        MonitorTarget pending[MAX_MONITORS];
+        view.monitors[0].sourceFilter = TRUE;
+        view.monitors[0].expectedInput = 0x0F;
+        StartTest(&view, FALSE, FALSE);
+        ResetEvent(allowSource);
+        CHECK(MonitorWorker_Set(&view.monitors[0], 10));
+        CHECK(WaitForSingleObject(sourceEntered, TEST_TIMEOUT) == WAIT_OBJECT_0);
+        CHECK(ReadCounter(&writes) == 0);
+        ULONGLONG started = GetTickCount64();
+        if (reset) MonitorWorker_Reset();
+        CHECK(MonitorWorker_Set(&view.monitors[0], 80));
+        CHECK(GetTickCount64() - started < 250);  /* No request lock across source I/O. */
+        CHECK(MonitorWorker_PendingTargets(pending) == 1u && pending[0].percent == 80);
+        MonitorWorker_RefreshSources(&view, TRUE);
+        MonitorWorker_RefreshSources(&view, TRUE);  /* Replacement releases its old leases. */
+        CHECK(ReadCounter(&leases) == 3);
+        SetEvent(allowSource);
+        stale = WaitResult();
+        latest = WaitResult();
+        if (stale && latest) {
+            CHECK(stale->kind == MONITOR_RESULT_CANCELLED && !stale->success);
+            CHECK(stale->sourceUpdated);
+            CHECK(!MonitorWorker_Accept(stale));
+            CHECK(latest->kind == MONITOR_RESULT_BRIGHTNESS && latest->current == 80);
+            CHECK(latest->success && MonitorWorker_Accept(latest));
+            CHECK(ReadCounter(&writes) == 1 && writtenValues[0] == 80);
+        }
+        free(stale);
+        free(latest);
+        MonitorResult *source = WaitResult();
+        if (source) CHECK(source->kind == MONITOR_RESULT_SOURCE && MonitorWorker_Accept(source));
+        free(source);
+        FinishTest();
+    }
+}
+
+static void TestSourcePollingScope(void)
+{
+    MonitorList view = MakeView();
+    view.count = 4;
+    for (int i = 1; i < view.count; i++) {
+        view.monitors[i] = view.monitors[0];
+        view.monitors[i].hPhysical = (HANDLE)(UINT_PTR)(i + 1);
+        view.monitors[i].sourceFilter = TRUE;
+        view.monitors[i].expectedInput = 0x0F;
+    }
+    view.monitors[1].excludedFromControl = TRUE;
+    view.monitors[2].sourceKnown = TRUE;
+    view.monitors[2].currentInput = 0x12; /* A suspended selected display must still be polled. */
+    view.monitors[3].controllable = FALSE;
+    StartTest(&view, FALSE, FALSE);
+    MonitorWorker_RefreshSources(&view, FALSE);
+    MonitorResult *result = WaitResult();
+    if (result) {
+        CHECK(result->index == 2 && result->kind == MONITOR_RESULT_SOURCE);
+        CHECK(result->sourceUpdated && result->sourceKnown && result->currentInput == 0x0F);
+        CHECK(MonitorWorker_Accept(result));
+    }
+    free(result);
+    FinishTest();
+    CHECK(ReadCounter(&sourceReads) == 1 && ReadCounter(&refreshes) == 0);
+}
+
+static void TestIdleReleasePurposeAndTelemetry(void)
+{
+    MonitorList view = MakeView();
+    MonitorTarget pending[MAX_MONITORS];
+    MonitorResult *result;
+    view.monitors[0].sourceFilter = TRUE;
+    view.monitors[0].expectedInput = 0x0F;
+    view.monitors[0].idleEpoch = 17;
+    StartTest(&view, FALSE, FALSE);
+    CHECK(MonitorWorker_SetIdle(&view.monitors[0], 10));
+    result = WaitResult();
+    if (result) {
+        CHECK(result->purpose == MONITOR_WRITE_IDLE && result->idleEpoch == 17);
+        CHECK(result->brightnessWritten && result->success && result->current == 10);
+        CHECK(result->preIdleBrightnessValid && result->preIdleBrightness == 50);
+        CHECK(MonitorWorker_Accept(result) && MonitorWorker_AcceptState(result));
+    }
+    free(result);
+
+    ResetEvent(allowSource);
+    InterlockedExchange(&sourceInput, 0x12);
+    CHECK(MonitorWorker_ReleaseIdle(&view.monitors[0], 50, 0x12));
+    CHECK(WaitForSingleObject(sourceEntered, TEST_TIMEOUT) == WAIT_OBJECT_0);
+    CHECK(MonitorWorker_PendingTargets(pending) == 0); /* Release is never desired PC intent. */
+    SetEvent(allowSource);
+    result = WaitResult();
+    if (result) {
+        CHECK(result->purpose == MONITOR_WRITE_IDLE_RELEASE && result->idleEpoch == 17);
+        CHECK(result->brightnessWritten && result->success && result->current == 50);
+        CHECK(result->sourceUpdated && result->sourceKnown && result->currentInput == 0x12);
+    }
+    free(result);
+    CHECK(ReadCounter(&writes) == 2 && writtenValues[0] == 10 && writtenValues[1] == 50);
+    FinishTest();
+}
+
+static void TestIdleReleaseRechecksSourceAndCancelsPerMonitor(void)
+{
+    /* Release must never brighten an input that changed while its check was blocked.
+       Cancelling one display does not cancel work queued for another display. */
+    for (int scenario = 0; scenario < 4; scenario++) {
+        MonitorList view = MakeView();
+        MonitorResult *result;
+        view.count = 2;
+        view.monitors[1] = view.monitors[0];
+        view.monitors[1].hPhysical = (HANDLE)(UINT_PTR)2;
+        view.monitors[0].sourceFilter = TRUE;
+        view.monitors[0].expectedInput = 0x0F;
+        view.monitors[0].idleEpoch = 23;
+        StartTest(&view, FALSE, FALSE);
+        ResetEvent(allowSource);
+        InterlockedExchange(&sourceInput, 0x12);
+        CHECK(MonitorWorker_ReleaseIdle(&view.monitors[0], 80, 0x12));
+        CHECK(WaitForSingleObject(sourceEntered, TEST_TIMEOUT) == WAIT_OBJECT_0);
+        CHECK(ReadCounter(&writes) == 0);
+        CHECK(MonitorWorker_Set(&view.monitors[1], 40));
+        if (scenario == 0) InterlockedExchange(&sourceInput, 0x0F);
+        if (scenario == 1) InterlockedExchange(&sourceInput, 0x11);
+        if (scenario == 2) InterlockedExchange(&sourceSuccess, FALSE);
+        if (scenario == 3) MonitorWorker_Cancel(&view.monitors[0]);
+        SetEvent(allowSource);
+        result = WaitResult();
+        if (result) {
+            CHECK(result->purpose == MONITOR_WRITE_IDLE_RELEASE && result->idleEpoch == 23);
+            CHECK(result->kind == (scenario == 3 ? MONITOR_RESULT_CANCELLED : MONITOR_RESULT_SKIPPED));
+            CHECK(!result->brightnessWritten && !result->success && result->sourceUpdated);
+            CHECK(MonitorWorker_Accept(result) == (scenario != 3));
+            CHECK(MonitorWorker_AcceptState(result));
+        }
+        free(result);
+        result = WaitResult();
+        if (result) CHECK(result->index == 1 && result->success && result->current == 40 &&
+                          result->brightnessWritten && MonitorWorker_Accept(result));
+        free(result);
+        CHECK(ReadCounter(&writes) == 1 && writtenValues[0] == 40);
+        FinishTest();
+    }
+}
+
+static void TestAppliedIdleIdentitySurvivesReset(void)
+{
+    for (int release = 0; release < 2; release++) {
+        MonitorList view = MakeView();
+        MonitorResult *result;
+        view.monitors[0].sourceFilter = TRUE;
+        view.monitors[0].expectedInput = 0x0F;
+        view.monitors[0].idleEpoch = 31;
+        wcscpy(view.monitors[0].deviceInstance, L"DISPLAY\\MOCK\\ORIGINAL");
+        StartTest(&view, TRUE, FALSE);
+        if (release) {
+            InterlockedExchange(&sourceInput, 0x12);
+            CHECK(MonitorWorker_ReleaseIdle(&view.monitors[0], 80, 0x12));
+        } else {
+            CHECK(MonitorWorker_SetIdle(&view.monitors[0], 10));
+        }
+        /* The final guard has passed and native I/O cannot be retracted. Reset
+           may replace index zero before its success is delivered to the app. */
+        CHECK(WaitForSingleObject(writeEntered, TEST_TIMEOUT) == WAIT_OBJECT_0);
+        MonitorWorker_Reset();
+        wcscpy(view.monitors[0].deviceInstance, L"DISPLAY\\MOCK\\REPLACEMENT");
+        view.monitors[0].backend = BACKEND_WMI;
+        view.monitors[0].sourceFilter = FALSE;
+        view.monitors[0].expectedInput = 0x11;
+        view.monitors[0].idleEpoch = 32;
+        SetEvent(allowWrite);
+        result = WaitResult();
+        if (result) {
+            CHECK(result->success && result->brightnessWritten);
+            CHECK(result->purpose == (release ? MONITOR_WRITE_IDLE_RELEASE : MONITOR_WRITE_IDLE));
+            CHECK(result->idleEpoch == 31);
+            CHECK(wcscmp(result->deviceInstance, L"DISPLAY\\MOCK\\ORIGINAL") == 0);
+            CHECK(result->backend == BACKEND_DDC && result->sourceFilter);
+            CHECK(result->expectedInput == 0x0F);
+            CHECK(!MonitorWorker_Accept(result) && !MonitorWorker_AcceptState(result));
+        }
+        free(result);
+        CHECK(ReadCounter(&writes) == 1);
+        FinishTest();
+    }
+}
+
 int main(void)
 {
     TestSlowWriteCoalescing();
@@ -361,6 +679,12 @@ int main(void)
     TestWritePriorityRoundRobin();
     TestRefreshStaleSequence();
     TestHardwareFailures();
+    TestSourcePollingAndWriteOutcomes();
+    TestSourceReadCancellation();
+    TestSourcePollingScope();
+    TestIdleReleasePurposeAndTelemetry();
+    TestIdleReleaseRechecksSourceAndCancelsPerMonitor();
+    TestAppliedIdleIdentitySurvivesReset();
     if (ReadCounter(&failures)) {
         printf("%ld monitor worker checks failed\n", ReadCounter(&failures));
         return 1;

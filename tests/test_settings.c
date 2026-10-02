@@ -34,6 +34,11 @@ static struct {
         WCHAR value[MONITOR_SELECTION_KEY_LEN + 32];
     } selectionValues[MAX_MONITORS * 2 + 8];
     int selectionValueCount;
+    struct {
+        WCHAR field[24];
+        WCHAR value[MONITOR_SELECTION_KEY_LEN + 32];
+    } inputValues[MAX_MONITORS * 4 + 8];
+    int inputValueCount;
 } mock;
 
 static void ResetMocks(void)
@@ -93,6 +98,28 @@ static void PutSelectionIni(const WCHAR *field, const WCHAR *value)
                                    ARRAYSIZE(mock.selectionValues[index].value), value)));
 }
 
+static const WCHAR *InputIniValue(const WCHAR *field)
+{
+    for (int i = 0; i < mock.inputValueCount; i++)
+        if (_wcsicmp(mock.inputValues[i].field, field) == 0)
+            return mock.inputValues[i].value;
+    return NULL;
+}
+
+static void PutInputIni(const WCHAR *field, const WCHAR *value)
+{
+    int index = 0;
+    for (; index < mock.inputValueCount; index++)
+        if (_wcsicmp(mock.inputValues[index].field, field) == 0) break;
+    CHECK(index < (int)ARRAYSIZE(mock.inputValues));
+    if (index >= (int)ARRAYSIZE(mock.inputValues)) return;
+    if (index == mock.inputValueCount) mock.inputValueCount++;
+    CHECK(SUCCEEDED(StringCchCopyW(mock.inputValues[index].field,
+                                   ARRAYSIZE(mock.inputValues[index].field), field)));
+    CHECK(SUCCEEDED(StringCchCopyW(mock.inputValues[index].value,
+                                   ARRAYSIZE(mock.inputValues[index].value), value)));
+}
+
 static BOOL WINAPI MockWritePrivateProfileStringW(LPCWSTR section, LPCWSTR key,
                                                  LPCWSTR value, LPCWSTR path)
 {
@@ -101,6 +128,8 @@ static BOOL WINAPI MockWritePrivateProfileStringW(LPCWSTR section, LPCWSTR key,
         CHECK(SUCCEEDED(StringCchCopyW(mock.defaultDayValue, ARRAYSIZE(mock.defaultDayValue), value)));
     if (section && key && value && wcscmp(section, L"MonitorSelection") == 0)
         PutSelectionIni(key, value);
+    if (section && key && value && wcscmp(section, L"MonitorInputs") == 0)
+        PutInputIni(key, value);
     CHECK(SUCCEEDED(StringCchCopyW(mock.iniWritePath, ARRAYSIZE(mock.iniWritePath), path)));
     return TRUE;
 }
@@ -113,6 +142,10 @@ static BOOL WINAPI MockWritePrivateProfileSectionW(LPCWSTR section, LPCWSTR valu
         CHECK(values[0] == L'\0');
         mock.selectionValueCount = 0;
     }
+    if (wcscmp(section, L"MonitorInputs") == 0) {
+        CHECK(values[0] == L'\0');
+        mock.inputValueCount = 0;
+    }
     return TRUE;
 }
 
@@ -124,6 +157,7 @@ static DWORD WINAPI MockGetPrivateProfileStringW(LPCWSTR section, LPCWSTR key,
     if (!capacity) return 0;
     if (!key) { buffer[0] = L'\0'; return 0; }
     const WCHAR *value = wcscmp(section, L"MonitorSelection") == 0 ? SelectionIniValue(key) : NULL;
+    if (wcscmp(section, L"MonitorInputs") == 0) value = InputIniValue(key);
     if (!value) value = fallback;
     size_t length = wcslen(value);
     if (length >= capacity) length = capacity - 1;
@@ -137,6 +171,7 @@ static UINT WINAPI MockGetPrivateProfileIntW(LPCWSTR section, LPCWSTR key,
 {
     (void)path;
     const WCHAR *value = wcscmp(section, L"MonitorSelection") == 0 ? SelectionIniValue(key) : NULL;
+    if (wcscmp(section, L"MonitorInputs") == 0) value = InputIniValue(key);
     if (value) return (UINT)_wtoi(value);
     return (UINT)fallback;
 }
@@ -729,6 +764,204 @@ static void TestMonitorSelectionInvalidEntries(void)
     CHECK(wcscmp(loaded.monitorSelection.names[1], L"Offline saved panel") == 0);
 }
 
+static MonitorInputRule InputRule(const WCHAR *key, BOOL enabled, DWORD input)
+{
+    MonitorInputRule rule = { 0 };
+    StringCchCopyW(rule.key, ARRAYSIZE(rule.key), key);
+    StringCchCopyW(rule.name, ARRAYSIZE(rule.name), L"Saved display");
+    rule.enabled = enabled;
+    rule.input = input;
+    return rule;
+}
+
+static void TestMonitorInputsPersistence(void)
+{
+    Settings settings = { 0 }, loaded = { 0 };
+    ResetMocks();
+    loaded.monitorSelection.inputRuleCount = 1;
+    loaded.monitorSelection.inputRules[0] = InputRule(L"DDC:DISPLAY\\OLD", TRUE, 15);
+    Settings_Load(&loaded);
+    CHECK(loaded.monitorSelection.inputRuleCount == 0); /* Old INI is opt-in. */
+
+    settings.monitorSelection.selectedOnly = TRUE;
+    settings.monitorSelection.count = 0; /* Both monitors unchecked/offline. */
+    settings.monitorSelection.inputRuleCount = 2;
+    settings.monitorSelection.inputRules[0] = InputRule(L"DDC:DISPLAY\\PC", TRUE, 15);
+    settings.monitorSelection.inputRules[1] = InputRule(L"DDC:DISPLAY\\OFFLINE", FALSE, 18);
+    Settings_Save(&settings);
+    Settings_Load(&loaded);
+    CHECK(loaded.monitorSelection.selectedOnly && loaded.monitorSelection.count == 0);
+    CHECK(loaded.monitorSelection.inputRuleCount == 2);
+    CHECK(loaded.monitorSelection.inputRules[0].enabled);
+    CHECK(loaded.monitorSelection.inputRules[0].input == 15);
+    CHECK(!loaded.monitorSelection.inputRules[1].enabled);
+    CHECK(loaded.monitorSelection.inputRules[1].input == 18);
+    CHECK(wcscmp(loaded.monitorSelection.inputRules[1].key, L"DDC:DISPLAY\\OFFLINE") == 0);
+    CHECK(wcscmp(loaded.monitorSelection.inputRules[1].name, L"Saved display") == 0);
+    loaded.monitorSelection.selectedOnly = FALSE;
+    Settings_Save(&loaded);
+    Settings_Load(&settings);
+    CHECK(!settings.monitorSelection.selectedOnly && settings.monitorSelection.inputRuleCount == 2);
+    CHECK(settings.monitorSelection.inputRules[1].input == 18); /* All also retains rules. */
+    CHECK(mock.createCalls == 0 && mock.openCalls == 0 && mock.setCalls == 0);
+}
+
+static void TestApplyMonitorInputs(void)
+{
+    Settings settings = { 0 };
+    MonitorList view = { 0 };
+    view.count = 3;
+    view.monitors[0] = SelectionMonitor(BACKEND_DDC, L"DISPLAY\\OTHER");
+    view.monitors[1] = SelectionMonitor(BACKEND_DDC, L"DISPLAY\\PC");
+    view.monitors[2] = SelectionMonitor(BACKEND_WMI, L"DISPLAY\\PANEL_0");
+    settings.monitorSelection.inputRuleCount = 2;
+    settings.monitorSelection.inputRules[0] = InputRule(L"ddc:display\\pc", TRUE, 15);
+    settings.monitorSelection.inputRules[1] = InputRule(L"WMI:DISPLAY\\PANEL_0", TRUE, 18);
+    Settings_ApplyMonitorSelection(&settings, &view);
+    CHECK(!view.monitors[0].sourceFilter); /* Same name never transfers a rule. */
+    CHECK(view.monitors[1].sourceFilter && view.monitors[1].expectedInput == 15);
+    CHECK(!view.monitors[1].excludedFromControl);
+    CHECK(!view.monitors[2].sourceFilter && view.monitors[2].expectedInput == 0);
+    CHECK(Settings_MonitorInputRule(&settings.monitorSelection, &view.monitors[0]) == NULL);
+    CHECK(Settings_MonitorInputRule(&settings.monitorSelection, &view.monitors[1]) ==
+          &settings.monitorSelection.inputRules[0]);
+    CHECK(Settings_MonitorInputRule(&settings.monitorSelection, &view.monitors[2]) == NULL);
+
+    BrightMonitor swap = view.monitors[0];
+    view.monitors[0] = view.monitors[1];
+    view.monitors[1] = swap;
+    Settings_ApplyMonitorSelection(&settings, &view);
+    CHECK(view.monitors[0].sourceFilter && view.monitors[0].expectedInput == 15);
+    CHECK(!view.monitors[1].sourceFilter && view.monitors[1].expectedInput == 0);
+    settings.monitorSelection.selectedOnly = TRUE;
+    Settings_ApplyMonitorSelection(&settings, &view);
+    CHECK(view.monitors[0].excludedFromControl && view.monitors[0].sourceFilter);
+    CHECK(view.monitors[0].expectedInput == 15); /* Unchecking preserves source settings. */
+
+    settings.monitorSelection.selectedOnly = FALSE;
+    view.monitors[1] = view.monitors[0];
+    Settings_ApplyMonitorSelection(&settings, &view);
+    CHECK(view.monitors[0].sourceFilter && view.monitors[0].expectedInput == 0);
+    CHECK(view.monitors[1].sourceFilter && view.monitors[1].expectedInput == 0);
+    view.monitors[1].controllable = FALSE;
+    Settings_ApplyMonitorSelection(&settings, &view);
+    CHECK(view.monitors[0].sourceFilter && view.monitors[0].expectedInput == 15);
+
+    settings.monitorSelection.inputRules[0].input = 256;
+    Settings_ApplyMonitorSelection(&settings, &view);
+    CHECK(view.monitors[0].sourceFilter && view.monitors[0].expectedInput == 0);
+    settings.monitorSelection.inputRules[0].enabled = FALSE;
+    Settings_ApplyMonitorSelection(&settings, &view);
+    CHECK(!view.monitors[0].sourceFilter);
+    settings.monitorSelection.inputRules[1] = InputRule(L"DDC:DISPLAY\\PC", TRUE, 18);
+    Settings_ApplyMonitorSelection(&settings, &view);
+    CHECK(view.monitors[0].sourceFilter && view.monitors[0].expectedInput == 0);
+    settings.monitorSelection.inputRuleCount = 0;
+    Settings_ApplyMonitorSelection(&settings, &view);
+    CHECK(!view.monitors[0].sourceFilter && view.monitors[0].expectedInput == 0);
+}
+
+static void TestMonitorInputsInvalidValues(void)
+{
+    Settings settings = { 0 };
+    const WCHAR *invalidInputs[] = { L"", L"-1", L"256", L"4294967311", L"15x",
+                                    L"0x0F", L"00000000000000000000000000015" };
+    ResetMocks();
+    PutInputIni(L"Count", L"1");
+    PutInputIni(L"Key0", L"DDC:DISPLAY\\PC");
+    PutInputIni(L"Enabled0", L"1");
+    Settings_Load(&settings); /* Missing input remains enabled and unconfigured. */
+    CHECK(settings.monitorSelection.inputRuleCount == 1);
+    CHECK(settings.monitorSelection.inputRules[0].enabled);
+    CHECK(settings.monitorSelection.inputRules[0].input == 0);
+    for (int i = 0; i < (int)ARRAYSIZE(invalidInputs); i++) {
+        PutInputIni(L"Input0", invalidInputs[i]);
+        Settings_Load(&settings);
+        CHECK(settings.monitorSelection.inputRuleCount == 1);
+        CHECK(settings.monitorSelection.inputRules[0].enabled);
+        CHECK(settings.monitorSelection.inputRules[0].input == 0);
+    }
+    PutInputIni(L"Input0", L"255");
+    Settings_Load(&settings);
+    CHECK(settings.monitorSelection.inputRules[0].input == 255);
+    PutInputIni(L"Input0", L"0");
+    Settings_Load(&settings);
+    CHECK(settings.monitorSelection.inputRules[0].enabled &&
+          settings.monitorSelection.inputRules[0].input == 0);
+    PutInputIni(L"Input0", L"15");
+    PutInputIni(L"Enabled0", L"corrupt");
+    Settings_Load(&settings);
+    CHECK(settings.monitorSelection.inputRules[0].enabled &&
+          settings.monitorSelection.inputRules[0].input == 0);
+    PutInputIni(L"Enabled0", L"");
+    Settings_Load(&settings);
+    CHECK(settings.monitorSelection.inputRules[0].enabled &&
+          settings.monitorSelection.inputRules[0].input == 0);
+    PutInputIni(L"Enabled0", L"0");
+    Settings_Load(&settings);
+    CHECK(!settings.monitorSelection.inputRules[0].enabled &&
+          settings.monitorSelection.inputRules[0].input == 15);
+}
+
+static void TestMonitorInputsIdentityBounds(void)
+{
+    Settings settings = { 0 }, loaded = { 0 };
+    WCHAR field[16], value[MONITOR_SELECTION_KEY_LEN + 1];
+    ResetMocks();
+    PutInputIni(L"Count", L"1000");
+    for (int i = 0; i <= MAX_MONITORS; i++) {
+        StringCchPrintfW(field, ARRAYSIZE(field), L"Key%d", i);
+        StringCchPrintfW(value, ARRAYSIZE(value), L"DDC:DISPLAY\\MONITOR%d", i);
+        PutInputIni(field, value);
+    }
+    Settings_Load(&settings);
+    CHECK(settings.monitorSelection.inputRuleCount == MAX_MONITORS);
+    CHECK(settings.monitorSelection.inputRules[MAX_MONITORS - 1].enabled);
+    CHECK(settings.monitorSelection.inputRules[MAX_MONITORS - 1].input == 0);
+
+    ResetMocks();
+    PutInputIni(L"Count", L"1");
+    FillMockPath(value, MONITOR_SELECTION_KEY_LEN);
+    memcpy(value, L"DDC:", 4 * sizeof(WCHAR));
+    PutInputIni(L"Key0", value);
+    Settings_Load(&settings);
+    CHECK(settings.monitorSelection.inputRuleCount == 0);
+    value[MONITOR_SELECTION_KEY_LEN - 1] = L'\0';
+    PutInputIni(L"Key0", value);
+    Settings_Load(&settings);
+    CHECK(settings.monitorSelection.inputRuleCount == 1);
+    CHECK(wcslen(settings.monitorSelection.inputRules[0].key) == 259);
+    PutInputIni(L"Key0", L"DDC:DISPLAY\\BAD\nInput0=15");
+    Settings_Load(&settings);
+    CHECK(settings.monitorSelection.inputRuleCount == 0);
+    PutInputIni(L"Key0", L"WMI:DISPLAY\\PANEL_0");
+    Settings_Load(&settings);
+    CHECK(settings.monitorSelection.inputRuleCount == 0);
+
+    PutInputIni(L"Count", L"2");
+    PutInputIni(L"Key0", L"DDC:DISPLAY\\PC");
+    PutInputIni(L"Enabled0", L"1");
+    PutInputIni(L"Input0", L"15");
+    PutInputIni(L"Key1", L"ddc:display\\pc");
+    PutInputIni(L"Enabled1", L"0");
+    PutInputIni(L"Input1", L"18");
+    Settings_Load(&settings);
+    CHECK(settings.monitorSelection.inputRuleCount == 1);
+    CHECK(settings.monitorSelection.inputRules[0].enabled &&
+          settings.monitorSelection.inputRules[0].input == 0);
+    settings.monitorSelection.inputRuleCount = 2;
+    settings.monitorSelection.inputRules[0] = InputRule(L"DDC:DISPLAY\\PC", FALSE, 15);
+    settings.monitorSelection.inputRules[1] = InputRule(L"ddc:display\\pc", TRUE, 18);
+    Settings_Save(&settings);
+    Settings_Load(&loaded);
+    CHECK(loaded.monitorSelection.inputRuleCount == 1);
+    CHECK(loaded.monitorSelection.inputRules[0].enabled &&
+          loaded.monitorSelection.inputRules[0].input == 0);
+    PutInputIni(L"Count", L"-1");
+    Settings_Load(&settings);
+    CHECK(settings.monitorSelection.inputRuleCount == 0);
+}
+
 int main(void)
 {
     TestSettingsPaths();
@@ -743,10 +976,14 @@ int main(void)
     TestMonitorSelectionPersistence();
     TestMonitorSelectionIniBounds();
     TestMonitorSelectionInvalidEntries();
+    TestMonitorInputsPersistence();
+    TestApplyMonitorInputs();
+    TestMonitorInputsInvalidValues();
+    TestMonitorInputsIdentityBounds();
     if (failures) {
         printf("%d settings checks failed\n", failures);
         return 1;
     }
-    puts("ALL PASS: settings paths, autostart, daytime preset and monitor selection (mocked I/O)");
+    puts("ALL PASS: settings paths, autostart, daytime preset, monitor selection and input rules (mocked I/O)");
     return 0;
 }

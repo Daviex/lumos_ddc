@@ -23,6 +23,8 @@ typedef struct {
     BOOL selectedOnly;
     BOOL enabled[MAX_MONITORS + 1];
     BOOL excluded[MAX_MONITORS];
+    BOOL sourceBlocked[MAX_MONITORS];
+    BOOL sourceUnknown[MAX_MONITORS];
     int percent[MAX_MONITORS + 1];
     int delta[MAX_MONITORS];
     WCHAR name[MAX_MONITORS][128];
@@ -63,7 +65,8 @@ static BOOL CanAdjustSlider(const PopupData *pd, int row)
 {
     if (!pd || !pd->ml || row < 0 || row > pd->ml->count) return FALSE;
     return row == pd->ml->count ? Monitor_HasSelected(pd->ml)
-        : Monitor_CanControl(&pd->ml->monitors[row]);
+        : Monitor_CanControl(&pd->ml->monitors[row]) &&
+          Monitor_SourceAllowsControl(&pd->ml->monitors[row]);
 }
 
 /* Forward declarations for layout helpers */
@@ -117,7 +120,7 @@ static void GetDeltaButtonRects(int row, RECT *rcMinus, RECT *rcValue, RECT *rcP
 static int HitTestDelta(PopupData *pd, int x, int y, int *outRow)
 {
     for (int row = 0; row < pd->ml->count; row++) {
-        if (!Monitor_CanControl(&pd->ml->monitors[row])) continue;
+        if (!CanAdjustSlider(pd, row)) continue;
         RECT rcMinus, rcValue, rcPlus;
         GetDeltaButtonRects(row, &rcMinus, &rcValue, &rcPlus);
         if (y >= rcMinus.top && y <= rcMinus.bottom) {
@@ -310,6 +313,8 @@ static void GetPopupFrame(PopupData *pd, PopupFrame *frame)
             frame->percent[row] = Brightness_GetPercent(mon);
             frame->delta[row] = mon->delta;
             frame->excluded[row] = mon->excludedFromControl;
+            frame->sourceBlocked[row] = !Monitor_SourceAllowsControl(mon);
+            frame->sourceUnknown[row] = !mon->sourceKnown || !mon->expectedInput;
             wcsncpy(frame->name[row], mon->name, 127);
         }
         if (pd->activeSlider == row && pd->dragPercent >= 0)
@@ -359,13 +364,16 @@ static void RenderPopup(HWND hwnd, PopupData *pd)
         BOOL isMaster = (row == ml->count);
         BOOL enabled = frame.enabled[row];
         int pct = frame.percent[row];
-        WCHAR label[140];
+        WCHAR label[180];
         WCHAR pctStr[8];
 
         if (isMaster) {
             wcscpy(label, frame.selectedOnly ? L"Selected Monitors" : L"All Monitors");
         } else if (frame.excluded[row]) {
             wsprintfW(label, L"%s (excluded)", frame.name[row]);
+        } else if (frame.sourceBlocked[row]) {
+            wsprintfW(label, frame.sourceUnknown[row] ? L"%s (input unverified)" :
+                                                       L"%s (other input)", frame.name[row]);
         } else {
             wcscpy(label, frame.name[row]);
         }
@@ -740,6 +748,8 @@ void UI_RefreshPopup(HWND hwnd, MonitorList *ml)
 {
     if (!hwnd || !IsWindowVisible(hwnd)) return;
     g_popupData.ml = ml;
+    if (g_popupData.activeSlider >= 0 && !CanAdjustSlider(&g_popupData, g_popupData.activeSlider))
+        FinishSliderDrag(hwnd, &g_popupData, -1);
     if (g_popupData.activeSlider != ml->count)
         g_popupData.masterPercent = GetMasterPercent(ml);
     RenderPopup(hwnd, &g_popupData);

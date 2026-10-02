@@ -500,6 +500,33 @@ static void TestNoEligibleControls(void)
     puts("PASS no eligible monitor means no slider/delta requests or manual callbacks");
 }
 
+static void TestSourceFilteredControls(void)
+{
+    ResetPopup(1);
+    BrightMonitor *monitor = &testMonitors.monitors[0];
+    monitor->sourceFilter = TRUE;
+    monitor->expectedInput = 0x0f;
+    monitor->currentInput = 0x12;
+    monitor->sourceKnown = TRUE;
+    UI_RefreshPopup(testWindow, &testMonitors);
+    CHECK(!g_popupRender.frame.enabled[0] && g_popupRender.frame.sourceBlocked[0]);
+    CHECK(g_popupRender.frame.enabled[1]); /* Master can still update intent. */
+    ApplySliderValue(&g_popupData, 0, 80);
+    PopupWndProc(testWindow, WM_LBUTTONDOWN, MK_LBUTTON, DeltaPosition(0, TRUE));
+    CHECK(setCalls == 0 && manualCalls == 0 && deltaSaves == 0);
+    monitor->sourceKnown = FALSE;
+    UI_RefreshPopup(testWindow, &testMonitors);
+    CHECK(g_popupRender.frame.sourceUnknown[0] && !g_popupRender.frame.enabled[0]);
+    monitor->sourceKnown = TRUE;
+    monitor->currentInput = 0x0f;
+    UI_RefreshPopup(testWindow, &testMonitors);
+    CHECK(g_popupRender.frame.enabled[0] && !g_popupRender.frame.sourceBlocked[0]);
+    ApplySliderValue(&g_popupData, 0, 80);
+    CHECK(setCalls == 1 && manualCalls == 1);
+    ReleasePopupRenderCache();
+    puts("PASS source mismatch/unknown suspends row controls and recovers on match");
+}
+
 int main(void)
 {
     TestRenderCache();
@@ -507,6 +534,7 @@ int main(void)
     TestMasterTarget();
     TestMonitorSelection();
     TestNoEligibleControls();
+    TestSourceFilteredControls();
     ReleasePopupRenderCache();
     printf("UI tests: %s\n", failures ? "FAIL" : "ALL PASS");
     return failures ? 1 : 0;

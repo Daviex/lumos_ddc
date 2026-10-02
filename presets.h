@@ -12,10 +12,19 @@
 #define MONITOR_SELECTION_KEY_LEN 260 /* backend prefix + 255-character identity + NUL */
 
 typedef struct {
+    WCHAR key[MONITOR_SELECTION_KEY_LEN];
+    WCHAR name[128];
+    BOOL enabled;
+    DWORD input; /* DDC VCP 0x60 value, 1..255; 0 means not configured. */
+} MonitorInputRule;
+
+typedef struct {
     BOOL selectedOnly; /* FALSE: all monitors; TRUE: only the saved stable keys */
     int count;
     WCHAR keys[MAX_MONITORS][MONITOR_SELECTION_KEY_LEN];
     WCHAR names[MAX_MONITORS][128]; /* retained even while a selected monitor is offline */
+    int inputRuleCount;
+    MonitorInputRule inputRules[MAX_MONITORS]; /* independent of selection/offline state */
 } MonitorSelection;
 
 typedef struct {
@@ -63,6 +72,9 @@ int Settings_DayBrightness(const Settings *s);
 BOOL Settings_MonitorKey(const BrightMonitor *monitor, WCHAR key[MONITOR_SELECTION_KEY_LEN]);
 BOOL Settings_MonitorKeyValid(const WCHAR *key);
 BOOL Settings_MonitorSelected(const MonitorSelection *selection, const BrightMonitor *monitor);
+/* Find a source rule using the DDC stable identity. Names never participate. */
+const MonitorInputRule *Settings_MonitorInputRule(const MonitorSelection *selection,
+                                                const BrightMonitor *monitor);
 /* Apply global scope without discarding saved offline entries. All matching
    monitors are excluded when a selected identity is ambiguous in this list. */
 void Settings_ApplyMonitorSelection(const Settings *s, MonitorList *view);

@@ -17,6 +17,7 @@ static const HWND testParent = (HWND)(UINT_PTR)1;
 static const HWND testPicker = (HWND)(UINT_PTR)2;
 static const HWND testOwner = (HWND)(UINT_PTR)3;
 static LONG_PTR pickerUserData;
+static ULONGLONG sourceTestTick = 20000;
 #define CHECK(condition) do { \
     if (!(condition)) { \
         printf("FAIL line %d: %s\n", __LINE__, #condition); \
@@ -27,16 +28,19 @@ static LONG_PTR pickerUserData;
 static BOOL WINAPI MockDestroyWindow(HWND);
 static BOOL WINAPI MockPostMessageW(HWND, UINT, WPARAM, LPARAM);
 static LONG_PTR WINAPI MockGetWindowLongPtrW(HWND, int);
+static ULONGLONG WINAPI MockGetTickCount64(void) { return sourceTestTick; }
 
 #undef GetWindowLongPtrW
 #define GetWindowLongPtrW MockGetWindowLongPtrW
 #define DestroyWindow MockDestroyWindow
 #define PostMessageW MockPostMessageW
+#define GetTickCount64 MockGetTickCount64
 #include "../ui_monitor_selection.c"
 #include "../ui.c"
 #undef GetWindowLongPtrW
 #undef DestroyWindow
 #undef PostMessageW
+#undef GetTickCount64
 
 static BOOL WINAPI MockDestroyWindow(HWND window)
 {
@@ -214,7 +218,7 @@ static void TestLimitsAndUnusableIdentities(void)
     }
     MonitorSelection original = selection;
     BuildSelectionRows(&picker, &selection, &view);
-    CHECK(picker.count == PICKER_MAX_ROWS && SelectionCheckedCount(&picker) == MAX_MONITORS);
+    CHECK(picker.count == MAX_MONITORS * 2 && SelectionCheckedCount(&picker) == MAX_MONITORS);
     CHECK(TryCheckRow(&picker, 0) == TRUE); /* UI rejects a seventeenth checked key. */
     picker.rows[0].checked = TRUE;
     CHECK(!CommitMonitorSelection(&picker));
@@ -265,16 +269,117 @@ static void TestParentRowsAndSaveValidation(void)
     CHECK(SetCanSave(&parent));
 }
 
+static void TestSourceRulesAndLiveTelemetry(void)
+{
+    MonitorSelection selection = { 0 };
+    MonitorList view = { 0 };
+    view.count = 2;
+    view.monitors[0] = MakeMonitor(1);
+    view.monitors[0].sourceKnown = TRUE;
+    view.monitors[0].currentInput = 0x0F;
+    view.monitors[0].sourceCheckedTick = sourceTestTick;
+    view.monitors[1] = MakeMonitor(2);
+    SelectionEdit picker = { 0 };
+    picker.destination = &selection;
+    BuildSelectionRows(&picker, &selection, &view);
+    CHECK(!picker.selectedOnly);
+    CHECK(TryCheckRow(&picker, 1)); /* All mode keeps the list usable but locks scope checkboxes. */
+    CHECK(CanEditSource(&picker, &picker.rows[0]));
+    CHECK(!picker.rows[0].expectedInput && !picker.rows[0].sourceFilter); /* No auto-association. */
+    CHECK(AssociateCurrentInput(&picker, &picker.rows[0]));
+    CHECK(picker.rows[0].expectedInput == 0x0F);
+    CHECK(!AssociateCurrentInput(&picker, &picker.rows[1]));
+    CHECK(!picker.rows[1].expectedInput && !picker.rows[1].rulePresent);
+    picker.rows[0].sourceFilter = TRUE;
+    CHECK(wcscmp(SelectionRowStatus(&picker, &picker.rows[0]), L"In control") == 0);
+
+    /* Hardware results can arrive while editing; expected input and selection
+       must remain local even when live settings disagree or monitor order changes. */
+    picker.selectedOnly = TRUE;
+    picker.rows[0].checked = FALSE;
+    BrightMonitor swapped = view.monitors[0];
+    view.monitors[0] = view.monitors[1];
+    view.monitors[1] = swapped;
+    view.monitors[1].currentInput = 0x12;
+    view.monitors[1].sourceFilter = FALSE;
+    view.monitors[1].expectedInput = 0x11;
+    wcscpy(view.monitors[1].name, L"Renamed display");
+    g_pickerWindow = testPicker;
+    pickerUserData = (LONG_PTR)&picker;
+    CHECK(UI_MonitorSelectionIsOpen());
+    UI_MonitorSelectionRefresh(&view);
+    g_pickerWindow = NULL;
+    CHECK(!UI_MonitorSelectionIsOpen());
+    CHECK(!picker.rows[0].checked && picker.rows[1].checked);
+    CHECK(picker.rows[0].sourceFilter && picker.rows[0].expectedInput == 0x0F);
+    CHECK(picker.rows[0].currentInput == 0x12 && picker.rows[0].sourceKnown);
+    CHECK(wcscmp(picker.rows[0].name, L"Renamed display") == 0);
+    CHECK(wcscmp(SelectionRowStatus(&picker, &picker.rows[0]), L"Not selected") == 0);
+    CHECK(selection.count == 0 && selection.inputRuleCount == 0); /* Not committed yet. */
+    CHECK(CommitMonitorSelection(&picker));
+    CHECK(selection.count == 1 && selection.inputRuleCount == 1);
+    CHECK(_wcsicmp(selection.inputRules[0].key, L"DDC:DISPLAY\\DEVICE1") == 0);
+    CHECK(selection.inputRules[0].input == 0x0F && selection.inputRules[0].enabled);
+
+    /* A rule survives an unchecked monitor going offline, then a disabled filter
+       retains its associated port for the next time the user enables it. */
+    view.count = 1;
+    BuildSelectionRows(&picker, &selection, &view);
+    CHECK(picker.count == 2 && picker.rows[0].checked && !picker.rows[1].checked);
+    CHECK(!picker.rows[1].connected && picker.rows[1].sourceFilter);
+    CHECK(picker.rows[1].expectedInput == 0x0F);
+    CHECK(!AssociateCurrentInput(&picker, &picker.rows[1]));
+    picker.rows[1].sourceFilter = FALSE;
+    CHECK(CommitMonitorSelection(&picker));
+    CHECK(selection.inputRuleCount == 1 && !selection.inputRules[0].enabled);
+    CHECK(selection.inputRules[0].input == 0x0F);
+    picker.rows[1].expectedInput = 0;
+    CHECK(CommitMonitorSelection(&picker));
+    CHECK(selection.inputRuleCount == 0); /* Clear the port and disable to free a saved rule slot. */
+}
+
+static void TestSourceStatusAndBuiltIn(void)
+{
+    SelectionEdit picker = { 0 };
+    SelectionRow row = { 0 };
+    row.connected = row.canAdd = row.sourceFilter = TRUE;
+    wcscpy(row.key, L"DDC:DISPLAY\\DEVICE1");
+    CHECK(wcscmp(SelectionRowStatus(&picker, &row), L"Paused: input not set") == 0);
+    row.expectedInput = 0x11;
+    CHECK(wcscmp(SelectionRowStatus(&picker, &row), L"Paused: input unavailable") == 0);
+    row.sourceKnown = TRUE;
+    row.currentInput = 0x12;
+    row.sourceCheckedTick = sourceTestTick;
+    CHECK(wcscmp(SelectionRowStatus(&picker, &row), L"Paused: other input") == 0);
+    row.currentInput = row.expectedInput;
+    CHECK(wcscmp(SelectionRowStatus(&picker, &row), L"In control") == 0);
+    sourceTestTick += 10001;
+    CHECK(wcscmp(SelectionRowStatus(&picker, &row), L"Paused: input unavailable") == 0);
+    CHECK(!AssociateCurrentInput(&picker, &row));
+    row.sourceCheckedTick = sourceTestTick;
+    row.currentInput = 0x100;
+    CHECK(!AssociateCurrentInput(&picker, &row));
+    row.currentInput = 0x12;
+    row.builtIn = TRUE;
+    CHECK(wcscmp(SelectionRowStatus(&picker, &row), L"Built-in") == 0);
+    CHECK(!CanEditSource(&picker, &row) && !AssociateCurrentInput(&picker, &row));
+    WCHAR text[40];
+    FormatInput(0x99, text, ARRAYSIZE(text));
+    CHECK(wcscmp(text, L"Input 0x99") == 0);
+}
+
 int main(void)
 {
     TestAllAndCustomWorkingCopies();
     TestOfflineRemovalAndReordering();
     TestLimitsAndUnusableIdentities();
     TestParentRowsAndSaveValidation();
+    TestSourceRulesAndLiveTelemetry();
+    TestSourceStatusAndBuiltIn();
     if (failures) {
         printf("monitor selection UI: %d failure(s)\n", failures);
         return 1;
     }
-    puts("ALL PASS: monitor picker working copies, Apply/Cancel/Save, identities and limits (mocked UI)");
+    puts("ALL PASS: monitor picker working copies, source rules, live telemetry, Apply/Cancel/Save and identities (mocked UI)");
     return 0;
 }

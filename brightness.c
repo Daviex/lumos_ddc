@@ -6,6 +6,16 @@ BOOL Monitor_CanControl(const BrightMonitor *monitor)
     return monitor && monitor->controllable && !monitor->excludedFromControl;
 }
 
+/* Source eligibility is transient. Keep it separate from the saved scope:
+   rescan recovery and master intent must still include suspended monitors. */
+BOOL Monitor_SourceAllowsControl(const BrightMonitor *monitor)
+{
+    if (!monitor) return FALSE;
+    if (!monitor->sourceFilter || monitor->backend == BACKEND_WMI) return TRUE;
+    return monitor->expectedInput > 0 && monitor->expectedInput <= 255 &&
+           monitor->sourceKnown && monitor->currentInput == monitor->expectedInput;
+}
+
 BOOL Monitor_HasSelected(const MonitorList *view)
 {
     if (view) {

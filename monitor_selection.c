@@ -53,6 +53,19 @@ BOOL Settings_MonitorSelected(const MonitorSelection *selection, const BrightMon
     return FALSE;
 }
 
+const MonitorInputRule *Settings_MonitorInputRule(const MonitorSelection *selection,
+                                                const BrightMonitor *monitor)
+{
+    WCHAR key[MONITOR_SELECTION_KEY_LEN];
+    if (!selection || !monitor || monitor->backend != BACKEND_DDC ||
+        !Settings_MonitorKey(monitor, key)) return NULL;
+    for (int i = 0; i < selection->inputRuleCount && i < MAX_MONITORS; i++)
+        if (Settings_MonitorKeyValid(selection->inputRules[i].key) &&
+            _wcsicmp(selection->inputRules[i].key, key) == 0)
+            return &selection->inputRules[i];
+    return NULL;
+}
+
 void Settings_ApplyMonitorSelection(const Settings *s, MonitorList *view)
 {
     const MonitorSelection *selection = &s->monitorSelection;
@@ -60,19 +73,39 @@ void Settings_ApplyMonitorSelection(const Settings *s, MonitorList *view)
     for (int i = 0; i < view->count; i++) {
         BrightMonitor *monitor = &view->monitors[i];
         monitor->excludedFromControl = FALSE;
-        if (!monitor->controllable || !selection->selectedOnly) continue;
-        monitor->excludedFromControl = !Settings_MonitorSelected(selection, monitor);
-        if (!monitor->excludedFromControl) {
-            WCHAR key[MONITOR_SELECTION_KEY_LEN];
+        monitor->sourceFilter = FALSE;
+        monitor->expectedInput = 0;
+        WCHAR key[MONITOR_SELECTION_KEY_LEN];
+        BOOL hasKey = Settings_MonitorKey(monitor, key);
+        int ruleMatches = 0;
+        if (hasKey && monitor->backend == BACKEND_DDC) {
+            for (int j = 0; j < selection->inputRuleCount && j < MAX_MONITORS; j++) {
+                const MonitorInputRule *rule = &selection->inputRules[j];
+                if (!Settings_MonitorKeyValid(rule->key) || _wcsicmp(rule->key, key) != 0)
+                    continue;
+                ruleMatches++;
+                if (rule->enabled) monitor->sourceFilter = TRUE;
+                monitor->expectedInput = rule->input <= 255 ? rule->input : 0;
+            }
+            /* Duplicate records can never turn an enabled filter into permission. */
+            if (ruleMatches > 1) monitor->expectedInput = 0;
+        }
+        if (!monitor->controllable) continue;
+        if (selection->selectedOnly)
+            monitor->excludedFromControl = !Settings_MonitorSelected(selection, monitor);
+        if (hasKey && (monitor->sourceFilter ||
+                       (selection->selectedOnly && !monitor->excludedFromControl))) {
             int matches = 0;
-            Settings_MonitorKey(monitor, key);
             for (int j = 0; j < view->count; j++) {
                 WCHAR candidateKey[MONITOR_SELECTION_KEY_LEN];
                 if (view->monitors[j].controllable &&
                     Settings_MonitorKey(&view->monitors[j], candidateKey) &&
                     _wcsicmp(key, candidateKey) == 0) matches++;
             }
-            monitor->excludedFromControl = matches != 1;
+            if (matches != 1) {
+                if (selection->selectedOnly) monitor->excludedFromControl = TRUE;
+                if (monitor->sourceFilter) monitor->expectedInput = 0;
+            }
         }
     }
 }

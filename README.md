@@ -73,6 +73,7 @@ Windows can dim a laptop panel, but it will not touch the brightness of external
 - **Idle auto-dim** - Optional. After a configurable idle period (default 5 minutes) the brightness drops to a configurable low level (default 5%), and it returns to the previous level as soon as you touch the keyboard or the mouse. Fullscreen video, presentation mode and live calls are skipped, so a movie you are watching or a Teams call you are sitting through without touching anything is not dimmed. Calls are detected by the microphone or the camera being in use, not by the name of the application, so any conferencing tool counts.
 - **Presets** - Night, Day, and Presentation, with editable brightness values.
 - **Choose monitors** - Control all displays (the default) or only the ones you select. The same selection applies to presets, sliders, hotkeys, idle dimming, the schedule and brightness restoration at sign-in or wake.
+- **Input source filter** - Optionally control a display only while it shows this PC's configured input. The chooser shows the saved PC input, current input and whether brightness control is paused.
 - **Day brightness at Windows sign-in** - With Start with Windows enabled, restore the configured Day/Giorno preset instead of inheriting a dim level left by the previous session. An active schedule resumes at its next anchor.
 - **Settings window** - A dark themed screen for the brightness step, the idle dim level and timeout, the schedule and autostart switches, and the preset values. Right-click the tray icon and pick Settings.
 - **On-screen display** - A clean overlay with the current percentage and a progress bar.
@@ -91,7 +92,7 @@ Internal laptop panels do not answer DDC/CI (that is an I2C protocol meant for e
 
 During enumeration each monitor is probed for DDC/CI first; if that fails, Lumos matches the display to its WMI panel by a normalized PnP instance key (never by hardcoded vendor or product IDs) and drives it over WMI instead. Everything above the backend (sliders, hotkeys, schedule, presets) is backend-agnostic.
 
-Brightness writes and refreshes run on a background worker, so dragging a slider does not wait for DDC/CI or WMI calls. Each monitor has one pending target: newer slider values replace older pending values while the display is busy, and releasing the slider submits its final value. The popup displays the requested level immediately; the display's actual response time still depends on its hardware and driver.
+Brightness writes and refreshes run on a background worker, so dragging a slider does not wait for DDC/CI or WMI calls. Each monitor has one pending target: newer slider values replace older pending values while the display is busy, and releasing the slider submits its final value. With the input filter enabled, brightness is confirmed only after the source check and hardware write succeed; other monitors show the requested level immediately. The display's actual response time still depends on its hardware and driver.
 
 The popup keeps its GDI bitmap, fonts, brushes and rounded-corner mask between frames, and skips unchanged frames. Rendering remains native GDI.
 
@@ -216,6 +217,36 @@ selections are saved by monitor identity, survive restarts and reconnection, and
 retain disconnected displays in the chooser. If none of the chosen displays is
 connected, Lumos leaves the other screens alone. New displays are included only
 when All Monitors is selected or you explicitly add them to the custom selection.
+
+In **Choose Monitors**, select a row and enable **Only when showing this PC**.
+Choose **This PC input** (for example DisplayPort 1 or HDMI 2), or click
+**Use current input for this PC** while that monitor is showing this computer.
+These names identify inputs on the monitor, not numbered outputs on the graphics
+card. Windows cannot reliably infer the monitor's HDMI 1/HDMI 2 numbering, so
+Lumos never learns or changes this association automatically. Apply, then Save
+the Settings window. The rule also works in All Monitors mode and remains saved
+when a display is unchecked or disconnected. Existing configurations keep this
+optional filter off until it is enabled explicitly.
+
+The current input is read with DDC/CI VCP 0x60 in the background every 2.5 seconds
+while a selected monitor has a filter or the chooser is open. Filtered writes
+always check the source again immediately before setting brightness. Another
+input, a missing association or an unreadable source pauses ordinary brightness control;
+it does not deselect the monitor or trigger brightness recovery retries. When
+the PC input returns, Lumos applies the current idle/schedule policy or the latest
+requested brightness, without replaying older commands. Internal WMI panels do
+not need an input filter. Read and write are separate monitor commands; input
+switching between those commands cannot be made atomic.
+
+Idle dimming has one deliberate exception to this filter. Before dimming, Lumos
+reads and saves each monitor's actual brightness. If a dimmed monitor switches
+to another known input, Lumos restores that monitor's exact pre-idle value once,
+without waking the PC or changing the other displays. Returning to the configured
+PC input while the PC is still idle dims that monitor again. Repeated switches
+retain the original pre-idle value until that idle period ends. Each restoration
+checks the alternate input again before writing; unknown inputs cause no write,
+and a failed restoration is retried on a later source poll. This requires the
+monitor to keep accepting DDC/CI commands from this PC while showing another input.
 
 The idle auto-dim keys work together. `IdleDimEnabled` turns the feature on and off, and the tray context menu toggles the same key. `IdleDimPercent` is the level held while the session is idle (0 to 100). `IdleDimMinutes` is how long there must be no keyboard or mouse input before the dim happens (1 to 1440 minutes).
 

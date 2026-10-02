@@ -7,6 +7,9 @@ API errors, idempotent disabling and the configured Day/Giorno preset lookup.
 Global monitor selections are also checked for INI round trips, legacy defaults,
 bounded identities, duplicates, disconnected displays and empty selections.
 Running it does not launch Lumos or change the registry or configuration files.
+Input-source rules are covered independently of selection: saved port/filter
+round trips, unchecked/offline retention, identity reorder, duplicate/corrupt
+rules and fail-closed handling of unassigned inputs.
 
 From the repository root with a Windows Clang/MinGW toolchain in `PATH`:
 Create the `build` directory first if it does not exist.
@@ -31,6 +34,14 @@ handle leases are released after replacement, reset and shutdown. Pending target
 snapshots preserve the latest write intent without including refresh reads.
 Refresh and hardware failure paths are also covered. It never accesses physical
 monitors.
+Source-only polling includes suspended displays. Tests block a source read while
+changing a target or resetting the worker, ensuring no obsolete native write
+follows it. Source telemetry, intentional skips and hardware failures have
+distinct results, and brightness refreshes cannot overwrite source telemetry.
+Typed idle writes and alternate-input restores retain their purpose, idle cycle
+and stable identity across queue replacement and reset. Only actual hardware
+writes report applied ownership; refresh reads never do. Idle restores are not
+saved as pending user targets.
 
 ```powershell
 clang -std=c11 -Wall -Wextra -Werror -DUNICODE -D_UNICODE tests/test_monitor_worker.c -o build/test_monitor_worker.exe
@@ -49,6 +60,10 @@ nonblocking cleanup during enumeration, rejected invalid readings and scaling
 across the full 32-bit brightness range.
 Excluded displays are checked at the preview, DDC/WMI write, group and active
 monitor boundaries to ensure their brightness remains unchanged.
+Idle dimming captures a fresh, validated native brightness only on a successful
+write. Restoration uses that exact raw value (including 128 on a 0-255 range),
+and is skipped when its final source read reports the PC input, a different
+alternate input, or an unknown input. Cancellation prevents pending native writes.
 
 ```powershell
 clang -std=c11 -Wall -Wextra -Werror -DUNICODE -D_UNICODE tests/test_monitor.c brightness.c -ldxva2 -luser32 -lgdi32 -ladvapi32 -o build/test_monitor.exe
@@ -66,6 +81,8 @@ messages. It verifies GDI resource reuse and cleanup, pixel stability, resize
 and allocation errors, the final drag value, capture loss, cancellation and
 master target bookkeeping. Excluded sliders and delta controls cannot write, and the master operates only
 on the selected displays, including the case where none is available.
+Source-filtered rows reject slider/delta input on another or unknown source and
+become available again when the PC input is reported.
 Window and monitor operations are mocked; no window is shown and no monitor or
 registry setting is changed.
 
@@ -99,6 +116,14 @@ discovery, exhausted retries and failed writes. The application entry point is n
 Day lookup and registry migration are covered separately by `test_settings.c`.
 The real selection helpers also verify that login, presets, idle, schedule,
 hotkeys and reordered rescan results leave a second, excluded monitor unchanged.
+Source suspension and return also cover latest-target resume, idle/schedule
+precedence, reconnect, source-rule edits, filter removal and polling without a
+Windows topology event. Skips and unknown reads must never trigger rescans.
+Idle handoff tests keep the PC idle while only a second monitor changes input:
+it restores its original raw brightness, dims again on return, and preserves the
+same baseline across repeated switches while leaving the first monitor dimmed.
+They also cover failed releases, wake/re-idle with queued work, rule edits, and
+applied results superseded by newer requests or a uniquely matched rescan.
 
 ```powershell
 clang -O2 -std=c11 -Wall -Wextra -Werror -DUNICODE -D_UNICODE -ffunction-sections -fdata-sections tests/test_startup.c brightness.c schedule.c monitor_selection.c '-Wl,--gc-sections' -lshell32 -o build/test_startup.exe
