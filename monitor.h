@@ -23,6 +23,7 @@ typedef struct {
     DWORD    brightnessMax;
     BOOL     controllable; /* TRUE if brightness is settable via any backend */
     BOOL     excludedFromControl; /* User scope; zero keeps the default All Monitors. */
+    BOOL     idleBlack; /* Cover this display with opaque black instead of idle dimming. */
     BOOL     sourceFilter; /* Apply changes only while expectedInput is selected. */
     DWORD    expectedInput; /* VCP 0x60 input connected to this PC; zero is unassigned. */
     DWORD    currentInput; /* Last successfully read VCP 0x60 input. */
@@ -109,8 +110,11 @@ MonitorWriteOutcome Monitor_SetBrightnessGuardedSync(BrightMonitor *mon, DWORD p
 MonitorWriteOutcome Monitor_SetBrightnessForPurposeGuardedSync(
     BrightMonitor *mon, DWORD value, MonitorWritePurpose purpose, DWORD otherInput,
     MonitorWriteGuard guard, void *context, BOOL *sourceUpdated);
-/* Reads only input source; failed/unsupported reads clear sourceKnown. */
+/* Reads only input source, retrying one transient failure on the worker.
+   Failed/unsupported reads clear sourceKnown. */
 BOOL Monitor_ReadSourceSync(BrightMonitor *mon);
+/* Validated brightness read; a success also recovers brightness capability. */
+BOOL Monitor_ReadBrightnessSync(BrightMonitor *mon);
 /* Bit i is set only when monitor i was successfully read and validated. */
 DWORD Monitor_RefreshBrightnessSync(MonitorList *ml);
 void Monitor_PreviewBrightness(BrightMonitor *mon, DWORD percent);

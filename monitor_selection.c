@@ -3,6 +3,13 @@
 
 /* These helpers only inspect snapshots and saved selection data. They never
    access the INI, registry, monitor hardware or hardware worker. */
+int Settings_ClampSourcePollSeconds(int seconds)
+{
+    if (seconds < MIN_SOURCE_POLL_SECONDS) return MIN_SOURCE_POLL_SECONDS;
+    if (seconds > MAX_SOURCE_POLL_SECONDS) return MAX_SOURCE_POLL_SECONDS;
+    return seconds;
+}
+
 BOOL Settings_MonitorKeyValid(const WCHAR *key)
 {
     size_t length;
@@ -73,10 +80,17 @@ void Settings_ApplyMonitorSelection(const Settings *s, MonitorList *view)
     for (int i = 0; i < view->count; i++) {
         BrightMonitor *monitor = &view->monitors[i];
         monitor->excludedFromControl = FALSE;
+        monitor->idleBlack = FALSE;
         monitor->sourceFilter = FALSE;
         monitor->expectedInput = 0;
         WCHAR key[MONITOR_SELECTION_KEY_LEN];
         BOOL hasKey = Settings_MonitorKey(monitor, key);
+        if (hasKey) {
+            for (int j = 0; j < selection->idleBlackCount && j < MAX_MONITORS; j++)
+                if (Settings_MonitorKeyValid(selection->idleBlackKeys[j]) &&
+                    _wcsicmp(selection->idleBlackKeys[j], key) == 0)
+                    monitor->idleBlack = TRUE;
+        }
         int ruleMatches = 0;
         if (hasKey && monitor->backend == BACKEND_DDC) {
             for (int j = 0; j < selection->inputRuleCount && j < MAX_MONITORS; j++) {
@@ -90,21 +104,20 @@ void Settings_ApplyMonitorSelection(const Settings *s, MonitorList *view)
             /* Duplicate records can never turn an enabled filter into permission. */
             if (ruleMatches > 1) monitor->expectedInput = 0;
         }
-        if (!monitor->controllable) continue;
         if (selection->selectedOnly)
             monitor->excludedFromControl = !Settings_MonitorSelected(selection, monitor);
-        if (hasKey && (monitor->sourceFilter ||
+        if (hasKey && (monitor->sourceFilter || monitor->idleBlack ||
                        (selection->selectedOnly && !monitor->excludedFromControl))) {
             int matches = 0;
             for (int j = 0; j < view->count; j++) {
                 WCHAR candidateKey[MONITOR_SELECTION_KEY_LEN];
-                if (view->monitors[j].controllable &&
-                    Settings_MonitorKey(&view->monitors[j], candidateKey) &&
+                if (Settings_MonitorKey(&view->monitors[j], candidateKey) &&
                     _wcsicmp(key, candidateKey) == 0) matches++;
             }
             if (matches != 1) {
                 if (selection->selectedOnly) monitor->excludedFromControl = TRUE;
                 if (monitor->sourceFilter) monitor->expectedInput = 0;
+                monitor->idleBlack = FALSE;
             }
         }
     }

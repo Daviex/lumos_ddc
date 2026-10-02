@@ -8,6 +8,9 @@
 #define MAX_PRESETS 10
 #define MAX_PRESET_NAME 64
 #define DEFAULT_DAY_BRIGHTNESS 80
+#define MIN_SOURCE_POLL_SECONDS 1
+#define MAX_SOURCE_POLL_SECONDS 60
+#define DEFAULT_SOURCE_POLL_SECONDS 3
 #define LUMOS_STARTUP_ARGUMENT L"--startup"
 #define MONITOR_SELECTION_KEY_LEN 260 /* backend prefix + 255-character identity + NUL */
 
@@ -25,6 +28,9 @@ typedef struct {
     WCHAR names[MAX_MONITORS][128]; /* retained even while a selected monitor is offline */
     int inputRuleCount;
     MonitorInputRule inputRules[MAX_MONITORS]; /* independent of selection/offline state */
+    int idleBlackCount;
+    WCHAR idleBlackKeys[MAX_MONITORS][MONITOR_SELECTION_KEY_LEN];
+    WCHAR idleBlackNames[MAX_MONITORS][128];
 } MonitorSelection;
 
 typedef struct {
@@ -47,6 +53,7 @@ typedef struct {
     BOOL          idleDimEnabled;
     int           idleDimPercent;   /* level held while the session is idle (0-100) */
     int           idleDimMinutes;   /* idle time before dimming */
+    int           sourcePollSeconds; /* periodic input-source checks, 1-60 seconds */
     MonitorSelection monitorSelection;
 } Settings;
 
@@ -66,6 +73,8 @@ void Settings_CreateDefaults(Settings *s);
    Giorno takes precedence over Day. The first match for each name wins, with
    DEFAULT_DAY_BRIGHTNESS used when neither name is present. */
 int Settings_DayBrightness(const Settings *s);
+/* Shared bounds for persisted settings, the slider and the runtime timer. */
+int Settings_ClampSourcePollSeconds(int seconds);
 
 /* Stable backend-prefixed keys, never a display name, index or physical handle.
    Missing identity cannot match a custom selection. */

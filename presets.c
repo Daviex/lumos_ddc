@@ -8,6 +8,7 @@
 #define AUTOSTART_COMMAND_CAPACITY (MAX_PATH + 2 + ARRAYSIZE(L" " LUMOS_STARTUP_ARGUMENT) - 1)
 #define MONITOR_SELECTION_SECTION L"MonitorSelection"
 #define MONITOR_INPUT_SECTION L"MonitorInputs"
+#define MONITOR_BLACK_SECTION L"MonitorIdleBlack"
 
 static void EnsureDirectory(const WCHAR *path)
 {
@@ -22,6 +23,7 @@ void Settings_Init(Settings *s)
     memset(s, 0, sizeof(*s));
     s->step = 5;   /* brightness step for hotkeys and mouse wheel */
     s->autostart = FALSE;
+    s->sourcePollSeconds = DEFAULT_SOURCE_POLL_SECONDS;
 
     if (SUCCEEDED(SHGetFolderPathW(NULL, CSIDL_APPDATA, NULL, 0, appData)) &&
         SUCCEEDED(StringCchPrintfW(settingsDir, ARRAYSIZE(settingsDir),
@@ -45,6 +47,7 @@ void Settings_Init(Settings *s)
 void Settings_CreateDefaults(Settings *s)
 {
     WCHAR dayBrightness[4];
+    WCHAR sourcePollSeconds[4];
     StringCchPrintfW(dayBrightness, ARRAYSIZE(dayBrightness), L"%d", DEFAULT_DAY_BRIGHTNESS);
     WritePrivateProfileStringW(L"Presets", L"Night", L"30", s->iniPath);
     WritePrivateProfileStringW(L"Presets", L"Day", dayBrightness, s->iniPath);
@@ -54,9 +57,12 @@ void Settings_CreateDefaults(Settings *s)
     WritePrivateProfileStringW(L"Settings", L"IdleDimEnabled", L"0", s->iniPath);
     WritePrivateProfileStringW(L"Settings", L"IdleDimPercent", L"5", s->iniPath);
     WritePrivateProfileStringW(L"Settings", L"IdleDimMinutes", L"5", s->iniPath);
+    StringCchPrintfW(sourcePollSeconds, ARRAYSIZE(sourcePollSeconds), L"%d", DEFAULT_SOURCE_POLL_SECONDS);
+    WritePrivateProfileStringW(L"Settings", L"SourcePollSeconds", sourcePollSeconds, s->iniPath);
     WritePrivateProfileStringW(MONITOR_SELECTION_SECTION, L"Mode", L"All", s->iniPath);
     WritePrivateProfileStringW(MONITOR_SELECTION_SECTION, L"Count", L"0", s->iniPath);
     WritePrivateProfileStringW(MONITOR_INPUT_SECTION, L"Count", L"0", s->iniPath);
+    WritePrivateProfileStringW(MONITOR_BLACK_SECTION, L"Count", L"0", s->iniPath);
 }
 
 int Settings_DayBrightness(const Settings *s)
@@ -133,6 +139,55 @@ static void SaveMonitorSelection(const Settings *s)
     }
     StringCchPrintfW(value, ARRAYSIZE(value), L"%d", count);
     WritePrivateProfileStringW(MONITOR_SELECTION_SECTION, L"Count", value, s->iniPath);
+}
+
+/* Black idle is an explicit per-display choice, retained while disconnected. */
+static void LoadMonitorIdleBlack(Settings *s)
+{
+    MonitorSelection *selection = &s->monitorSelection;
+    selection->idleBlackCount = 0;
+    int count = (int)GetPrivateProfileIntW(MONITOR_BLACK_SECTION, L"Count", 0, s->iniPath);
+    if (count < 0) count = 0;
+    if (count > MAX_MONITORS) count = MAX_MONITORS;
+    for (int i = 0; i < count; i++) {
+        WCHAR field[16], key[MONITOR_SELECTION_KEY_LEN + 1];
+        StringCchPrintfW(field, ARRAYSIZE(field), L"Key%d", i);
+        DWORD length = GetPrivateProfileStringW(MONITOR_BLACK_SECTION, field, L"",
+                                                key, ARRAYSIZE(key), s->iniPath);
+        if (length >= MONITOR_SELECTION_KEY_LEN || !Settings_MonitorKeyValid(key)) continue;
+        BOOL duplicate = FALSE;
+        for (int j = 0; j < selection->idleBlackCount; j++)
+            if (_wcsicmp(selection->idleBlackKeys[j], key) == 0) duplicate = TRUE;
+        if (duplicate) continue;
+        int index = selection->idleBlackCount++;
+        StringCchCopyW(selection->idleBlackKeys[index], MONITOR_SELECTION_KEY_LEN, key);
+        StringCchPrintfW(field, ARRAYSIZE(field), L"Name%d", i);
+        GetPrivateProfileStringW(MONITOR_BLACK_SECTION, field, L"",
+                                 selection->idleBlackNames[index], 128, s->iniPath);
+    }
+}
+
+static void SaveMonitorIdleBlack(const Settings *s)
+{
+    const MonitorSelection *selection = &s->monitorSelection;
+    int indices[MAX_MONITORS], count = 0;
+    WCHAR field[16], value[16];
+    WritePrivateProfileSectionW(MONITOR_BLACK_SECTION, L"", s->iniPath);
+    for (int i = 0; i < selection->idleBlackCount && i < MAX_MONITORS; i++) {
+        if (!Settings_MonitorKeyValid(selection->idleBlackKeys[i])) continue;
+        BOOL duplicate = FALSE;
+        for (int j = 0; j < count; j++)
+            if (_wcsicmp(selection->idleBlackKeys[indices[j]], selection->idleBlackKeys[i]) == 0)
+                duplicate = TRUE;
+        if (duplicate) continue;
+        StringCchPrintfW(field, ARRAYSIZE(field), L"Key%d", count);
+        WritePrivateProfileStringW(MONITOR_BLACK_SECTION, field, selection->idleBlackKeys[i], s->iniPath);
+        StringCchPrintfW(field, ARRAYSIZE(field), L"Name%d", count);
+        WritePrivateProfileStringW(MONITOR_BLACK_SECTION, field, selection->idleBlackNames[i], s->iniPath);
+        indices[count++] = i;
+    }
+    StringCchPrintfW(value, ARRAYSIZE(value), L"%d", count);
+    WritePrivateProfileStringW(MONITOR_BLACK_SECTION, L"Count", value, s->iniPath);
 }
 
 static BOOL ParseMonitorInput(const WCHAR *value, DWORD *input)
@@ -267,6 +322,8 @@ void Settings_Load(Settings *s)
        one day ceiling because anything longer never triggers in practice. */
     if (s->idleDimMinutes < 1)    s->idleDimMinutes = 1;
     if (s->idleDimMinutes > 1440) s->idleDimMinutes = 1440;
+    s->sourcePollSeconds = Settings_ClampSourcePollSeconds((int)GetPrivateProfileIntW(
+        L"Settings", L"SourcePollSeconds", DEFAULT_SOURCE_POLL_SECONDS, s->iniPath));
 
     /* Load deltas */
     s->deltaCount = 0;
@@ -316,6 +373,7 @@ void Settings_Load(Settings *s)
     }
     LoadMonitorSelection(s);
     LoadMonitorInputs(s);
+    LoadMonitorIdleBlack(s);
 }
 
 void Settings_Save(Settings *s)
@@ -341,6 +399,8 @@ void Settings_Save(Settings *s)
     WritePrivateProfileStringW(L"Settings", L"IdleDimPercent", val, s->iniPath);
     wsprintfW(val, L"%d", s->idleDimMinutes);
     WritePrivateProfileStringW(L"Settings", L"IdleDimMinutes", val, s->iniPath);
+    wsprintfW(val, L"%d", Settings_ClampSourcePollSeconds(s->sourcePollSeconds));
+    WritePrivateProfileStringW(L"Settings", L"SourcePollSeconds", val, s->iniPath);
 
     /* Save deltas */
     WritePrivateProfileSectionW(L"Deltas", L"", s->iniPath);
@@ -372,6 +432,7 @@ void Settings_Save(Settings *s)
     }
     SaveMonitorSelection(s);
     SaveMonitorInputs(s);
+    SaveMonitorIdleBlack(s);
 }
 
 static BOOL GetAutostartExecutable(WCHAR exePath[MAX_PATH])

@@ -29,6 +29,7 @@ typedef struct {
     BOOL preIdleBrightnessValid;
     DWORD preIdleBrightness;
     BOOL brightnessWritten; /* Successful native write, never a brightness refresh. */
+    BOOL brightnessUpdated; /* Validated payload, including recovery during source polling. */
     WCHAR deviceInstance[256]; /* Stable value-only identity for applied writes after a rescan. */
     MonitorBackend backend;
     BOOL sourceFilter;
@@ -49,7 +50,8 @@ BOOL MonitorWorker_ReleaseIdle(BrightMonitor *monitor, DWORD rawBrightness, DWOR
 /* Invalidates this monitor's pending/in-flight work without disturbing others. */
 void MonitorWorker_Cancel(BrightMonitor *monitor);
 void MonitorWorker_Refresh(const MonitorList *view);
-/* Poll filtered selected displays, including temporarily skipped sources.
+/* Poll selected displays with filters or unresolved brightness capability,
+   including temporarily skipped sources.
    allMonitors includes every DDC display while the chooser is open. */
 void MonitorWorker_RefreshSources(const MonitorList *view, BOOL allMonitors);
 void MonitorWorker_Reset(void);

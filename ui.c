@@ -6,6 +6,7 @@
 #include <dwmapi.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <windowsx.h>
 
 static HINSTANCE g_hInst;
 static const WCHAR OSD_CLASS[]     = L"LumosOSD";
@@ -719,16 +720,17 @@ static LRESULT CALLBACK SchedWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
 
 /* Rows are data, not code: the table below drives rendering, hit testing and
    editing, so adding a setting later is one BuildSettingsRows line. */
-enum { SET_SECTION = 0, SET_TOGGLE, SET_NUMBER, SET_MONITORS };
-enum { SET_UNIT_PLAIN = 0, SET_UNIT_PERCENT, SET_UNIT_MINUTES };
+enum { SET_SECTION = 0, SET_TOGGLE, SET_NUMBER, SET_MONITORS, SET_SLIDER };
+enum { SET_UNIT_PLAIN = 0, SET_UNIT_PERCENT, SET_UNIT_MINUTES, SET_UNIT_SECONDS };
+#define SET_SLIDER_H 56
 
 /* Hit kinds returned by SetHitTest. */
-enum { SETHIT_NONE = 0, SETHIT_MINUS, SETHIT_PLUS, SETHIT_TOGGLE, SETHIT_ROW, SETHIT_MONITORS };
+enum { SETHIT_NONE = 0, SETHIT_MINUS, SETHIT_PLUS, SETHIT_TOGGLE, SETHIT_ROW, SETHIT_MONITORS, SETHIT_SLIDER };
 
 typedef struct {
     int    kind;
     WCHAR  label[MAX_PRESET_NAME + 16];
-    int   *ival;      /* SET_NUMBER: the value being edited */
+    int   *ival;      /* SET_NUMBER / SET_SLIDER: the value being edited */
     BOOL  *bval;      /* SET_TOGGLE: the flag being edited */
     int    lo, hi;    /* SET_NUMBER bounds */
     int    step;      /* SET_NUMBER increment (minutes scale instead, see SetStepFor) */
@@ -746,6 +748,7 @@ typedef struct {
     BOOL  idleDimEnabled;
     int   idleDimPercent;
     int   idleDimMinutes;
+    int   sourcePollSeconds;
     int   presetValues[MAX_PRESETS];
     int   presetCount;
     MonitorSelection monitorSelection;
@@ -756,6 +759,7 @@ typedef struct {
     int    rowCount;
     int    hoverRow;
     int    keyboardRow; /* rowCount denotes Save, -1 means mouse navigation */
+    int    activeSliderRow; /* -1 unless a slider owns mouse capture */
     Settings *settings;
     HWND   owner;
 } SetEditData;
@@ -778,16 +782,17 @@ static void SetAddToggle(SetEditData *d, const WCHAR *label, BOOL *val)
     if (r) r->bval = val;
 }
 
-static void SetAddNumber(SetEditData *d, const WCHAR *label, int *val,
+static SetRow *SetAddNumber(SetEditData *d, const WCHAR *label, int *val,
                          int lo, int hi, int step, int unit)
 {
     SetRow *r = SetAddRow(d, SET_NUMBER, label);
-    if (!r) return;
+    if (!r) return NULL;
     r->ival = val;
     r->lo = lo;
     r->hi = hi;
     r->step = step;
     r->unit = unit;
+    return r;
 }
 
 static void BuildSettingsRows(SetEditData *d)
@@ -798,6 +803,9 @@ static void BuildSettingsRows(SetEditData *d)
     SetAddNumber(d, L"Brightness step", &d->step, 1, 50, 1, SET_UNIT_PERCENT);
     SetAddToggle(d, L"Start with Windows", &d->autostart);
     SetAddRow(d, SET_MONITORS, L"Choose Monitors");
+    SetRow *sourceInterval = SetAddNumber(d, L"Source check interval", &d->sourcePollSeconds,
+                 MIN_SOURCE_POLL_SECONDS, MAX_SOURCE_POLL_SECONDS, 1, SET_UNIT_SECONDS);
+    if (sourceInterval) sourceInterval->kind = SET_SLIDER;
 
     SetAddRow(d, SET_SECTION, L"IDLE DIM");
     SetAddToggle(d, L"Dim when idle", &d->idleDimEnabled);
@@ -815,9 +823,10 @@ static void BuildSettingsRows(SetEditData *d)
     }
 }
 
-static int SetRowHeight(SetRow *r)
+static int SetRowHeight(const SetRow *r)
 {
-    return (r->kind == SET_SECTION) ? SET_SECTION_H : SET_ROW_H;
+    if (r->kind == SET_SECTION) return SET_SECTION_H;
+    return r->kind == SET_SLIDER ? SET_SLIDER_H : SET_ROW_H;
 }
 
 static int SetHeight(SetEditData *d)
@@ -847,6 +856,43 @@ static void SetToggleRect(int top, RECT *rc)
     rc->bottom = rc->top + 20;
 }
 
+static int SetRowTop(const SetEditData *d, int row)
+{
+    int top = SET_HEADER_H;
+    for (int i = 0; i < row; i++) top += SetRowHeight(&d->rows[i]);
+    return top;
+}
+
+static void SetSliderRect(int top, RECT *track)
+{
+    track->left = 22;
+    track->right = SET_WIDTH - 22;
+    track->top = top + 35;
+    track->bottom = top + 41;
+}
+
+static BOOL SetSliderValue(SetEditData *d, int row, int x)
+{
+    if (row < 0 || row >= d->rowCount) return FALSE;
+    SetRow *r = &d->rows[row];
+    if (r->kind != SET_SLIDER || !r->ival) return FALSE;
+    RECT track;
+    SetSliderRect(SetRowTop(d, row), &track);
+    if (x < track.left) x = track.left;
+    if (x > track.right) x = track.right;
+    int width = track.right - track.left;
+    int value = r->lo + ((x - track.left) * (r->hi - r->lo) + width / 2) / width;
+    if (*r->ival == value) return FALSE;
+    *r->ival = value;
+    return TRUE;
+}
+
+static void SetEndSliderDrag(HWND hwnd, SetEditData *d)
+{
+    d->activeSliderRow = -1; /* clear before ReleaseCapture sends another message */
+    if (GetCapture() == hwnd) ReleaseCapture();
+}
+
 static void SetSaveRect(SetEditData *d, RECT *rc)
 {
     int y = SetHeight(d) - SET_FOOTER_H + 10;
@@ -866,7 +912,7 @@ static int SetStepFor(SetRow *r, int value)
 
 static void SetAdjust(SetRow *r, int dir)
 {
-    if (r->kind != SET_NUMBER || !r->ival) return;
+    if ((r->kind != SET_NUMBER && r->kind != SET_SLIDER) || !r->ival) return;
     int v = *r->ival;
     /* Stepping down uses the bucket below the current value, so the same click
        count walks a value back to where it came from. */
@@ -895,6 +941,13 @@ static int SetHitTest(SetEditData *d, int x, int y, int *outHit)
                 RECT rc;
                 SetToggleRect(top, &rc);
                 *outHit = (x >= rc.left && x <= rc.right) ? SETHIT_TOGGLE : SETHIT_ROW;
+                return i;
+            }
+            if (r->kind == SET_SLIDER) {
+                RECT track;
+                SetSliderRect(top, &track);
+                *outHit = x >= track.left - 7 && x <= track.right + 7 &&
+                          y >= top + 26 && y < top + rh - 4 ? SETHIT_SLIDER : SETHIT_ROW;
                 return i;
             }
             RECT rcMinus, rcValue, rcPlus;
@@ -956,6 +1009,7 @@ static void RenderSettings(HWND hwnd, SetEditData *d)
     int y = SET_HEADER_H;
     for (int i = 0; i < d->rowCount; i++) {
         SetRow *r = &d->rows[i];
+        int rowHeight = SetRowHeight(r);
 
         if (r->kind == SET_SECTION) {
             RECT rc = { 16, y, w - 16, y + SET_SECTION_H };
@@ -969,7 +1023,7 @@ static void RenderSettings(HWND hwnd, SetEditData *d)
         if (i == d->hoverRow || i == d->keyboardRow || r->kind == SET_MONITORS) {
             HBRUSH hb = CreateSolidBrush(UI_ColorRef(CLR_SURFACE));
             HBRUSH ob = (HBRUSH)SelectObject(dc, hb);
-            RoundRect(dc, 8, y + 2, w - 8, y + SET_ROW_H - 2, 8, 8);
+            RoundRect(dc, 8, y + 2, w - 8, y + rowHeight - 2, 8, 8);
             SelectObject(dc, ob);
             DeleteObject(hb);
         }
@@ -989,6 +1043,40 @@ static void RenderSettings(HWND hwnd, SetEditData *d)
             SetTextColor(dc, UI_ColorRef(CLR_ACCENT));
             DrawTextW(dc, text, -1, &summary, DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
             y += SET_ROW_H;
+            continue;
+        }
+
+        if (r->kind == SET_SLIDER) {
+            RECT label = { 16, y, w - 66, y + 28 };
+            RECT value = { w - 66, y, w - 16, y + 28 };
+            WCHAR text[16];
+            int v = r->ival ? *r->ival : r->lo;
+            if (v < r->lo) v = r->lo;
+            if (v > r->hi) v = r->hi;
+            wsprintfW(text, L"%d s", v);
+            SelectObject(dc, hFont);
+            SetTextColor(dc, UI_ColorRef(CLR_TEXT));
+            DrawTextW(dc, r->label, -1, &label, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+            SetTextColor(dc, UI_ColorRef(CLR_ACCENT));
+            DrawTextW(dc, text, -1, &value, DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
+            RECT track;
+            SetSliderRect(y, &track);
+            int x = track.left + (v - r->lo) * (track.right - track.left) / (r->hi - r->lo);
+            HBRUSH background = CreateSolidBrush(UI_ColorRef(CLR_TRACK));
+            HBRUSH fill = CreateSolidBrush(UI_ColorRef(CLR_ACCENT));
+            HBRUSH knob = CreateSolidBrush(UI_ColorRef(CLR_TEXT));
+            HBRUSH oldBrush = (HBRUSH)SelectObject(dc, background);
+            RoundRect(dc, track.left, track.top, track.right, track.bottom, 6, 6);
+            SelectObject(dc, fill);
+            if (x > track.left) RoundRect(dc, track.left, track.top, x, track.bottom, 6, 6);
+            SelectObject(dc, knob);
+            int cy = (track.top + track.bottom) / 2;
+            Ellipse(dc, x - 7, cy - 7, x + 7, cy + 7);
+            SelectObject(dc, oldBrush);
+            DeleteObject(background);
+            DeleteObject(fill);
+            DeleteObject(knob);
+            y += rowHeight;
             continue;
         }
 
@@ -1091,6 +1179,7 @@ static void SetCommit(SetEditData *d)
     s->idleDimEnabled  = d->idleDimEnabled;
     s->idleDimPercent  = d->idleDimPercent;
     s->idleDimMinutes  = d->idleDimMinutes;
+    s->sourcePollSeconds = Settings_ClampSourcePollSeconds(d->sourcePollSeconds);
     s->monitorSelection = d->monitorSelection;
     for (int i = 0; i < d->presetCount && i < s->presetCount; i++)
         s->presets[i].brightness = (DWORD)d->presetValues[i];
@@ -1137,7 +1226,7 @@ static LRESULT CALLBACK SetWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
 
     switch (msg) {
     case WM_LBUTTONDOWN: {
-        int x = LOWORD(lParam), y = HIWORD(lParam);
+        int x = GET_X_LPARAM(lParam), y = GET_Y_LPARAM(lParam);
 
         RECT rcSave;
         SetSaveRect(d, &rcSave);
@@ -1152,7 +1241,11 @@ static LRESULT CALLBACK SetWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
             d->keyboardRow = -1;
             SetRow *r = &d->rows[row];
             if (hit == SETHIT_MONITORS) { SetChooseMonitors(hwnd, d); return 0; }
-            if (hit == SETHIT_TOGGLE && r->bval) *r->bval = !*r->bval;
+            if (hit == SETHIT_SLIDER) {
+                d->activeSliderRow = row;
+                SetSliderValue(d, row, x);
+                SetCapture(hwnd);
+            } else if (hit == SETHIT_TOGGLE && r->bval) *r->bval = !*r->bval;
             else if (hit == SETHIT_MINUS)        SetAdjust(r, -1);
             else if (hit == SETHIT_PLUS)         SetAdjust(r, +1);
             d->hoverRow = row;
@@ -1162,8 +1255,14 @@ static LRESULT CALLBACK SetWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
     }
 
     case WM_MOUSEMOVE: {
+        if (d->activeSliderRow >= 0) {
+            BOOL changed = SetSliderValue(d, d->activeSliderRow, GET_X_LPARAM(lParam));
+            if (!(wParam & MK_LBUTTON)) SetEndSliderDrag(hwnd, d);
+            if (changed) RenderSettings(hwnd, d);
+            return 0;
+        }
         int hit;
-        int row = SetHitTest(d, LOWORD(lParam), HIWORD(lParam), &hit);
+        int row = SetHitTest(d, GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam), &hit);
         if (row != d->hoverRow) {
             d->hoverRow = row;
             RenderSettings(hwnd, d);
@@ -1171,13 +1270,29 @@ static LRESULT CALLBACK SetWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
         return 0;
     }
 
+    case WM_LBUTTONUP:
+        if (d->activeSliderRow >= 0) {
+            SetSliderValue(d, d->activeSliderRow, GET_X_LPARAM(lParam));
+            SetEndSliderDrag(hwnd, d);
+            RenderSettings(hwnd, d);
+        }
+        return 0;
+
+    case WM_CAPTURECHANGED:
+        if ((HWND)lParam != hwnd) d->activeSliderRow = -1;
+        return 0;
+
+    case WM_CANCELMODE:
+        SetEndSliderDrag(hwnd, d);
+        return 0;
+
     case WM_MOUSEWHEEL: {
         int dir = ((short)HIWORD(wParam) > 0) ? 1 : -1;
         POINT pt = { (short)LOWORD(lParam), (short)HIWORD(lParam) };
         ScreenToClient(hwnd, &pt);
         int hit;
         int row = SetHitTest(d, pt.x, pt.y, &hit);
-        if (row >= 0 && d->rows[row].kind == SET_NUMBER) {
+        if (row >= 0 && (d->rows[row].kind == SET_NUMBER || d->rows[row].kind == SET_SLIDER)) {
             SetAdjust(&d->rows[row], dir);
             d->hoverRow = row;
             RenderSettings(hwnd, d);
@@ -1203,6 +1318,8 @@ static LRESULT CALLBACK SetWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
                 if (r->kind == SET_TOGGLE && r->bval) *r->bval = !*r->bval;
             } else if (wParam == VK_LEFT || wParam == VK_RIGHT) {
                 SetAdjust(r, wParam == VK_RIGHT ? 1 : -1);
+            } else if (r->kind == SET_SLIDER && r->ival && (wParam == VK_HOME || wParam == VK_END)) {
+                *r->ival = wParam == VK_HOME ? r->lo : r->hi;
             }
             RenderSettings(hwnd, d);
         }
@@ -1217,6 +1334,7 @@ static LRESULT CALLBACK SetWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
         return 0;
 
     case WM_DESTROY:
+        SetEndSliderDrag(hwnd, d);
         g_setHwnd = NULL;
         UI_CloseMonitorSelection();
         return 0;
@@ -1449,6 +1567,8 @@ void UI_ShowSettings(HWND hwndOwner, Settings *s, MonitorList *monitors)
     g_set.idleDimEnabled = s->idleDimEnabled;
     g_set.idleDimPercent = s->idleDimPercent;
     g_set.idleDimMinutes = s->idleDimMinutes;
+    g_set.sourcePollSeconds = Settings_ClampSourcePollSeconds(s->sourcePollSeconds);
+    g_set.activeSliderRow = -1;
     g_set.presetCount = s->presetCount;
     for (int i = 0; i < s->presetCount; i++)
         g_set.presetValues[i] = (int)s->presets[i].brightness;

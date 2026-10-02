@@ -131,7 +131,8 @@ static DWORD SnapshotTargetsLocked(MonitorTarget targets[MAX_MONITORS])
 
 static void PostResult(int index, DWORD generation, DWORD sequence,
                        const BrightMonitor *monitor, BOOL success, MonitorResultKind kind,
-                       BOOL sourceUpdated, MonitorWritePurpose purpose, BOOL brightnessWritten)
+                       BOOL sourceUpdated, MonitorWritePurpose purpose, BOOL brightnessWritten,
+                       BOOL brightnessUpdated)
 {
     MonitorResult *result = (MonitorResult *)malloc(sizeof(*result));
     if (!result) return;
@@ -152,6 +153,7 @@ static void PostResult(int index, DWORD generation, DWORD sequence,
     result->preIdleBrightnessValid = monitor->preIdleBrightnessValid;
     result->preIdleBrightness = monitor->preIdleBrightness;
     result->brightnessWritten = brightnessWritten;
+    result->brightnessUpdated = brightnessUpdated;
     CopyMemory(result->deviceInstance, monitor->deviceInstance, sizeof(result->deviceInstance));
     result->deviceInstance[ARRAYSIZE(result->deviceInstance) - 1] = L'\0';
     result->backend = monitor->backend;
@@ -190,7 +192,7 @@ static void ApplyWrite(int index, WriteRequest *request)
                              MONITOR_RESULT_BRIGHTNESS;
     PostResult(index, request->generation, request->sequence,
                &request->monitor, outcome == MONITOR_WRITE_APPLIED, kind, sourceUpdated,
-               request->purpose, outcome == MONITOR_WRITE_APPLIED);
+               request->purpose, outcome == MONITOR_WRITE_APPLIED, outcome == MONITOR_WRITE_APPLIED);
     ReleaseWriteRequest(request);
     EnterCriticalSection(&g_worker.lock);
     /* Reset may have already cancelled this generation's outstanding intent. */
@@ -206,7 +208,7 @@ static void ApplyRefresh(RefreshRequest *request)
         if (readMask & (1u << i))
             PostResult(i, request->generation, request->sequences[i],
                        &request->monitors.monitors[i], TRUE, MONITOR_RESULT_BRIGHTNESS, FALSE,
-                       MONITOR_WRITE_NORMAL, FALSE);
+                       MONITOR_WRITE_NORMAL, FALSE, TRUE);
     }
     ReleaseRefreshRequest(request);
 }
@@ -215,13 +217,16 @@ static void ApplySourceRefresh(RefreshRequest *request)
 {
     for (int i = 0; i < request->monitors.count; i++) {
         BrightMonitor *monitor = &request->monitors.monitors[i];
-        if (monitor->backend != BACKEND_DDC) continue;
-        if (!request->allMonitors && (!monitor->controllable || monitor->excludedFromControl ||
-                                      !monitor->sourceFilter)) continue;
+        if (monitor->backend != BACKEND_DDC || !monitor->hasHandle) continue;
+        if (!request->allMonitors && (monitor->excludedFromControl ||
+            (!monitor->sourceFilter && monitor->controllable))) continue;
+        /* A failed initial brightness read must not permanently hide a monitor
+           or stop its source polling. Reads recover capability without writing. */
+        BOOL brightnessUpdated = !monitor->controllable && Monitor_ReadBrightnessSync(monitor);
         BOOL success = Monitor_ReadSourceSync(monitor);
         /* A failed read must replace stale success with "unknown" in the UI. */
         PostResult(i, request->generation, request->sequences[i], monitor,
-                   success, MONITOR_RESULT_SOURCE, TRUE, MONITOR_WRITE_NORMAL, FALSE);
+                   success, MONITOR_RESULT_SOURCE, TRUE, MONITOR_WRITE_NORMAL, FALSE, brightnessUpdated);
     }
     ReleaseRefreshRequest(request);
 }

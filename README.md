@@ -135,7 +135,7 @@ Cross-compile from Linux/WSL with MinGW (outputs land in `build/`):
 mkdir -p build
 x86_64-w64-mingw32-windres lumos.rc -O coff -o build/lumos.res
 x86_64-w64-mingw32-gcc -O2 -Wall -mwindows -DUNICODE -D_UNICODE \
-  lumos.c monitor.c monitor_worker.c brightness.c monitor_selection.c \
+  lumos.c monitor.c monitor_worker.c brightness.c monitor_selection.c idle_black.c \
   ui.c ui_popup.c ui_graphics.c ui_monitor_selection.c presets.c schedule.c wmibright.c capture.c build/lumos.res \
   -o build/lumos.exe \
   -ldxva2 -luser32 -lgdi32 -lshell32 -lcomctl32 -ladvapi32 -lole32 -loleaut32 -lwbemuuid -ldwmapi -lwtsapi32 -lkernel32 -lm
@@ -151,6 +151,7 @@ build.bat debug      :: debug build, logs to %APPDATA%\Lumos\lumos-*.log
 ### Code organization
 
 - `lumos.c`: application lifecycle, tray/hotkeys, scheduling and monitor rescan coordination.
+- `idle_black.c`: per-monitor black idle windows, input wake and display power request.
 - `monitor.c`, `wmibright.c`: hardware access and physical handle ownership.
 - `monitor_worker.c`: queued writes, refreshes and result delivery to the UI thread.
 - `brightness.c`: shared brightness calculations and monitor identity matching, with no hardware access.
@@ -228,10 +229,17 @@ the Settings window. The rule also works in All Monitors mode and remains saved
 when a display is unchecked or disconnected. Existing configurations keep this
 optional filter off until it is enabled explicitly.
 
-The current input is read with DDC/CI VCP 0x60 in the background every 2.5 seconds
-while a selected monitor has a filter or the chooser is open. Filtered writes
-always check the source again immediately before setting brightness. Another
-input, a missing association or an unreadable source pauses ordinary brightness control;
+The **Source check interval** slider in Settings sets how often the current input
+is read with DDC/CI VCP 0x60 in the background: **1 to 60 seconds**, in steps of
+one second (default **3 seconds**). Save applies the interval immediately and
+retains it for the next launch. Source status stays valid between scheduled polls.
+Polling runs while a selected monitor has a filter, needs brightness discovery to recover,
+or the chooser is open. A failed source read is retried once after 100 ms before
+being reported as unavailable. A failed brightness read does not hide the
+monitor's identity or its source; polling can recover brightness support later.
+Filtered writes always check the source again immediately before setting brightness,
+regardless of the periodic interval. Another input, a missing association or an
+unreadable source pauses ordinary brightness control;
 it does not deselect the monitor or trigger brightness recovery retries. When
 the PC input returns, Lumos applies the current idle/schedule policy or the latest
 requested brightness, without replaying older commands. Internal WMI panels do
@@ -249,6 +257,30 @@ and a failed restoration is retried on a later source poll. This requires the
 monitor to keep accepting DDC/CI commands from this PC while showing another input.
 
 The idle auto-dim keys work together. `IdleDimEnabled` turns the feature on and off, and the tray context menu toggles the same key. `IdleDimPercent` is the level held while the session is idle (0 to 100). `IdleDimMinutes` is how long there must be no keyboard or mouse input before the dim happens (1 to 1440 minutes).
+
+For OLED displays, select the monitor in **Choose Monitors** and enable
+**OLED: true black when idle**, then Apply and Save. The existing idle timeout
+and fullscreen/call exclusions still apply. This optional mode covers the whole
+selected display, including the taskbar and pointer, with an opaque RGB 0,0,0
+window instead of changing panel brightness. Mouse or keyboard activity removes
+the cover, checked every 100 ms while it is visible. The setting is saved by
+stable monitor identity under `[MonitorIdleBlack]`, including offline displays;
+it also supports built-in OLED panels. Existing configurations keep normal dimming.
+
+While idle protection is enabled and at least one selected display uses black
+idle, Lumos requests that Windows keep the video output awake. This pauses
+automatic display standby for all displays, even before Lumos's idle timeout,
+to avoid driver transitions caused by turning off the signal. It does not
+prevent system sleep or session locking. Locking the session releases the request
+and hides the windows; unlock restores the configured policy. Disabling idle
+protection, removing the last selected black-idle display, or exiting Lumos
+releases the request too.
+
+The cover follows the input-source filter. Another or unreadable input hides
+it; returning to this PC while still idle shows it again. Panel brightness
+was never reduced, so another source retains its original brightness. Black
+idle does not power off the monitor or trigger its standby/panel maintenance
+cycle. The monitor's own OLED care functions remain necessary.
 
 ## Requirements
 

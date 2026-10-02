@@ -29,6 +29,8 @@ static struct {
     DWORD commandBytes;
     WCHAR queryValue[MAX_PATH + 64];
     DWORD queryType, queryBytes;
+    BOOL sourcePollPresent;
+    WCHAR sourcePollValue[24];
     struct {
         WCHAR field[24];
         WCHAR value[MONITOR_SELECTION_KEY_LEN + 32];
@@ -39,6 +41,11 @@ static struct {
         WCHAR value[MONITOR_SELECTION_KEY_LEN + 32];
     } inputValues[MAX_MONITORS * 4 + 8];
     int inputValueCount;
+    struct {
+        WCHAR field[24];
+        WCHAR value[MONITOR_SELECTION_KEY_LEN + 32];
+    } blackValues[MAX_MONITORS * 2 + 8];
+    int blackValueCount;
 } mock;
 
 static void ResetMocks(void)
@@ -123,9 +130,25 @@ static void PutInputIni(const WCHAR *field, const WCHAR *value)
 static BOOL WINAPI MockWritePrivateProfileStringW(LPCWSTR section, LPCWSTR key,
                                                  LPCWSTR value, LPCWSTR path)
 {
+    if (section && key && value && wcscmp(section, L"Settings") == 0 &&
+        wcscmp(key, L"SourcePollSeconds") == 0) {
+        mock.sourcePollPresent = TRUE;
+        StringCchCopyW(mock.sourcePollValue, ARRAYSIZE(mock.sourcePollValue), value);
+    }
     if (section && key && value && wcscmp(section, L"Presets") == 0 &&
         wcscmp(key, L"Day") == 0)
         CHECK(SUCCEEDED(StringCchCopyW(mock.defaultDayValue, ARRAYSIZE(mock.defaultDayValue), value)));
+    if (section && key && value && wcscmp(section, L"MonitorIdleBlack") == 0) {
+        int index = 0;
+        for (; index < mock.blackValueCount; index++)
+            if (_wcsicmp(mock.blackValues[index].field, key) == 0) break;
+        CHECK(index < (int)ARRAYSIZE(mock.blackValues));
+        if (index < (int)ARRAYSIZE(mock.blackValues)) {
+            if (index == mock.blackValueCount) mock.blackValueCount++;
+            StringCchCopyW(mock.blackValues[index].field, 24, key);
+            StringCchCopyW(mock.blackValues[index].value, ARRAYSIZE(mock.blackValues[index].value), value);
+        }
+    }
     if (section && key && value && wcscmp(section, L"MonitorSelection") == 0)
         PutSelectionIni(key, value);
     if (section && key && value && wcscmp(section, L"MonitorInputs") == 0)
@@ -146,6 +169,10 @@ static BOOL WINAPI MockWritePrivateProfileSectionW(LPCWSTR section, LPCWSTR valu
         CHECK(values[0] == L'\0');
         mock.inputValueCount = 0;
     }
+    if (wcscmp(section, L"MonitorIdleBlack") == 0) {
+        CHECK(values[0] == L'\0');
+        mock.blackValueCount = 0;
+    }
     return TRUE;
 }
 
@@ -158,6 +185,9 @@ static DWORD WINAPI MockGetPrivateProfileStringW(LPCWSTR section, LPCWSTR key,
     if (!key) { buffer[0] = L'\0'; return 0; }
     const WCHAR *value = wcscmp(section, L"MonitorSelection") == 0 ? SelectionIniValue(key) : NULL;
     if (wcscmp(section, L"MonitorInputs") == 0) value = InputIniValue(key);
+    if (wcscmp(section, L"MonitorIdleBlack") == 0)
+        for (int i = 0; i < mock.blackValueCount; i++)
+            if (_wcsicmp(mock.blackValues[i].field, key) == 0) value = mock.blackValues[i].value;
     if (!value) value = fallback;
     size_t length = wcslen(value);
     if (length >= capacity) length = capacity - 1;
@@ -170,8 +200,13 @@ static UINT WINAPI MockGetPrivateProfileIntW(LPCWSTR section, LPCWSTR key,
                                             INT fallback, LPCWSTR path)
 {
     (void)path;
+    if (wcscmp(section, L"Settings") == 0 && wcscmp(key, L"SourcePollSeconds") == 0 &&
+        mock.sourcePollPresent) return (UINT)_wtoi(mock.sourcePollValue);
     const WCHAR *value = wcscmp(section, L"MonitorSelection") == 0 ? SelectionIniValue(key) : NULL;
     if (wcscmp(section, L"MonitorInputs") == 0) value = InputIniValue(key);
+    if (wcscmp(section, L"MonitorIdleBlack") == 0)
+        for (int i = 0; i < mock.blackValueCount; i++)
+            if (_wcsicmp(mock.blackValues[i].field, key) == 0) value = mock.blackValues[i].value;
     if (value) return (UINT)_wtoi(value);
     return (UINT)fallback;
 }
@@ -661,7 +696,14 @@ static void TestApplyMonitorSelection(void)
     CHECK(!view.monitors[2].excludedFromControl); /* Other unique selected keys remain enabled. */
     view.monitors[1].controllable = FALSE;
     Settings_ApplyMonitorSelection(&settings, &view);
-    CHECK(!view.monitors[0].excludedFromControl && !view.monitors[2].excludedFromControl);
+    CHECK(view.monitors[0].excludedFromControl && view.monitors[1].excludedFromControl);
+    CHECK(!view.monitors[2].excludedFromControl); /* Ambiguity survives a failed brightness read. */
+    wcscpy(view.monitors[1].deviceInstance, L"DISPLAY\\DDC2");
+    Settings_ApplyMonitorSelection(&settings, &view);
+    CHECK(!view.monitors[0].excludedFromControl && view.monitors[1].excludedFromControl);
+    Settings_MonitorKey(&view.monitors[1], settings.monitorSelection.keys[1]);
+    Settings_ApplyMonitorSelection(&settings, &view);
+    CHECK(!view.monitors[1].excludedFromControl && !view.monitors[1].controllable);
 }
 
 static void TestMonitorSelectionPersistence(void)
@@ -845,6 +887,9 @@ static void TestApplyMonitorInputs(void)
     CHECK(view.monitors[1].sourceFilter && view.monitors[1].expectedInput == 0);
     view.monitors[1].controllable = FALSE;
     Settings_ApplyMonitorSelection(&settings, &view);
+    CHECK(view.monitors[0].sourceFilter && view.monitors[0].expectedInput == 0);
+    view.monitors[1].deviceInstance[0] = L'\0';
+    Settings_ApplyMonitorSelection(&settings, &view);
     CHECK(view.monitors[0].sourceFilter && view.monitors[0].expectedInput == 15);
 
     settings.monitorSelection.inputRules[0].input = 256;
@@ -962,6 +1007,68 @@ static void TestMonitorInputsIdentityBounds(void)
     CHECK(settings.monitorSelection.inputRuleCount == 0);
 }
 
+static void TestBlackIdlePersistenceAndUniqueSelection(void)
+{
+    ResetMocks();
+    Settings saved = {0}, loaded = {0};
+    saved.monitorSelection.idleBlackCount = 3;
+    StringCchCopyW(saved.monitorSelection.idleBlackKeys[0], MONITOR_SELECTION_KEY_LEN, L"DDC:OLED");
+    StringCchCopyW(saved.monitorSelection.idleBlackNames[0], 128, L"OLED desktop");
+    StringCchCopyW(saved.monitorSelection.idleBlackKeys[1], MONITOR_SELECTION_KEY_LEN, L"WMI:INTERNAL");
+    StringCchCopyW(saved.monitorSelection.idleBlackKeys[2], MONITOR_SELECTION_KEY_LEN, L"ddc:oled");
+    Settings_Save(&saved);
+    Settings_Load(&loaded);
+    CHECK(loaded.monitorSelection.idleBlackCount == 2);
+    CHECK(!wcscmp(loaded.monitorSelection.idleBlackNames[0], L"OLED desktop"));
+    CHECK(loaded.monitorSelection.count == 0 && loaded.monitorSelection.inputRuleCount == 0);
+    MonitorList view = {0};
+    view.count = 2;
+    view.monitors[0].backend = BACKEND_DDC;
+    view.monitors[0].controllable = TRUE;
+    StringCchCopyW(view.monitors[0].deviceInstance, 256, L"OLED");
+    view.monitors[1].backend = BACKEND_WMI;
+    view.monitors[1].controllable = TRUE;
+    StringCchCopyW(view.monitors[1].wmiInstance, 256, L"INTERNAL");
+    Settings_ApplyMonitorSelection(&loaded, &view);
+    CHECK(view.monitors[0].idleBlack && view.monitors[1].idleBlack);
+    loaded.monitorSelection.selectedOnly = TRUE;
+    Settings_ApplyMonitorSelection(&loaded, &view);
+    CHECK(view.monitors[0].excludedFromControl && view.monitors[1].excludedFromControl);
+    loaded.monitorSelection.selectedOnly = FALSE;
+    view.monitors[1] = view.monitors[0];
+    Settings_ApplyMonitorSelection(&loaded, &view);
+    CHECK(!view.monitors[0].idleBlack && !view.monitors[1].idleBlack);
+    ResetMocks();
+    Settings_Load(&loaded);
+    CHECK(loaded.monitorSelection.idleBlackCount == 0); /* Existing INI stays dim-only. */
+}
+
+static void TestSourcePollingSetting(void)
+{
+    Settings settings = {0}, loaded = {0};
+    ResetMocks();
+    Settings_Load(&loaded);
+    CHECK(loaded.sourcePollSeconds == DEFAULT_SOURCE_POLL_SECONDS);
+    Settings_CreateDefaults(&settings);
+    CHECK(mock.sourcePollPresent && _wtoi(mock.sourcePollValue) == DEFAULT_SOURCE_POLL_SECONDS);
+    for (int seconds = 1; seconds <= 60; seconds++) {
+        settings.sourcePollSeconds = seconds;
+        Settings_Save(&settings);
+        Settings_Load(&loaded);
+        CHECK(loaded.sourcePollSeconds == seconds);
+    }
+    const int invalid[] = { -7, 0, 61, 1000 };
+    for (int i = 0; i < (int)ARRAYSIZE(invalid); i++) {
+        int expected = invalid[i] < 1 ? 1 : 60;
+        wsprintfW(mock.sourcePollValue, L"%d", invalid[i]);
+        Settings_Load(&loaded);
+        CHECK(loaded.sourcePollSeconds == expected);
+        settings.sourcePollSeconds = invalid[i];
+        Settings_Save(&settings);
+        CHECK(_wtoi(mock.sourcePollValue) == expected);
+    }
+}
+
 int main(void)
 {
     TestSettingsPaths();
@@ -980,6 +1087,8 @@ int main(void)
     TestApplyMonitorInputs();
     TestMonitorInputsInvalidValues();
     TestMonitorInputsIdentityBounds();
+    TestBlackIdlePersistenceAndUniqueSelection();
+    TestSourcePollingSetting();
     if (failures) {
         printf("%d settings checks failed\n", failures);
         return 1;

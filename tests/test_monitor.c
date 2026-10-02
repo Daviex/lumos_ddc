@@ -32,6 +32,8 @@ static int brightnessReadCalls;
 static DWORD sourceInput;
 static DWORD sourceAfterBrightnessRead;
 static BOOL sourceReadSuccess;
+static int sourceFailuresRemaining, retrySleeps;
+static DWORD sourceAfterRetrySleep;
 
 static BOOL WINAPI MockGetVCPFeatureAndVCPFeatureReply(HANDLE handle, BYTE code,
         LPMC_VCP_CODE_TYPE type, LPDWORD current, LPDWORD maximum)
@@ -42,7 +44,15 @@ static BOOL WINAPI MockGetVCPFeatureAndVCPFeatureReply(HANDLE handle, BYTE code,
     *type = MC_SET_PARAMETER;
     *current = sourceInput;
     *maximum = 0x12;
+    if (sourceFailuresRemaining > 0) { sourceFailuresRemaining--; return FALSE; }
     return sourceReadSuccess;
+}
+
+static void WINAPI MockSleep(DWORD milliseconds)
+{
+    CHECK(milliseconds == 100);
+    retrySleeps++;
+    if (sourceAfterRetrySleep) sourceInput = sourceAfterRetrySleep;
 }
 
 static BOOL WINAPI MockDestroyPhysicalMonitor(HANDLE handle)
@@ -124,6 +134,7 @@ void MonitorWorker_Refresh(const MonitorList *view)
 #define GetMonitorBrightness MockGetMonitorBrightness
 #define SetMonitorBrightness MockSetMonitorBrightness
 #define GetVCPFeatureAndVCPFeatureReply MockGetVCPFeatureAndVCPFeatureReply
+#define Sleep MockSleep
 #include "../monitor.c"
 
 static BrightMonitor MakeDdc(UINT_PTR handle)
@@ -158,6 +169,8 @@ static void ResetMocks(void)
     sourceInput = 0x0F;
     sourceAfterBrightnessRead = 0;
     sourceReadSuccess = TRUE;
+    sourceFailuresRemaining = retrySleeps = 0;
+    sourceAfterRetrySleep = 0;
 }
 
 static void TestReusedZeroHandleLeases(void)
@@ -258,6 +271,56 @@ static void TestLargeBrightnessRange(void)
     CHECK(lastWrite == 100 && monitor.brightnessCur == 100);
 }
 
+static void TestIndependentSourceAndBrightnessRecovery(void)
+{
+    BrightMonitor monitor = MakeDdc(0);
+    ResetMocks();
+    monitor.controllable = FALSE;
+    readings[0].success = FALSE;
+    CHECK(Monitor_ReadSourceSync(&monitor));
+    CHECK(monitor.sourceKnown && monitor.currentInput == 0x0F && !monitor.controllable);
+    CHECK(!Monitor_ReadBrightnessSync(&monitor) && !monitor.controllable);
+    readings[0].success = TRUE;
+    readings[0].maximum = readings[0].minimum;
+    CHECK(!Monitor_ReadBrightnessSync(&monitor) && !monitor.controllable);
+    readings[0].maximum = 90;
+    CHECK(Monitor_ReadBrightnessSync(&monitor) && monitor.controllable);
+    CHECK(monitor.brightnessMin == 10 && monitor.brightnessCur == 50 && monitor.brightnessMax == 90);
+    readings[0].success = FALSE;
+    CHECK(!Monitor_ReadBrightnessSync(&monitor) && monitor.controllable);
+    CHECK(monitor.brightnessMax == 90 && monitor.sourceKnown);
+    CHECK(setCalls == 0);
+}
+
+static void TestTransientSourceReadRetry(void)
+{
+    BrightMonitor monitor = MakeDdc(0);
+    ResetMocks();
+    monitor.sourceFilter = TRUE;
+    monitor.expectedInput = 0x0F;
+    sourceFailuresRemaining = 1;
+    CHECK(Monitor_ReadSourceSync(&monitor));
+    CHECK(sourceCalls == 2 && retrySleeps == 1 && monitor.currentInput == 0x0F);
+
+    sourceReadSuccess = FALSE;
+    CHECK(Monitor_SetBrightnessGuardedSync(&monitor, 40, NULL, NULL) == MONITOR_WRITE_SKIPPED);
+    CHECK(sourceCalls == 4 && retrySleeps == 2 && !monitor.sourceKnown && !monitor.currentInput);
+    CHECK(setCalls == 0); /* Cached success cannot authorize a write. */
+
+    sourceReadSuccess = TRUE;
+    sourceFailuresRemaining = 1;
+    sourceAfterRetrySleep = 0x12;
+    CHECK(Monitor_SetBrightnessGuardedSync(&monitor, 40, NULL, NULL) == MONITOR_WRITE_SKIPPED);
+    CHECK(sourceCalls == 6 && monitor.currentInput == 0x12 && setCalls == 0);
+
+    sourceInput = 0;
+    int slept = retrySleeps;
+    CHECK(!Monitor_ReadSourceSync(&monitor) && retrySleeps == slept);
+    CHECK(sourceCalls == 7); /* A valid API response with an invalid input stays unknown. */
+    monitor.hasHandle = FALSE;
+    CHECK(!Monitor_ReadSourceSync(&monitor) && sourceCalls == 7 && retrySleeps == slept);
+}
+
 static void TestExcludedMonitorsAreNeverWritten(void)
 {
     MonitorList view = { 0 };
@@ -317,7 +380,7 @@ static void TestSourceFilterChecksBeforeEveryWrite(void)
 
     sourceReadSuccess = FALSE;
     CHECK(Monitor_SetBrightnessGuardedSync(&monitor, 70, NULL, NULL) == MONITOR_WRITE_SKIPPED);
-    CHECK(sourceCalls == 3 && setCalls == 1 && !monitor.sourceKnown);
+    CHECK(sourceCalls == 4 && setCalls == 1 && !monitor.sourceKnown);
     CHECK(monitor.currentInput == 0);
     sourceReadSuccess = TRUE;
     sourceInput = 0;  /* Invalid replies also suspend control. */
@@ -326,27 +389,27 @@ static void TestSourceFilterChecksBeforeEveryWrite(void)
     sourceInput = 0x0F;
     monitor.expectedInput = 0;
     CHECK(!Monitor_SetBrightnessSync(&monitor, 70));
-    CHECK(sourceCalls == 5 && setCalls == 1);
+    CHECK(sourceCalls == 6 && setCalls == 1);
     monitor.expectedInput = 0x0F;
-    int expectedCalls = 6;
+    int expectedCalls = 7;
     CHECK(Monitor_SetBrightnessGuardedSync(&monitor, 70, RejectAfterSourceRead,
                                           &expectedCalls) == MONITOR_WRITE_CANCELLED);
     CHECK(setCalls == 1 && monitor.brightnessCur == 40);
     CHECK(Monitor_SetBrightnessSync(&monitor, 70));
-    CHECK(sourceCalls == 7 && setCalls == 2 && monitor.brightnessCur == 70);
+    CHECK(sourceCalls == 8 && setCalls == 2 && monitor.brightnessCur == 70);
     sourceInput = 256;
     CHECK(!Monitor_SetBrightnessSync(&monitor, 80));
-    CHECK(sourceCalls == 8 && !monitor.sourceKnown && monitor.currentInput == 0 && setCalls == 2);
+    CHECK(sourceCalls == 9 && !monitor.sourceKnown && monitor.currentInput == 0 && setCalls == 2);
 
     monitor.sourceFilter = FALSE;
     sourceReadSuccess = FALSE;
     CHECK(Monitor_SetBrightnessSync(&monitor, 80));
-    CHECK(sourceCalls == 8 && setCalls == 3);  /* Legacy unfiltered behavior. */
+    CHECK(sourceCalls == 9 && setCalls == 3);  /* Legacy unfiltered behavior. */
     monitor.sourceFilter = TRUE;
     monitor.backend = BACKEND_WMI;
     monitor.hasHandle = FALSE;
     CHECK(Monitor_SetBrightnessSync(&monitor, 90));
-    CHECK(sourceCalls == 8 && setCalls == 4 && monitor.brightnessCur == 90);
+    CHECK(sourceCalls == 9 && setCalls == 4 && monitor.brightnessCur == 90);
 }
 
 static void TestIdleRestoresExactRawBrightness(void)
@@ -395,12 +458,12 @@ static void TestIdleReleaseNeverBypassesUnknownOrChangedSource(void)
     CHECK(setCalls == 0 && sourceCalls == 2 && monitor.currentInput == 0x11);
     sourceReadSuccess = FALSE;
     CHECK(!Monitor_ReleaseIdleBrightness(&monitor, 80, 0x12));
-    CHECK(setCalls == 0 && sourceCalls == 3 && !monitor.sourceKnown);
+    CHECK(setCalls == 0 && sourceCalls == 4 && !monitor.sourceKnown);
     sourceReadSuccess = TRUE;
     sourceInput = 0;
     CHECK(!Monitor_ReleaseIdleBrightness(&monitor, 80, 0x12));
     sourceInput = 0x12;
-    int expectedCalls = 5;
+    int expectedCalls = 6;
     BOOL sourceUpdated = FALSE;
     CHECK(Monitor_SetBrightnessForPurposeGuardedSync(&monitor, 80, MONITOR_WRITE_IDLE_RELEASE,
         0x12, RejectAfterSourceRead, &expectedCalls, &sourceUpdated) == MONITOR_WRITE_CANCELLED);
@@ -420,7 +483,7 @@ static void TestIdleReleaseNeverBypassesUnknownOrChangedSource(void)
     monitor.excludedFromControl = FALSE;
     monitor.backend = BACKEND_WMI;
     CHECK(!Monitor_ReleaseIdleBrightness(&monitor, 80, 0x12));
-    CHECK(setCalls == 0 && sourceCalls == 6);
+    CHECK(setCalls == 0 && sourceCalls == 7);
 }
 
 static void TestIdleRequiresValidatedBaselineAndAppliedWrite(void)
@@ -497,6 +560,8 @@ int main(void)
     TestReusedZeroHandleLeases();
     TestFlushDoesNotWaitForEnumeration();
     TestRefreshValidatesReadings();
+    TestIndependentSourceAndBrightnessRecovery();
+    TestTransientSourceReadRetry();
     TestLargeBrightnessRange();
     TestExcludedMonitorsAreNeverWritten();
     TestSourceFilterChecksBeforeEveryWrite();

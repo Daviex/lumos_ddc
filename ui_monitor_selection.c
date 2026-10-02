@@ -9,7 +9,7 @@
 
 #define PICKER_WIDTH 790
 #define PICKER_HEIGHT 536
-#define PICKER_MAX_ROWS (MAX_MONITORS * 3)
+#define PICKER_MAX_ROWS (MAX_MONITORS * 4)
 #define PICKER_ALL 101
 #define PICKER_SELECTED 102
 #define PICKER_LIST 103
@@ -17,6 +17,7 @@
 #define PICKER_SOURCE_FILTER 105
 #define PICKER_INPUT 106
 #define PICKER_ASSOCIATE 107
+#define PICKER_IDLE_BLACK 108
 
 typedef struct {
     WCHAR key[MONITOR_SELECTION_KEY_LEN];
@@ -25,6 +26,7 @@ typedef struct {
     BOOL canAdd;
     BOOL checked;
     BOOL builtIn;
+    BOOL idleBlack;
     BOOL rulePresent;
     BOOL sourceFilter;
     DWORD expectedInput;
@@ -35,7 +37,7 @@ typedef struct {
 
 typedef struct {
     HWND owner, list, all, selected, apply, hint;
-    HWND sourceFilter, input, associate;
+    HWND sourceFilter, input, associate, idleBlack;
     MonitorSelection *destination;
     MonitorSelectionClosedCallback closed;
     SelectionRow rows[PICKER_MAX_ROWS];
@@ -55,6 +57,7 @@ static const WCHAR PICKER_CLASS[] = L"LumosMonitorSelection";
 static HINSTANCE g_pickerInstance;
 static HWND g_pickerWindow;
 static SelectionEdit *g_pickerPending;
+static ULONGLONG g_sourceTelemetryMaxAge = 10000;
 
 static int FindSelectionRow(const SelectionEdit *edit, const WCHAR *key)
 {
@@ -96,7 +99,7 @@ static void MergeSelectionTelemetry(SelectionEdit *edit, const MonitorList *moni
     if (!monitors) return;
     for (int i = 0; i < monitors->count && i < MAX_MONITORS; i++) {
         const BrightMonitor *monitor = &monitors->monitors[i];
-        if (!monitor->controllable) continue;
+        if (!monitor->controllable && !(monitor->backend == BACKEND_DDC && monitor->hasHandle)) continue;
         WCHAR key[MONITOR_SELECTION_KEY_LEN] = { 0 };
         BOOL identified = Settings_MonitorKey(monitor, key);
         int match = identified ? FindSelectionRow(edit, key) : -1;
@@ -156,6 +159,15 @@ static void BuildSelectionRows(SelectionEdit *edit, const MonitorSelection *sele
         row->sourceFilter = rule->enabled;
         row->expectedInput = rule->input;
     }
+    for (int i = 0; i < selection->idleBlackCount && i < MAX_MONITORS; i++) {
+        if (!Settings_MonitorKeyValid(selection->idleBlackKeys[i])) continue;
+        int match = FindSelectionRow(edit, selection->idleBlackKeys[i]);
+        if (match < 0 && edit->count < PICKER_MAX_ROWS) {
+            match = edit->count;
+            AddSavedRow(edit, selection->idleBlackKeys[i], selection->idleBlackNames[i]);
+        }
+        if (match >= 0) edit->rows[match].idleBlack = TRUE;
+    }
     /* Switching from the default All mode starts with connected, identifiable
        displays checked, while a saved custom selection keeps its own choices. */
     if (!selection->selectedOnly && selection->count == 0) {
@@ -185,6 +197,12 @@ static BOOL CommitMonitorSelection(SelectionEdit *edit)
             StringCchCopyW(result.keys[result.count], MONITOR_SELECTION_KEY_LEN, row->key);
             StringCchCopyW(result.names[result.count], 128, row->name);
             result.count++;
+        }
+        if (row->idleBlack) {
+            if (result.idleBlackCount >= MAX_MONITORS) return FALSE;
+            int index = result.idleBlackCount++;
+            StringCchCopyW(result.idleBlackKeys[index], MONITOR_SELECTION_KEY_LEN, row->key);
+            StringCchCopyW(result.idleBlackNames[index], 128, row->name);
         }
         if (!row->builtIn && (row->sourceFilter || row->expectedInput)) {
             if (result.inputRuleCount >= MAX_MONITORS) return FALSE;
@@ -217,10 +235,19 @@ static BOOL CanEditSource(const SelectionEdit *edit, const SelectionRow *row)
             SourceRuleCount(edit) < MAX_MONITORS);
 }
 
+static BOOL CanEditIdleBlack(const SelectionEdit *edit, const SelectionRow *row)
+{
+    if (!row->key[0] || !row->canAdd) return FALSE;
+    if (row->idleBlack) return TRUE;
+    int count = 0;
+    for (int i = 0; i < edit->count; i++) if (edit->rows[i].idleBlack) count++;
+    return count < MAX_MONITORS;
+}
+
 static BOOL SourceTelemetryCurrent(const SelectionRow *row)
 {
     return row->connected && row->sourceKnown && row->currentInput > 0 && row->currentInput <= 0xFF &&
-           GetTickCount64() - row->sourceCheckedTick <= 10000;
+           GetTickCount64() - row->sourceCheckedTick <= g_sourceTelemetryMaxAge;
 }
 
 static const WCHAR *SelectionRowStatus(const SelectionEdit *edit, const SelectionRow *row)
@@ -251,6 +278,7 @@ static void UpdateSelectionRow(SelectionEdit *edit, int index)
     ListView_SetItemText(edit->list, index, 1, expected);
     ListView_SetItemText(edit->list, index, 2, current);
     ListView_SetItemText(edit->list, index, 3, (WCHAR *)SelectionRowStatus(edit, row));
+    ListView_SetItemText(edit->list, index, 4, row->idleBlack ? L"True black" : L"Dim");
 }
 
 static SelectionRow *EditingRow(SelectionEdit *edit)
@@ -267,6 +295,8 @@ static void RefreshSourceEditor(SelectionEdit *edit, BOOL fillInput)
     EnableWindow(edit->input, enabled);
     EnableWindow(edit->associate, enabled && SourceTelemetryCurrent(row));
     SendMessageW(edit->sourceFilter, BM_SETCHECK, row && row->sourceFilter ? BST_CHECKED : BST_UNCHECKED, 0);
+    EnableWindow(edit->idleBlack, row && CanEditIdleBlack(edit, row));
+    SendMessageW(edit->idleBlack, BM_SETCHECK, row && row->idleBlack ? BST_CHECKED : BST_UNCHECKED, 0);
     if (!fillInput) return;
     SendMessageW(edit->input, CB_RESETCONTENT, 0, 0);
     int selected = 0;
@@ -344,17 +374,20 @@ static BOOL PopulateSelectionList(SelectionEdit *edit)
     LVCOLUMNW column = { 0 };
     column.mask = LVCF_TEXT | LVCF_WIDTH;
     column.pszText = L"Monitor";
-    column.cx = 235;
+    column.cx = 195;
     if (ListView_InsertColumn(edit->list, 0, &column) < 0) return FALSE;
     column.pszText = L"This PC input";
-    column.cx = 150;
+    column.cx = 125;
     if (ListView_InsertColumn(edit->list, 1, &column) < 0) return FALSE;
     column.pszText = L"Current input";
-    column.cx = 145;
+    column.cx = 125;
     if (ListView_InsertColumn(edit->list, 2, &column) < 0) return FALSE;
     column.pszText = L"Status";
-    column.cx = 208;
+    column.cx = 185;
     if (ListView_InsertColumn(edit->list, 3, &column) < 0) return FALSE;
+    column.pszText = L"Idle";
+    column.cx = 105;
+    if (ListView_InsertColumn(edit->list, 4, &column) < 0) return FALSE;
     edit->filling = TRUE;
     for (int i = 0; i < edit->count; i++) {
         SelectionRow *row = &edit->rows[i];
@@ -400,22 +433,25 @@ static LRESULT CALLBACK SelectionWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM 
                                    16, 76, PICKER_WIDTH - 32, 230, PICKER_LIST);
         edit->sourceFilter = PickerControl(hwnd, L"BUTTON", L"Only when showing this PC", BS_AUTOCHECKBOX | WS_TABSTOP,
                                            16, 318, 360, 24, PICKER_SOURCE_FILTER);
+        edit->idleBlack = PickerControl(hwnd, L"BUTTON", L"OLED: true black when idle", BS_AUTOCHECKBOX | WS_TABSTOP,
+                                        400, 318, 365, 24, PICKER_IDLE_BLACK);
         PickerControl(hwnd, L"STATIC", L"This PC input:", SS_LEFT, 16, 353, 100, 22, -1);
         edit->input = PickerControl(hwnd, WC_COMBOBOXW, L"", CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP,
                                     122, 348, 225, 230, PICKER_INPUT);
         edit->associate = PickerControl(hwnd, L"BUTTON", L"Use current input for this PC", BS_PUSHBUTTON | WS_TABSTOP,
                                         360, 346, 285, 28, PICKER_ASSOCIATE);
         PickerControl(hwnd, L"STATIC",
-                      L"Select a row to configure its source filter. Input names refer to ports on the monitor.\n"
-                      L"Use the current input only while that monitor is showing this PC.",
-                      SS_LEFT, 16, 385, PICKER_WIDTH - 32, 36, -1);
-        edit->hint = PickerControl(hwnd, L"STATIC", L"", SS_LEFT, 16, 435, PICKER_WIDTH - 32, 32, PICKER_HINT);
+                      L"Select a row to configure it. Input names refer to ports on the monitor.\n"
+                      L"Use the current input only while that monitor is showing this PC.\n"
+                      L"Black idle keeps video active and pauses Windows display standby while idle protection is enabled.",
+                      SS_LEFT, 16, 380, PICKER_WIDTH - 32, 56, -1);
+        edit->hint = PickerControl(hwnd, L"STATIC", L"", SS_LEFT, 16, 445, PICKER_WIDTH - 32, 32, PICKER_HINT);
         edit->apply = PickerControl(hwnd, L"BUTTON", L"Apply", BS_DEFPUSHBUTTON | WS_TABSTOP,
                                     PICKER_WIDTH - 198, 486, 84, 28, IDOK);
         HWND cancel = PickerControl(hwnd, L"BUTTON", L"Cancel", BS_PUSHBUTTON | WS_TABSTOP,
                                      PICKER_WIDTH - 104, 486, 88, 28, IDCANCEL);
         if (!edit->all || !edit->selected || !edit->list || !edit->hint || !edit->apply || !cancel ||
-            !edit->sourceFilter || !edit->input || !edit->associate)
+            !edit->sourceFilter || !edit->input || !edit->associate || !edit->idleBlack)
             return -1;
         if (!PopulateSelectionList(edit)) return -1;
         RefreshSelectionControls(edit);
@@ -426,6 +462,13 @@ static LRESULT CALLBACK SelectionWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM 
         switch (LOWORD(wp)) {
         case PICKER_ALL: edit->selectedOnly = FALSE; RefreshSelectionControls(edit); return 0;
         case PICKER_SELECTED: edit->selectedOnly = TRUE; RefreshSelectionControls(edit); return 0;
+        case PICKER_IDLE_BLACK: {
+            SelectionRow *row = EditingRow(edit);
+            if (row && CanEditIdleBlack(edit, row))
+                row->idleBlack = SendMessageW(edit->idleBlack, BM_GETCHECK, 0, 0) == BST_CHECKED;
+            RefreshSelectionControls(edit);
+            return 0;
+        }
         case PICKER_SOURCE_FILTER: {
             SelectionRow *row = EditingRow(edit);
             if (row && CanEditSource(edit, row)) {
@@ -589,6 +632,16 @@ BOOL UI_MonitorSelectionMessage(MSG *message)
 BOOL UI_MonitorSelectionIsOpen(void)
 {
     return g_pickerWindow != NULL;
+}
+
+void UI_MonitorSelectionSetSourcePollInterval(UINT milliseconds)
+{
+    if (milliseconds < MIN_SOURCE_POLL_SECONDS * 1000u) milliseconds = MIN_SOURCE_POLL_SECONDS * 1000u;
+    if (milliseconds > MAX_SOURCE_POLL_SECONDS * 1000u) milliseconds = MAX_SOURCE_POLL_SECONDS * 1000u;
+    /* Allow the next scheduled read to complete, retaining the previous 10s
+       floor for normal short intervals. Failed reads still clear known input. */
+    g_sourceTelemetryMaxAge = (ULONGLONG)milliseconds + 5000;
+    if (g_sourceTelemetryMaxAge < 10000) g_sourceTelemetryMaxAge = 10000;
 }
 
 void UI_MonitorSelectionRefresh(const MonitorList *monitors)

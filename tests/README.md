@@ -10,6 +10,8 @@ Running it does not launch Lumos or change the registry or configuration files.
 Input-source rules are covered independently of selection: saved port/filter
 round trips, unchecked/offline retention, identity reorder, duplicate/corrupt
 rules and fail-closed handling of unassigned inputs.
+The source polling interval covers the legacy 3-second default, persistence of
+every whole-second value from 1 to 60, and bounds on malformed values.
 
 From the repository root with a Windows Clang/MinGW toolchain in `PATH`:
 Create the `build` directory first if it does not exist.
@@ -34,7 +36,9 @@ handle leases are released after replacement, reset and shutdown. Pending target
 snapshots preserve the latest write intent without including refresh reads.
 Refresh and hardware failure paths are also covered. It never accesses physical
 monitors.
-Source-only polling includes suspended displays. Tests block a source read while
+Source polling includes suspended displays and physical DDC monitors whose
+initial brightness read failed. Recovery reports validated brightness separately
+from source availability and never performs a native write. Tests block a source read while
 changing a target or resetting the worker, ensuring no obsolete native write
 follows it. Source telemetry, intentional skips and hardware failures have
 distinct results, and brightness refreshes cannot overwrite source telemetry.
@@ -58,6 +62,10 @@ reads/writes/destruction, WMI and the worker. Enumeration is never invoked. It
 checks shared handle leases (including valid handle zero), queued ownership,
 nonblocking cleanup during enumeration, rejected invalid readings and scaling
 across the full 32-bit brightness range.
+Transient source errors are retried once after 100 ms; persistent failures and
+invalid replies cannot authorize writes from cached telemetry. Brightness
+capability recovers independently, without revoking previously validated values
+after another failed read.
 Excluded displays are checked at the preview, DDC/WMI write, group and active
 monitor boundaries to ensure their brightness remains unchanged.
 Idle dimming captures a fresh, validated native brightness only on a successful
@@ -119,11 +127,27 @@ hotkeys and reordered rescan results leave a second, excluded monitor unchanged.
 Source suspension and return also cover latest-target resume, idle/schedule
 precedence, reconnect, source-rule edits, filter removal and polling without a
 Windows topology event. Skips and unknown reads must never trigger rescans.
+Runtime source-timer checks cover all intervals from 1 to 60 seconds and align
+the picker freshness window with the saved timer interval.
 Idle handoff tests keep the PC idle while only a second monitor changes input:
 it restores its original raw brightness, dims again on return, and preserves the
 same baseline across repeated switches while leaving the first monitor dimmed.
 They also cover failed releases, wake/re-idle with queued work, rule edits, and
 applied results superseded by newer requests or a uniquely matched rescan.
+Mixed OLED/LCD idle checks verify that black-idle displays receive no idle
+brightness write and no manual-policy brightness restore when input returns.
+
+`test_idle_black.c` exercises the overlay with mocked windows, monitor geometry,
+last-input timestamps, source selection and power requests. It verifies an
+opaque cover over the full monitor (including negative desktop coordinates),
+prompt wake, failed input/timer setup, session lock and cleanup. An offscreen
+GDI DIB verifies that every painted pixel is RGB 0,0,0. No screen is covered
+and no real execution-state request is made.
+
+```powershell
+clang -std=c11 -Wall -Wextra -Werror -DUNICODE -D_UNICODE tests/test_idle_black.c brightness.c -lgdi32 -luser32 -o build/test_idle_black.exe
+./build/test_idle_black.exe
+```
 
 ```powershell
 clang -O2 -std=c11 -Wall -Wextra -Werror -DUNICODE -D_UNICODE -ffunction-sections -fdata-sections tests/test_startup.c brightness.c schedule.c monitor_selection.c '-Wl,--gc-sections' -lshell32 -o build/test_startup.exe
@@ -135,6 +159,10 @@ with mocked window APIs. It checks All/custom choices, Apply/Cancel isolation,
 parent Save, retained offline selections, reordered displays, ambiguous identities,
 selection limits and keyboard navigation. It does not create windows or access
 hardware, the registry or configuration files.
+The Settings slider covers whole-second click/drag, wheel and keyboard changes,
+exact drag release, capture loss, Save/Cancel isolation and long polling telemetry.
+Its real renderer draws to offscreen DIBs; optional `--preview` saves 3-second
+and 60-second Settings BMP previews under `build` for visual inspection.
 
 ```powershell
 clang -O2 -std=c11 -Wall -Wextra -Werror -DUNICODE -D_UNICODE -ffunction-sections -fdata-sections tests/test_monitor_selection_ui.c monitor_selection.c schedule.c ui_graphics.c '-Wl,--gc-sections' -lgdi32 -luser32 -lshell32 -ldwmapi -lcomctl32 -o build/test_monitor_selection_ui.exe

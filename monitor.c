@@ -435,22 +435,15 @@ static BOOL CALLBACK MonitorEnumProc(HMONITOR hMon, HDC hdcMon, LPRECT lpRect, L
             bm->name[127] = L'\0';
             LogW("    Friendly name", bm->name);
 
-            /* A monitor that answers a brightness read is controllable, which is
-               the only signal we need. */
-            bm->backend = BACKEND_NONE;
+            /* Physical DDC identity/source access survives a failed brightness
+               read. Brightness capability is recovered independently later. */
+            bm->backend = BACKEND_DDC;
             bm->controllable = FALSE;
             bm->wmiInstance[0] = L'\0';
 
-            DWORD bMin = 0, bCur = 0, bMax = 0;
-            BOOL brOk = GetMonitorBrightness(phys[i].hPhysicalMonitor, &bMin, &bCur, &bMax);
-
-            if (brOk && bMax > bMin && bCur >= bMin && bCur <= bMax) {
-                bm->backend = BACKEND_DDC;
-                bm->controllable = TRUE;
-                bm->brightnessMin = bMin;
-                bm->brightnessCur = bCur;
-                bm->brightnessMax = bMax;
-                Log("    Brightness: min=%lu cur=%lu max=%lu", bMin, bCur, bMax);
+            if (Monitor_ReadBrightnessSync(bm)) {
+                Log("    Brightness: min=%lu cur=%lu max=%lu",
+                    bm->brightnessMin, bm->brightnessCur, bm->brightnessMax);
             } else if (TryAttachWmiPanel(ctx, hMon, bm)) {
                 /* Internal laptop panel: no DDC, but WMI backlight works. */
                 Log("    Using WMI backlight backend");
@@ -526,32 +519,37 @@ void Monitor_Cleanup(MonitorList *ml)
     memset(ml, 0, sizeof(*ml));
 }
 
+BOOL Monitor_ReadBrightnessSync(BrightMonitor *bm)
+{
+    if (bm->backend == BACKEND_DDC && bm->hasHandle) {
+        DWORD minimum, current, maximum;
+        BOOL ok = GetMonitorBrightness(bm->hPhysical,
+                                       &minimum, &current, &maximum);
+        if (ok && maximum > minimum && current >= minimum && current <= maximum) {
+            bm->brightnessMin = minimum;
+            bm->brightnessCur = current;
+            bm->brightnessMax = maximum;
+            bm->controllable = TRUE;
+            return TRUE;
+        }
+    } else if (bm->backend == BACKEND_WMI) {
+        DWORD pct = 0;
+        if (Wmi_GetBrightness(bm->wmiInstance, &pct) && pct <= 100) {
+            bm->brightnessCur = pct;   /* WMI range is fixed 0-100 */
+            bm->controllable = TRUE;
+            return TRUE;
+        }
+    }
+    /* Transient failures cannot revoke previously validated capability/values. */
+    return FALSE;
+}
+
 DWORD Monitor_RefreshBrightnessSync(MonitorList *ml)
 {
     DWORD readMask = 0;
     for (int i = 0; i < ml->count; i++) {
-        BrightMonitor *bm = &ml->monitors[i];
-        if (bm->backend == BACKEND_DDC && bm->hasHandle) {
-            DWORD minimum, current, maximum;
-            BOOL ok = GetMonitorBrightness(bm->hPhysical,
-                                 &minimum, &current, &maximum);
-            if (ok && maximum > minimum && current >= minimum && current <= maximum) {
-                bm->brightnessMin = minimum;
-                bm->brightnessCur = current;
-                bm->brightnessMax = maximum;
-                readMask |= 1u << i;
-            } else {
-                Log("RefreshBrightness[%d] FAILED, err=%lu", i, GetLastError());
-            }
-        } else if (bm->backend == BACKEND_WMI) {
-            DWORD pct = 0;
-            if (Wmi_GetBrightness(bm->wmiInstance, &pct) && pct <= 100) {
-                bm->brightnessCur = pct;   /* WMI range is fixed 0-100 */
-                readMask |= 1u << i;
-            } else {
-                Log("RefreshBrightness[%d] WMI failed", i);
-            }
-        }
+        if (Monitor_ReadBrightnessSync(&ml->monitors[i])) readMask |= 1u << i;
+        else Log("RefreshBrightness[%d] FAILED, err=%lu", i, GetLastError());
     }
     return readMask;
 }
@@ -563,6 +561,14 @@ BOOL Monitor_ReadSourceSync(BrightMonitor *mon)
     BOOL ok = mon->backend == BACKEND_DDC && mon->hasHandle &&
               GetVCPFeatureAndVCPFeatureReply(mon->hPhysical, 0x60, &type,
                                              &input, &maximum);
+    /* Some displays reject back-to-back DDC commands with a transient error.
+       Retry once after a short pause; never reuse a cached match to authorize a
+       write. This runs on the worker (or initial enumeration), not the UI. */
+    if (!ok && mon->backend == BACKEND_DDC && mon->hasHandle) {
+        Sleep(100);
+        ok = GetVCPFeatureAndVCPFeatureReply(mon->hPhysical, 0x60, &type,
+                                          &input, &maximum);
+    }
     mon->sourceKnown = ok && input > 0 && input <= 255;
     mon->currentInput = mon->sourceKnown ? input : 0;
     mon->sourceCheckedTick = GetTickCount64();

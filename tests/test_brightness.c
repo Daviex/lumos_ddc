@@ -131,6 +131,9 @@ static void TestDisplayIdentity(void)
     wcscpy(candidate.deviceInstance, source.deviceInstance);
     candidate.controllable = FALSE;
     CHECK(!Monitor_SameDisplay(&source, &candidate));
+    candidate.hasHandle = TRUE;
+    CHECK(Monitor_SameDisplay(&source, &candidate)); /* Physical identity survives failed brightness. */
+    candidate.hasHandle = FALSE;
     candidate.controllable = TRUE;
     candidate.backend = BACKEND_WMI;
     CHECK(!Monitor_SameDisplay(&source, &candidate));

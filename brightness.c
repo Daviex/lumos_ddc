@@ -97,7 +97,10 @@ int Brightness_TargetToSlider(const MonitorList *view, int target)
 BOOL Monitor_SameDisplay(const BrightMonitor *source, const BrightMonitor *candidate)
 {
     if (!source || !candidate || source->backend != candidate->backend ||
-        !candidate->controllable) return FALSE;
+        (!candidate->controllable && !(candidate->backend == BACKEND_DDC &&
+          candidate->hasHandle && candidate->deviceInstance[0]))) return FALSE;
+    /* A connected physical display keeps its stable identity through transient
+       brightness failures, so rescans cannot lose its pending idle restore. */
     if (source->backend == BACKEND_WMI)
         return _wcsicmp(source->wmiInstance, candidate->wmiInstance) == 0;
     if (source->deviceInstance[0] || candidate->deviceInstance[0])

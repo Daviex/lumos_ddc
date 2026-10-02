@@ -32,6 +32,7 @@ static int setAllCalls, setOneCalls, actualWrites, lastBase, lastUiTarget;
 static int refreshCalls, popupCalls, destroyCalls, workerResets, cleanupCalls;
 static int timerCalls, killCalls;
 static int sourceRefreshCalls, pickerRefreshCalls;
+static UINT sourceTelemetryInterval;
 static BOOL pickerOpen;
 static DWORD mockPendingMask;
 static DWORD mockPendingTarget;
@@ -42,6 +43,8 @@ static int idleWrites, releaseWrites, cancelCalls;
 static BOOL mockWorkerRunning;
 static BOOL mockReleaseSucceeds;
 static int releaseRequests;
+static int blackUpdates, blackClears;
+static BOOL blackIdle, blackEnabled;
 static int osdCalls, osdPercent;
 static HMONITOR osdMonitor;
 static UINT_PTR lastTimer;
@@ -241,6 +244,17 @@ void Monitor_Cleanup(MonitorList *view)
 }
 
 void MonitorWorker_Reset(void) { workerResets++; }
+void IdleBlack_Init(HINSTANCE instance, HWND owner) { (void)instance; (void)owner; }
+void IdleBlack_Update(const MonitorList *view, BOOL enabled, BOOL idle)
+{
+    CHECK(view == &g_monitors);
+    blackUpdates++;
+    blackIdle = idle;
+    blackEnabled = enabled;
+}
+void IdleBlack_Clear(void) { blackClears++; blackIdle = FALSE; }
+void IdleBlack_SetSessionLocked(BOOL locked) { (void)locked; }
+void IdleBlack_Shutdown(void) { CHECK(FALSE); }
 BOOL MonitorWorker_Running(void) { return mockWorkerRunning; }
 void MonitorWorker_Cancel(BrightMonitor *monitor)
 {
@@ -281,6 +295,7 @@ DWORD MonitorWorker_PendingTargets(MonitorTarget targets[MAX_MONITORS])
 }
 
 void UI_SetMasterTarget(int target) { lastUiTarget = target; }
+void UI_MonitorSelectionSetSourcePollInterval(UINT milliseconds) { sourceTelemetryInterval = milliseconds; }
 void UI_RefreshPopup(HWND hwnd, MonitorList *view)
 {
     CHECK((hwnd == NULL || hwnd == testPopup) && view == &g_monitors);
@@ -298,6 +313,7 @@ static BrightMonitor MakeMonitor(BOOL controllable, int percent)
     BrightMonitor monitor = {0};
     monitor.controllable = controllable;
     monitor.backend = controllable ? BACKEND_DDC : BACKEND_NONE;
+    monitor.hasHandle = controllable;
     monitor.brightnessMax = 100;
     monitor.brightnessCur = (DWORD)percent;
     monitor.delta = mockDelta;
@@ -321,6 +337,7 @@ static void ResetState(void)
     g_masterTargetValid = FALSE;
     g_idleDimmed = FALSE;
     g_idleEpoch = 0;
+    g_settings.sourcePollSeconds = DEFAULT_SOURCE_POLL_SECONDS;
     nowMinute = 570; /* 09:30 */
     nowDay = 1;
     dayValue = 82;
@@ -330,6 +347,7 @@ static void ResetState(void)
     refreshCalls = popupCalls = destroyCalls = workerResets = cleanupCalls = 0;
     timerCalls = killCalls = 0;
     sourceRefreshCalls = pickerRefreshCalls = 0;
+    sourceTelemetryInterval = 0;
     pickerOpen = FALSE;
     mockPendingMask = mockPendingTarget = 0;
     acceptResult = TRUE;
@@ -339,6 +357,8 @@ static void ResetState(void)
     mockWorkerRunning = FALSE;
     mockReleaseSucceeds = TRUE;
     releaseRequests = 0;
+    blackUpdates = blackClears = 0;
+    blackIdle = blackEnabled = FALSE;
     osdCalls = osdPercent = 0;
     osdMonitor = NULL;
     lastTimer = lastKilledTimer = 0;
@@ -1245,6 +1265,89 @@ static void TestSourcePollingAndRuleChanges(void)
     CHECK(actualWrites == writes);
 }
 
+static void TestPollingAndPolicyAfterBrightnessRecovery(void)
+{
+    for (int scenario = 0; scenario < 5; scenario++) {
+        ResetState();
+        AddReadyMonitor();
+        BrightMonitor *monitor = &g_monitors.monitors[0];
+        monitor->controllable = FALSE;
+        monitor->delta = 0;
+        monitor->sourceFilter = TRUE;
+        monitor->expectedInput = 0x0F;
+        monitor->desiredBrightnessValid = TRUE;
+        monitor->desiredBrightness = 62;
+        monitor->excludedFromControl = scenario == 4;
+        g_idleDimmed = scenario == 1;
+        g_settings.idleDimPercent = 5;
+        HandleTimer(testWindow, SOURCE_TIMER_ID);
+        CHECK(sourceRefreshCalls == (scenario == 4 ? 0 : 1));
+
+        MonitorResult *result = (MonitorResult *)calloc(1, sizeof(*result));
+        CHECK(result != NULL);
+        if (!result) return;
+        result->kind = MONITOR_RESULT_SOURCE;
+        result->sourceUpdated = TRUE;
+        result->sourceKnown = scenario != 3;
+        result->currentInput = scenario == 2 ? 0x12 : scenario == 3 ? 0 : 0x0F;
+        result->brightnessUpdated = TRUE;
+        result->minimum = 0;
+        result->current = 80;
+        result->maximum = 100;
+        HandleMonitorResult(testWindow, result);
+        CHECK(monitor->controllable && monitor->brightnessMax == 100);
+        if (scenario == 0) CHECK(actualWrites == 1 && monitor->brightnessCur == 62);
+        else if (scenario == 1) {
+            CHECK(actualWrites == 1 && idleWrites == 1 && monitor->brightnessCur == 5);
+            CHECK(monitor->preIdleBrightnessValid && monitor->preIdleBrightness == 80);
+        } else CHECK(actualWrites == 0 && monitor->brightnessCur == 80);
+    }
+    ResetState();
+    AddReadyMonitor();
+    g_monitors.monitors[0].controllable = FALSE;
+    HandleTimer(testWindow, SOURCE_TIMER_ID);
+    CHECK(sourceRefreshCalls == 1); /* Retry discovery even with no source filter. */
+}
+
+static void TestIdleStateSurvivesUnavailableBrightnessOnRescan(void)
+{
+    ResetState();
+    ConfigureTwoFilteredMonitors();
+    g_settings.monitorSelection.inputRuleCount = 2;
+    for (int i = 0; i < g_monitors.count; i++) {
+        MonitorInputRule *rule = &g_settings.monitorSelection.inputRules[i];
+        CHECK(Settings_MonitorKey(&g_monitors.monitors[i], rule->key));
+        rule->enabled = TRUE;
+        rule->input = 0x0F;
+    }
+    Idle_Dim();
+    MonitorList *fresh = (MonitorList *)calloc(1, sizeof(*fresh));
+    CHECK(fresh != NULL);
+    if (!fresh) return;
+    *fresh = g_monitors;
+    fresh->monitors[1].controllable = FALSE;
+    fresh->monitors[1].preIdleBrightnessValid = FALSE;
+    fresh->monitors[1].idleApplied = FALSE;
+    fresh->monitors[1].idleEpoch = 0;
+    AdoptMonitorList(fresh);
+    BrightMonitor *second = &g_monitors.monitors[1];
+    CHECK(!second->controllable && second->preIdleBrightnessValid && second->preIdleBrightness == 128);
+    CHECK(second->idleApplied && second->idleEpoch != 0);
+    MonitorResult *result = (MonitorResult *)calloc(1, sizeof(*result));
+    CHECK(result != NULL);
+    if (!result) return;
+    result->index = 1;
+    result->kind = MONITOR_RESULT_SOURCE;
+    result->sourceUpdated = result->sourceKnown = result->brightnessUpdated = TRUE;
+    result->currentInput = 0x12;
+    result->current = 12;
+    result->maximum = 255;
+    HandleMonitorResult(testWindow, result);
+    CHECK(second->controllable && !second->idleApplied && releaseWrites == 1);
+    CHECK(second->brightnessCur == 128 && second->preIdleBrightness == 128);
+    CHECK(g_idleDimmed && g_monitors.monitors[0].brightnessCur == 5);
+}
+
 static void TestSourceResumeAfterRescanAndFilterRemoval(void)
 {
     ResetState();
@@ -1317,6 +1420,56 @@ static void TestSuspendedIntentSurvivesScopeChange(void)
     CHECK(g_monitors.monitors[0].sourceKnown && g_monitors.monitors[0].currentInput == 0x0f);
 }
 
+static void TestOledBlackIdleKeepsPanelBrightness(void)
+{
+    ResetState();
+    g_settings.idleDimEnabled = TRUE;
+    g_settings.idleDimPercent = 5;
+    g_masterTarget = 73;
+    g_masterTargetValid = TRUE;
+    g_monitors.count = 2;
+    g_monitors.monitors[0] = MakeMonitor(TRUE, 73);
+    g_monitors.monitors[1] = MakeMonitor(TRUE, 62);
+    g_monitors.monitors[0].delta = g_monitors.monitors[1].delta = 0;
+    g_monitors.monitors[1].idleBlack = TRUE;
+    Idle_Dim();
+    CHECK(g_idleDimmed && blackIdle && blackEnabled && blackUpdates > 0);
+    CHECK(idleWrites == 1 && g_monitors.monitors[0].brightnessCur == 5);
+    CHECK(g_monitors.monitors[1].brightnessCur == 62);
+    CHECK(!g_monitors.monitors[1].preIdleBrightnessValid && !g_monitors.monitors[1].idleApplied);
+    ReapplyBrightness();
+    CHECK(g_monitors.monitors[1].brightnessCur == 62);
+    int before = setOneCalls;
+    Idle_Restore();
+    CHECK(!g_idleDimmed && !blackIdle && blackClears > 0);
+    CHECK(setOneCalls == before + 1 && g_monitors.monitors[0].brightnessCur == 73);
+    CHECK(g_monitors.monitors[1].brightnessCur == 62);
+    Idle_Dim();
+    ManualChange();
+    CHECK(!g_idleDimmed && !blackIdle);
+}
+
+static void TestConfiguredSourcePollingTimer(void)
+{
+    ResetState();
+    RestartSourcePolling();
+    CHECK(lastTimer == SOURCE_TIMER_ID && lastInterval == 3000);
+    CHECK(sourceTelemetryInterval == 3000);
+    for (int seconds = 1; seconds <= 60; seconds++) {
+        g_settings.sourcePollSeconds = seconds;
+        RestartSourcePolling();
+        CHECK(lastTimer == SOURCE_TIMER_ID && lastInterval == (UINT)seconds * 1000u);
+        CHECK(sourceTelemetryInterval == lastInterval);
+    }
+    g_settings.sourcePollSeconds = 0;
+    RestartSourcePolling();
+    CHECK(g_settings.sourcePollSeconds == 1 && lastInterval == 1000);
+    g_settings.sourcePollSeconds = 100;
+    RestartSourcePolling();
+    CHECK(g_settings.sourcePollSeconds == 60 && lastInterval == 60000);
+    CHECK(sourceRefreshCalls == 0 && actualWrites == 0); /* Saving the interval only re-arms its timer. */
+}
+
 int main(void)
 {
     (void)UnusedApplicationEntryPoint; /* Compile the entry point; never run it. */
@@ -1346,8 +1499,12 @@ int main(void)
     TestReorderedRescanReconcilesAppliedIdleByIdentity();
     TestCrossResetIdleAcknowledgementRejectsChangedIdentityOrPolicy();
     TestSourcePollingAndRuleChanges();
+    TestConfiguredSourcePollingTimer();
+    TestPollingAndPolicyAfterBrightnessRecovery();
+    TestIdleStateSurvivesUnavailableBrightnessOnRescan();
     TestSourceResumeAfterRescanAndFilterRemoval();
     TestSuspendedIntentSurvivesScopeChange();
+    TestOledBlackIdleKeepsPanelBrightness();
     if (failures) {
         printf("startup: %d failure(s)\n", failures);
         return 1;

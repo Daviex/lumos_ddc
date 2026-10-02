@@ -24,6 +24,7 @@ static int resultCount, resultHead;
 static volatile LONG writes, refreshes, retains, releases, leases;
 static volatile LONG writeSuccess, refreshMask;
 static volatile LONG sourceReads, sourceInput, sourceSuccess;
+static volatile LONG brightnessReads, brightnessReadSuccess;
 static DWORD writtenValues[RESULT_CAPACITY];
 
 static LONG ReadCounter(volatile LONG *counter)
@@ -138,6 +139,15 @@ DWORD Monitor_RefreshBrightnessSync(MonitorList *view)
     return (DWORD)ReadCounter(&refreshMask);
 }
 
+BOOL Monitor_ReadBrightnessSync(BrightMonitor *monitor)
+{
+    InterlockedIncrement(&brightnessReads);
+    if (!ReadCounter(&brightnessReadSuccess)) return FALSE;
+    Monitor_PreviewBrightness(monitor, 73);
+    monitor->controllable = TRUE;
+    return TRUE;
+}
+
 #define PostMessageW CapturePostMessageW
 #include "../monitor_worker.c"
 
@@ -172,6 +182,8 @@ static void StartTest(MonitorList *view, BOOL blockWrites, BOOL blockRefresh)
     sourceReads = 0;
     sourceInput = 0x0F;
     sourceSuccess = TRUE;
+    brightnessReads = 0;
+    brightnessReadSuccess = TRUE;
     refreshMask = 1;
     memset(writtenValues, 0, sizeof(writtenValues));
     CHECK(MonitorWorker_Start((HWND)(UINT_PTR)1, view));
@@ -547,8 +559,44 @@ static void TestSourcePollingScope(void)
         CHECK(MonitorWorker_Accept(result));
     }
     free(result);
+    result = WaitResult();
+    if (result) {
+        CHECK(result->index == 3 && result->kind == MONITOR_RESULT_SOURCE);
+        CHECK(result->brightnessUpdated && !result->brightnessWritten && result->current == 73);
+        CHECK(result->sourceKnown && MonitorWorker_Accept(result));
+    }
+    free(result);
     FinishTest();
-    CHECK(ReadCounter(&sourceReads) == 1 && ReadCounter(&refreshes) == 0);
+    CHECK(ReadCounter(&sourceReads) == 2 && ReadCounter(&refreshes) == 0);
+    CHECK(ReadCounter(&brightnessReads) == 1 && ReadCounter(&writes) == 0);
+}
+
+static void TestSourcePollingWithoutBrightnessCapability(void)
+{
+    MonitorList view = MakeView();
+    view.monitors[0].controllable = FALSE;
+    StartTest(&view, FALSE, FALSE);
+    InterlockedExchange(&brightnessReadSuccess, FALSE);
+    MonitorWorker_RefreshSources(&view, FALSE); /* No filter is needed to retry discovery. */
+    MonitorResult *result = WaitResult();
+    if (result) {
+        CHECK(result->kind == MONITOR_RESULT_SOURCE && result->sourceKnown);
+        CHECK(!result->brightnessUpdated && !result->brightnessWritten);
+        CHECK(MonitorWorker_Accept(result));
+    }
+    free(result);
+    InterlockedExchange(&brightnessReadSuccess, TRUE);
+    MonitorWorker_RefreshSources(&view, FALSE);
+    result = WaitResult();
+    if (result) {
+        CHECK(result->kind == MONITOR_RESULT_SOURCE && result->sourceKnown);
+        CHECK(result->brightnessUpdated && !result->brightnessWritten && result->current == 73);
+        CHECK(MonitorWorker_Accept(result));
+    }
+    free(result);
+    FinishTest();
+    CHECK(ReadCounter(&sourceReads) == 2 && ReadCounter(&brightnessReads) == 2);
+    CHECK(ReadCounter(&writes) == 0);
 }
 
 static void TestIdleReleasePurposeAndTelemetry(void)
@@ -682,6 +730,7 @@ int main(void)
     TestSourcePollingAndWriteOutcomes();
     TestSourceReadCancellation();
     TestSourcePollingScope();
+    TestSourcePollingWithoutBrightnessCapability();
     TestIdleReleasePurposeAndTelemetry();
     TestIdleReleaseRechecksSourceAndCancelsPerMonitor();
     TestAppliedIdleIdentitySurvivesReset();

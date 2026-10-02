@@ -11,6 +11,7 @@
 #include <string.h>
 #include "../ui.h"
 #include "../ui_monitor_selection.h"
+#include "../ui_graphics.h"
 
 static int failures, destroys, saveNotifications;
 static const HWND testParent = (HWND)(UINT_PTR)1;
@@ -18,6 +19,9 @@ static const HWND testPicker = (HWND)(UINT_PTR)2;
 static const HWND testOwner = (HWND)(UINT_PTR)3;
 static LONG_PTR pickerUserData;
 static ULONGLONG sourceTestTick = 20000;
+static HWND settingsCapture;
+static BYTE *settingsFrame;
+static int settingsFrameHeight;
 #define CHECK(condition) do { \
     if (!(condition)) { \
         printf("FAIL line %d: %s\n", __LINE__, #condition); \
@@ -29,18 +33,51 @@ static BOOL WINAPI MockDestroyWindow(HWND);
 static BOOL WINAPI MockPostMessageW(HWND, UINT, WPARAM, LPARAM);
 static LONG_PTR WINAPI MockGetWindowLongPtrW(HWND, int);
 static ULONGLONG WINAPI MockGetTickCount64(void) { return sourceTestTick; }
+static HWND WINAPI MockGetCapture(void) { return settingsCapture; }
+static HWND WINAPI MockSetCapture(HWND window) { HWND old = settingsCapture; settingsCapture = window; return old; }
+static BOOL WINAPI MockReleaseCapture(void) { settingsCapture = NULL; return TRUE; }
+static BOOL WINAPI MockScreenToClient(HWND window, LPPOINT point) { (void)window; (void)point; return TRUE; }
+static BOOL MockSettingsCommit(HWND window, HDC dc, int width, int height);
 
 #undef GetWindowLongPtrW
 #define GetWindowLongPtrW MockGetWindowLongPtrW
 #define DestroyWindow MockDestroyWindow
 #define PostMessageW MockPostMessageW
 #define GetTickCount64 MockGetTickCount64
+#define GetCapture MockGetCapture
+#define SetCapture MockSetCapture
+#define ReleaseCapture MockReleaseCapture
+#define ScreenToClient MockScreenToClient
+#define UI_CommitLayered MockSettingsCommit
 #include "../ui_monitor_selection.c"
 #include "../ui.c"
 #undef GetWindowLongPtrW
 #undef DestroyWindow
 #undef PostMessageW
 #undef GetTickCount64
+#undef GetCapture
+#undef SetCapture
+#undef ReleaseCapture
+#undef ScreenToClient
+#undef UI_CommitLayered
+
+static BOOL MockSettingsCommit(HWND window, HDC dc, int width, int height)
+{
+    CHECK(window == testParent && width == SET_WIDTH);
+    DIBSECTION dib = {0};
+    HBITMAP bitmap = (HBITMAP)GetCurrentObject(dc, OBJ_BITMAP);
+    CHECK(GetObjectW(bitmap, sizeof(dib), &dib) == sizeof(dib));
+    CHECK(dib.dsBm.bmBits != NULL && dib.dsBm.bmBitsPixel == 32);
+    if (!dib.dsBm.bmBits) return FALSE;
+    GdiFlush();
+    BYTE *frame = (BYTE *)realloc(settingsFrame, (size_t)width * height * 4);
+    CHECK(frame != NULL);
+    if (!frame) return FALSE;
+    settingsFrame = frame;
+    settingsFrameHeight = height;
+    memcpy(settingsFrame, dib.dsBm.bmBits, (size_t)width * height * 4);
+    return TRUE;
+}
 
 static BOOL WINAPI MockDestroyWindow(HWND window)
 {
@@ -96,6 +133,11 @@ static void InitParent(SetEditData *parent, Settings *settings)
     parent->step = settings->step;
     parent->idleDimPercent = settings->idleDimPercent;
     parent->idleDimMinutes = settings->idleDimMinutes;
+    parent->autostart = settings->autostart;
+    parent->idleDimEnabled = settings->idleDimEnabled;
+    parent->scheduleEnabled = settings->scheduleEnabled;
+    parent->sourcePollSeconds = Settings_ClampSourcePollSeconds(settings->sourcePollSeconds);
+    parent->activeSliderRow = -1;
     parent->keyboardRow = -1;
     BuildSettingsRows(parent);
 }
@@ -186,6 +228,30 @@ static LRESULT TryCheckRow(SelectionEdit *picker, int row)
     change.uNewState = INDEXTOSTATEIMAGEMASK(2);
     pickerUserData = (LONG_PTR)picker;
     return SelectionWndProc(testPicker, WM_NOTIFY, 0, (LPARAM)&change);
+}
+
+static void TestConnectedMonitorWithoutBrightness(void)
+{
+    MonitorSelection selection = {0};
+    MonitorList view = {0};
+    view.count = 1;
+    view.monitors[0] = MakeMonitor(7);
+    view.monitors[0].controllable = FALSE;
+    view.monitors[0].hasHandle = TRUE;
+    view.monitors[0].sourceKnown = TRUE;
+    view.monitors[0].currentInput = 0x0F;
+    view.monitors[0].sourceCheckedTick = sourceTestTick;
+    SaveIdentity(&selection, &view.monitors[0]);
+    selection.selectedOnly = TRUE;
+    SelectionEdit picker = {0};
+    BuildSelectionRows(&picker, &selection, &view);
+    CHECK(picker.count == 1 && picker.rows[0].connected && picker.rows[0].checked);
+    CHECK(picker.rows[0].canAdd && SourceTelemetryCurrent(&picker.rows[0]));
+    CHECK(picker.rows[0].currentInput == 0x0F);
+    CHECK(CanEditSource(&picker, &picker.rows[0]) && CanEditIdleBlack(&picker, &picker.rows[0]));
+    view.monitors[0].sourceKnown = FALSE;
+    MergeSelectionTelemetry(&picker, &view);
+    CHECK(picker.rows[0].connected && !SourceTelemetryCurrent(&picker.rows[0]));
 }
 
 static void TestLimitsAndUnusableIdentities(void)
@@ -368,14 +434,180 @@ static void TestSourceStatusAndBuiltIn(void)
     CHECK(wcscmp(text, L"Input 0x99") == 0);
 }
 
-int main(void)
+static void TestBlackIdleOfflineAndBuiltInWorkingCopy(void)
 {
+    MonitorSelection live = {0};
+    live.idleBlackCount = 1;
+    wcscpy(live.idleBlackKeys[0], L"DDC:OFFLINE-OLED");
+    wcscpy(live.idleBlackNames[0], L"Disconnected OLED");
+    MonitorList view = {0};
+    view.count = 1;
+    view.monitors[0] = MakeMonitor(1);
+    view.monitors[0].backend = BACKEND_WMI;
+    wcscpy(view.monitors[0].wmiInstance, L"BUILT-IN-OLED");
+    SelectionEdit picker = {0};
+    MonitorSelection working = live;
+    picker.destination = &working;
+    BuildSelectionRows(&picker, &working, &view);
+    CHECK(picker.count == 2 && picker.rows[0].builtIn);
+    CHECK(CanEditIdleBlack(&picker, &picker.rows[0]));
+    CHECK(!CanEditSource(&picker, &picker.rows[0]));
+    picker.rows[0].idleBlack = TRUE;
+    MergeSelectionTelemetry(&picker, &view);
+    CHECK(picker.rows[0].idleBlack && picker.rows[1].idleBlack);
+    CHECK(live.idleBlackCount == 1);
+    CHECK(CommitMonitorSelection(&picker));
+    CHECK(working.idleBlackCount == 2 && !working.selectedOnly);
+    CHECK(working.inputRuleCount == 0);
+    picker.rows[0].idleBlack = FALSE;
+    CHECK(CommitMonitorSelection(&picker));
+    CHECK(working.idleBlackCount == 1 && !wcscmp(working.idleBlackKeys[0], L"DDC:OFFLINE-OLED"));
+}
+
+static void TestSourceIntervalSlider(void)
+{
+    Settings live = {0};
+    live.sourcePollSeconds = 3;
+    InitParent(&g_set, &live);
+    int row = -1;
+    for (int i = 0; i < g_set.rowCount; i++)
+        if (g_set.rows[i].kind == SET_SLIDER) row = i;
+    CHECK(row >= 0);
+    if (row < 0) return;
+    SetRow *slider = &g_set.rows[row];
+    CHECK(slider->lo == 1 && slider->hi == 60 && slider->step == 1);
+    CHECK(slider->ival == &g_set.sourcePollSeconds);
+    RECT track;
+    SetSliderRect(SetRowTop(&g_set, row), &track);
+    int cy = (track.top + track.bottom) / 2;
+    int hit;
+    CHECK(SetHitTest(&g_set, track.left, cy, &hit) == row && hit == SETHIT_SLIDER);
+    CHECK(SetHitTest(&g_set, track.left, SetRowTop(&g_set, row) + 10, &hit) == row && hit == SETHIT_ROW);
+    for (int seconds = 1; seconds <= 60; seconds++) {
+        int x = track.left + (seconds - 1) * (track.right - track.left) / 59;
+        SetSliderValue(&g_set, row, x);
+        CHECK(g_set.sourcePollSeconds == seconds);
+    }
+    SetSliderValue(&g_set, row, -100);
+    CHECK(g_set.sourcePollSeconds == 1);
+    SetAdjust(slider, -1);
+    CHECK(g_set.sourcePollSeconds == 1);
+    SetAdjust(slider, 1);
+    CHECK(g_set.sourcePollSeconds == 2);
+    SetSliderValue(&g_set, row, SET_WIDTH + 100);
+    SetAdjust(slider, 1);
+    CHECK(g_set.sourcePollSeconds == 60 && live.sourcePollSeconds == 3);
+
+    SetWndProc(testParent, WM_LBUTTONDOWN, MK_LBUTTON, MAKELPARAM(track.left, cy));
+    CHECK(g_set.sourcePollSeconds == 1 && g_set.activeSliderRow == row && settingsCapture == testParent);
+    SetWndProc(testParent, WM_MOUSEMOVE, MK_LBUTTON, MAKELPARAM(track.right, cy));
+    CHECK(g_set.sourcePollSeconds == 60);
+    SetWndProc(testParent, WM_MOUSEMOVE, MK_LBUTTON, MAKELPARAM(-50, cy));
+    CHECK(g_set.sourcePollSeconds == 1); /* Signed coordinates while dragging outside. */
+    SetWndProc(testParent, WM_LBUTTONUP, 0, MAKELPARAM(track.right, cy));
+    CHECK(g_set.sourcePollSeconds == 60 && g_set.activeSliderRow == -1 && !settingsCapture);
+    g_set.keyboardRow = row;
+    SetWndProc(testParent, WM_KEYDOWN, VK_LEFT, 0);
+    CHECK(g_set.sourcePollSeconds == 59);
+    SetWndProc(testParent, WM_KEYDOWN, VK_HOME, 0);
+    CHECK(g_set.sourcePollSeconds == 1);
+    SetWndProc(testParent, WM_KEYDOWN, VK_RIGHT, 0);
+    CHECK(g_set.sourcePollSeconds == 2);
+    SetWndProc(testParent, WM_MOUSEWHEEL, MAKEWPARAM(0, 120), MAKELPARAM(track.left, cy));
+    CHECK(g_set.sourcePollSeconds == 3);
+    SetWndProc(testParent, WM_KEYDOWN, VK_END, 0);
+    CHECK(g_set.sourcePollSeconds == 60 && live.sourcePollSeconds == 3);
+    SetWndProc(testParent, WM_KEYDOWN, VK_ESCAPE, 0);
+    CHECK(live.sourcePollSeconds == 3); /* Closing without Save discards the edit. */
+
+    SetWndProc(testParent, WM_LBUTTONDOWN, MK_LBUTTON, MAKELPARAM(track.right, cy));
+    SetWndProc(testParent, WM_CANCELMODE, 0, 0);
+    CHECK(g_set.activeSliderRow == -1 && !settingsCapture);
+    SetWndProc(testParent, WM_LBUTTONDOWN, MK_LBUTTON, MAKELPARAM(track.left, cy));
+    SetWndProc(testParent, WM_CAPTURECHANGED, 0, (LPARAM)testOwner);
+    settingsCapture = NULL;
+    SetWndProc(testParent, WM_MOUSEMOVE, MK_LBUTTON, MAKELPARAM(track.right, cy));
+    CHECK(g_set.activeSliderRow == -1 && g_set.sourcePollSeconds == 1);
+    g_set.sourcePollSeconds = 37;
+    SetSave(testParent, &g_set);
+    CHECK(live.sourcePollSeconds == 37);
+    g_set.presetCount = MAX_PRESETS;
+    BuildSettingsRows(&g_set);
+    CHECK(g_set.rowCount == MAX_SET_ROWS && g_set.rows[g_set.rowCount - 1].kind == SET_NUMBER);
+}
+
+static void TestSlowPollingTelemetryFreshness(void)
+{
+    SelectionRow row = {0};
+    row.connected = row.sourceKnown = TRUE;
+    row.currentInput = 0x0F;
+    row.sourceCheckedTick = sourceTestTick;
+    UI_MonitorSelectionSetSourcePollInterval(60000);
+    sourceTestTick += 60000;
+    CHECK(SourceTelemetryCurrent(&row));
+    row.sourceKnown = FALSE;
+    CHECK(!SourceTelemetryCurrent(&row)); /* An actual read failure still clears telemetry immediately. */
+    row.sourceKnown = TRUE;
+    sourceTestTick += 5001;
+    CHECK(!SourceTelemetryCurrent(&row));
+    UI_MonitorSelectionSetSourcePollInterval(3000);
+    row.sourceCheckedTick = sourceTestTick;
+    sourceTestTick += 10001;
+    CHECK(!SourceTelemetryCurrent(&row));
+}
+
+static void SaveSettingsPreview(const char *path, int seconds)
+{
+    Settings live = {0};
+    live.sourcePollSeconds = seconds;
+    live.step = live.idleDimMinutes = 5;
+    live.idleDimPercent = 1;
+    live.idleDimEnabled = TRUE;
+    live.presetCount = 3;
+    wcscpy(live.presets[0].name, L"Night"); live.presets[0].brightness = 30;
+    wcscpy(live.presets[1].name, L"Day"); live.presets[1].brightness = 60;
+    wcscpy(live.presets[2].name, L"Presentation"); live.presets[2].brightness = 100;
+    InitParent(&g_set, &live);
+    g_set.presetCount = live.presetCount;
+    for (int i = 0; i < live.presetCount; i++) g_set.presetValues[i] = (int)live.presets[i].brightness;
+    BuildSettingsRows(&g_set);
+    RenderSettings(testParent, &g_set);
+    FILE *file = fopen(path, "wb");
+    CHECK(file != NULL);
+    if (!file) return;
+    BITMAPFILEHEADER header = {0};
+    BITMAPINFOHEADER info = {0};
+    header.bfType = 0x4D42;
+    header.bfOffBits = sizeof(header) + sizeof(info);
+    header.bfSize = header.bfOffBits + (DWORD)SET_WIDTH * settingsFrameHeight * 4;
+    info.biSize = sizeof(info);
+    info.biWidth = SET_WIDTH;
+    info.biHeight = -settingsFrameHeight;
+    info.biPlanes = 1;
+    info.biBitCount = 32;
+    CHECK(fwrite(&header, sizeof(header), 1, file) == 1);
+    CHECK(fwrite(&info, sizeof(info), 1, file) == 1);
+    CHECK(fwrite(settingsFrame, (size_t)SET_WIDTH * settingsFrameHeight * 4, 1, file) == 1);
+    fclose(file);
+}
+
+int main(int argc, char **argv)
+{
+    TestBlackIdleOfflineAndBuiltInWorkingCopy();
     TestAllAndCustomWorkingCopies();
     TestOfflineRemovalAndReordering();
     TestLimitsAndUnusableIdentities();
+    TestConnectedMonitorWithoutBrightness();
     TestParentRowsAndSaveValidation();
     TestSourceRulesAndLiveTelemetry();
     TestSourceStatusAndBuiltIn();
+    TestSourceIntervalSlider();
+    TestSlowPollingTelemetryFreshness();
+    if (argc > 1 && strcmp(argv[1], "--preview") == 0) {
+        SaveSettingsPreview("build/settings-source-interval-3.bmp", 3);
+        SaveSettingsPreview("build/settings-source-interval-60.bmp", 60);
+    }
+    free(settingsFrame);
     if (failures) {
         printf("monitor selection UI: %d failure(s)\n", failures);
         return 1;
