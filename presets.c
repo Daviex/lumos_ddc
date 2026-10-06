@@ -5,6 +5,11 @@
 #define REG_RUN_KEY L"Software\\Microsoft\\Windows\\CurrentVersion\\Run"
 #define APP_NAME    L"Lumos"
 
+/* INI key per hotkey action, in HOTKEY_* order. */
+static const WCHAR *const kHotkeyKeys[HOTKEY_COUNT] = {
+    L"HotkeyBrighten", L"HotkeyDim", L"HotkeyPopup"
+};
+
 static void EnsureDirectory(const WCHAR *path)
 {
     CreateDirectoryW(path, NULL);
@@ -43,6 +48,18 @@ void Settings_CreateDefaults(Settings *s)
     WritePrivateProfileStringW(L"Settings", L"IdleDimEnabled", L"0", s->iniPath);
     WritePrivateProfileStringW(L"Settings", L"IdleDimPercent", L"5", s->iniPath);
     WritePrivateProfileStringW(L"Settings", L"IdleDimMinutes", L"5", s->iniPath);
+
+    /* Written out on a new install, so that a config.ini with no hotkey lines
+       is recognizably older than 1.2 (see Settings_Load). */
+    for (int i = 0; i < HOTKEY_COUNT; i++) {
+        char text[HOTKEY_TEXT_MAX];
+        WCHAR textW[HOTKEY_TEXT_MAX];
+        Hotkey_Format(Hotkey_Default(i), text, HOTKEY_TEXT_MAX);
+        int k = 0;
+        for (; text[k]; k++) textW[k] = (WCHAR)(unsigned char)text[k];
+        textW[k] = L'\0';
+        WritePrivateProfileStringW(L"Settings", kHotkeyKeys[i], textW, s->iniPath);
+    }
 }
 
 void Settings_Load(Settings *s)
@@ -85,6 +102,30 @@ void Settings_Load(Settings *s)
        one day ceiling because anything longer never triggers in practice. */
     if (s->idleDimMinutes < 1)    s->idleDimMinutes = 1;
     if (s->idleDimMinutes > 1440) s->idleDimMinutes = 1440;
+
+    /* Hotkeys are stored as text ("Ctrl+Win+Up"). A missing line means the
+       file predates configurable hotkeys, because a new install writes all of
+       them: such a file keeps the Ctrl+Alt combinations it has always had. An
+       unreadable value falls back to the default, so a typo cannot leave the
+       user without a way to change the brightness from the keyboard. */
+    for (int i = 0; i < HOTKEY_COUNT; i++) {
+        WCHAR textW[HOTKEY_TEXT_MAX];
+        char text[HOTKEY_TEXT_MAX];
+        s->hotkeys[i] = Hotkey_Default(i);
+        GetPrivateProfileStringW(L"Settings", kHotkeyKeys[i], L"\x01", textW,
+                                 HOTKEY_TEXT_MAX, s->iniPath);
+        if (textW[0] == 0x01) {                 /* no such line */
+            s->hotkeys[i] = Hotkey_LegacyDefault(i);
+            continue;
+        }
+        int k = 0;
+        for (; textW[k] && k < HOTKEY_TEXT_MAX - 1; k++)
+            text[k] = (textW[k] < 0x80) ? (char)textW[k] : '?';
+        text[k] = '\0';
+        Hotkey hk;
+        if (Hotkey_Parse(text, &hk))
+            s->hotkeys[i] = hk;
+    }
 
     /* Load deltas */
     s->deltaCount = 0;
@@ -157,6 +198,16 @@ void Settings_Save(Settings *s)
     WritePrivateProfileStringW(L"Settings", L"IdleDimPercent", val, s->iniPath);
     wsprintfW(val, L"%d", s->idleDimMinutes);
     WritePrivateProfileStringW(L"Settings", L"IdleDimMinutes", val, s->iniPath);
+
+    for (int i = 0; i < HOTKEY_COUNT; i++) {
+        char text[HOTKEY_TEXT_MAX];
+        WCHAR textW[HOTKEY_TEXT_MAX];
+        Hotkey_Format(s->hotkeys[i], text, HOTKEY_TEXT_MAX);
+        int k = 0;
+        for (; text[k]; k++) textW[k] = (WCHAR)(unsigned char)text[k];
+        textW[k] = L'\0';
+        WritePrivateProfileStringW(L"Settings", kHotkeyKeys[i], textW, s->iniPath);
+    }
 
     /* Save deltas */
     WritePrivateProfileSectionW(L"Deltas", L"", s->iniPath);

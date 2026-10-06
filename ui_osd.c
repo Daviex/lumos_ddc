@@ -25,6 +25,25 @@ typedef struct {
 
 static OsdData g_osd;
 
+/* The OSD has no items. Its own name is the spoken text, which is what NVDA
+   reads on the live region event that A11y_Announce raises. */
+static int OsdA11yCount(void *ctx) { (void)ctx; return 0; }
+static int OsdA11yFocused(void *ctx) { (void)ctx; return -1; }
+
+static void OsdA11yDescribe(void *ctx, int index, A11yItem *out)
+{
+    (void)ctx;
+    if (index >= 0)
+        return;
+    out->role = ROLE_SYSTEM_STATICTEXT;
+    out->state = STATE_SYSTEM_READONLY;
+    _snwprintf(out->name, 159, L"Brightness %d%%", g_osd.percent);
+}
+
+static const A11yModel g_osdModel = {
+    OsdA11yCount, OsdA11yDescribe, OsdA11yFocused, NULL, NULL
+};
+
 static void RenderOSD(HWND hwnd)
 {
     BYTE *bits = NULL;
@@ -89,6 +108,18 @@ static void RenderOSD(HWND hwnd)
 static LRESULT CALLBACK OsdWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
     switch (msg) {
+    case WM_GETOBJECT: {
+        LRESULT r;
+        if (A11y_HandleGetObject(hwnd, wParam, lParam, &r))
+            return r;
+        break;
+    }
+
+    case WM_DESTROY:
+        A11y_UnmarkLiveRegion(hwnd);
+        A11y_Detach(hwnd);
+        return 0;
+
     case WM_TIMER:
         if (wParam == OSD_TIMER_SHOW) {
             /* Show period ended, start fade out */
@@ -128,7 +159,7 @@ static LRESULT CALLBACK OsdWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
     return DefWindowProcW(hwnd, msg, wParam, lParam);
 }
 
-void UI_ShowOSD(HINSTANCE hInst, HMONITOR hMon, int percent)
+void UI_ShowOSD(HINSTANCE hInst, HMONITOR hMon, int percent, BOOL announce)
 {
     if (!hMon) return;
 
@@ -149,6 +180,8 @@ void UI_ShowOSD(HINSTANCE hInst, HMONITOR hMon, int percent)
             cx, cy, OSD_W, OSD_H,
             NULL, NULL, hInst, NULL);
         if (!g_osdHwnd) return;
+        A11y_Attach(g_osdHwnd, &g_osdModel);
+        A11y_MarkLiveRegion(g_osdHwnd);
     }
 
     SetWindowPos(g_osdHwnd, HWND_TOPMOST, cx, cy, OSD_W, OSD_H, SWP_NOACTIVATE);
@@ -161,6 +194,9 @@ void UI_ShowOSD(HINSTANCE hInst, HMONITOR hMon, int percent)
     RenderOSD(g_osdHwnd);
     ShowWindow(g_osdHwnd, SW_SHOWNOACTIVATE);
     SetTimer(g_osdHwnd, OSD_TIMER_SHOW, OSD_SHOW_MS, NULL);
+
+    if (announce)
+        A11y_Announce(g_osdHwnd);   /* reads "Brightness N%" from the model */
 }
 
 /* ---- Class registration ---- */

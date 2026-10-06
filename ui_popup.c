@@ -1,5 +1,6 @@
 #include "ui_internal.h"
 #include <shellapi.h>
+#include <windowsx.h>
 
 static const WCHAR POPUP_CLASS[]   = L"LumosPopup";
 
@@ -11,7 +12,13 @@ typedef struct {
     int masterPercent;
     int dragPercent;
     DWORD lastApplyTick;   /* throttles hardware writes during slider drag */
+    BOOL keyDrag;          /* the drag above is driven by a held arrow key */
+    int  focusItem;        /* keyboard focus, see "Keyboard items" below */
+    BOOL focusVisible;     /* draw the ring: set once the keyboard is in use */
 } PopupData;
+
+/* Writes a key-driven value that arrived inside the throttle interval. */
+#define POPUP_FLUSH_TIMER 1
 
 /* Max rate of hardware brightness writes while dragging a slider. The WMI
  * backend (internal panels) does a full COM roundtrip per write, so applying
@@ -150,6 +157,89 @@ static int XFromPercent(RECT *sliderRect, int pct)
     return trackLeft + (pct * (trackRight - trackLeft)) / 100;
 }
 
+/* ---- Keyboard items ----
+   Focus order follows the layout: each monitor's slider, then its offset
+   control, then "All Monitors". Item i belongs to row i / 2, which also gives
+   the master row (ml->count) for the last item. */
+
+static int ItemCount(PopupData *pd)  { return pd->ml->count * 2 + 1; }
+static int MasterItem(PopupData *pd) { return pd->ml->count * 2; }
+static int ItemRow(int item)         { return item / 2; }
+
+static BOOL ItemIsOffset(PopupData *pd, int item)
+{
+    return item < MasterItem(pd) && (item % 2) == 1;
+}
+
+/* The percentage a row shows right now, including a drag in progress. */
+static int RowPercent(PopupData *pd, int row)
+{
+    if (pd->activeSlider == row && pd->dragPercent >= 0)
+        return pd->dragPercent;
+    if (row == pd->ml->count)
+        return pd->masterPercent;
+    return GetMonPercent(&pd->ml->monitors[row]);
+}
+
+/* Outline drawn around the focused item. */
+static void GetItemFocusRect(PopupData *pd, int item, RECT *rc)
+{
+    int row = ItemRow(item);
+    if (ItemIsOffset(pd, item)) {
+        RECT rcMinus, rcValue, rcPlus;
+        GetDeltaButtonRects(row, &rcMinus, &rcValue, &rcPlus);
+        SetRect(rc, rcMinus.left - 3, rcMinus.top - 3, rcPlus.right + 3, rcPlus.bottom + 3);
+    } else {
+        GetSliderRect(row, rc);
+        InflateRect(rc, 4, SLIDER_THUMB_R + 3);
+    }
+}
+
+static int PopupA11yCount(void *ctx)
+{
+    return ItemCount((PopupData *)ctx);
+}
+
+static void PopupA11yDescribe(void *ctx, int index, A11yItem *out)
+{
+    PopupData *pd = (PopupData *)ctx;
+    if (index < 0) {
+        out->role = ROLE_SYSTEM_DIALOG;
+        out->state = STATE_SYSTEM_FOCUSABLE;
+        wcscpy(out->name, APP_NAME L" brightness");
+        return;
+    }
+    int row = ItemRow(index);
+    BOOL isMaster = (index == MasterItem(pd));
+    BrightMonitor *mon = isMaster ? NULL : &pd->ml->monitors[row];
+    GetItemFocusRect(pd, index, &out->rect);
+    out->state = STATE_SYSTEM_FOCUSABLE;
+    if (mon && !mon->controllable)
+        out->state |= STATE_SYSTEM_UNAVAILABLE;
+
+    if (ItemIsOffset(pd, index)) {
+        out->role = ROLE_SYSTEM_SPINBUTTON;
+        _snwprintf(out->name, 159, L"%s offset", mon->name);
+        _snwprintf(out->value, 63, L"%+d", mon->delta);
+    } else {
+        out->role = ROLE_SYSTEM_SLIDER;
+        if (isMaster)
+            wcscpy(out->name, L"All monitors");
+        else
+            _snwprintf(out->name, 159, L"%s", mon->name);
+        _snwprintf(out->value, 63, L"%d%%", RowPercent(pd, row));
+    }
+}
+
+static int PopupA11yFocused(void *ctx)
+{
+    return ((PopupData *)ctx)->focusItem;
+}
+
+static const A11yModel g_popupModel = {
+    PopupA11yCount, PopupA11yDescribe, PopupA11yFocused, NULL, &g_popupData
+};
+
 /* ---- Popup rendering (UpdateLayeredWindow) ---- */
 
 static void RenderPopup(HWND hwnd, PopupData *pd)
@@ -280,6 +370,12 @@ static void RenderPopup(HWND hwnd, PopupData *pd)
     DeleteObject(noPen);
     DeleteObject(trackBrush);
     DeleteObject(fillBrush);
+
+    if (pd->focusVisible && pd->focusItem >= 0 && pd->focusItem < ItemCount(pd)) {
+        RECT rcFocus;
+        GetItemFocusRect(pd, pd->focusItem, &rcFocus);
+        DrawFocusRing(dc, &rcFocus, 10);
+    }
     SelectObject(dc, oldFont);
     DeleteObject(hFont);
     DeleteObject(hFontBold);
@@ -363,6 +459,126 @@ static void ApplySliderValue(PopupData *pd, int row, int percent)
     if (g_manualChangeCb) g_manualChangeCb();
 }
 
+/* ---- Keyboard ---- */
+
+static void SetFocusItem(HWND hwnd, PopupData *pd, int item)
+{
+    int n = ItemCount(pd);
+    pd->focusItem = (item % n + n) % n;   /* wrap both ways */
+    RenderPopup(hwnd, pd);
+    A11y_NotifyFocus(hwnd, pd->focusItem);
+}
+
+/* Apply the pending key value now. */
+static void FlushKeyValue(HWND hwnd, PopupData *pd)
+{
+    KillTimer(hwnd, POPUP_FLUSH_TIMER);
+    if (pd->keyDrag && pd->activeSlider >= 0 && pd->dragPercent >= 0) {
+        ApplySliderValue(pd, pd->activeSlider, pd->dragPercent);
+        pd->lastApplyTick = GetTickCount();
+    }
+}
+
+/* A held arrow key works like a mouse drag: the display follows every repeat,
+   the hardware gets at most one write per DRAG_APPLY_INTERVAL_MS, and the
+   timer delivers the last value if the repeats stop inside an interval. */
+static void KeyAdjustSlider(HWND hwnd, PopupData *pd, int row, int pct)
+{
+    if (pct < 0) pct = 0;
+    if (pct > 100) pct = 100;
+    if (pct == RowPercent(pd, row))
+        return;
+    pd->activeSlider = row;
+    pd->keyDrag = TRUE;
+    pd->dragPercent = pct;
+    if (GetTickCount() - pd->lastApplyTick >= DRAG_APPLY_INTERVAL_MS)
+        FlushKeyValue(hwnd, pd);
+    else
+        SetTimer(hwnd, POPUP_FLUSH_TIMER, DRAG_APPLY_INTERVAL_MS, NULL);
+    RenderPopup(hwnd, pd);
+    A11y_NotifyValue(hwnd, pd->focusItem);
+}
+
+/* Key released: write the final value and leave drag mode. Monitor_SetBrightness
+   updates the cached level, so there is no DDC read-back here. */
+static void EndKeyDrag(HWND hwnd, PopupData *pd)
+{
+    if (!pd->keyDrag)
+        return;
+    FlushKeyValue(hwnd, pd);
+    pd->keyDrag = FALSE;
+    pd->activeSlider = -1;
+    pd->dragPercent = -1;
+    RenderPopup(hwnd, pd);
+}
+
+static void AdjustOffset(HWND hwnd, PopupData *pd, int row, int value)
+{
+    BrightMonitor *mon = &pd->ml->monitors[row];
+    if (value < -40) value = -40;
+    if (value > 40) value = 40;
+    if (value == mon->delta)
+        return;
+    mon->delta = value;
+    if (g_deltaSaveCb) g_deltaSaveCb();
+    RenderPopup(hwnd, pd);
+    A11y_NotifyValue(hwnd, pd->focusItem);
+}
+
+/* Standard slider keys: Tab and Shift+Tab move between controls, the arrows
+   change the value by 1 (Up and Right raise it), Page Up and Page Down by 10,
+   Home and End go to the limits. Escape closes. */
+static void PopupKeyDown(HWND hwnd, PopupData *pd, WPARAM vk)
+{
+    int item = pd->focusItem;
+    int row = ItemRow(item);
+
+    if (!pd->focusVisible) {
+        pd->focusVisible = TRUE;
+        RenderPopup(hwnd, pd);
+    }
+
+    if (vk == VK_ESCAPE) {
+        UI_HidePopup(hwnd);
+        return;
+    }
+    if (vk == VK_TAB) {
+        EndKeyDrag(hwnd, pd);
+        SetFocusItem(hwnd, pd, item + (KEY_DOWN(VK_SHIFT) ? -1 : 1));
+        return;
+    }
+
+    int dir = 0, page = 0, limit = 0;
+    switch (vk) {
+    case VK_RIGHT: case VK_UP:   dir = 1;  break;
+    case VK_LEFT:  case VK_DOWN: dir = -1; break;
+    case VK_PRIOR: page = 1;  break;
+    case VK_NEXT:  page = -1; break;
+    case VK_HOME:  limit = -1; break;
+    case VK_END:   limit = 1;  break;
+    default: return;
+    }
+
+    if (ItemIsOffset(pd, item)) {
+        int d = pd->ml->monitors[row].delta;
+        if (limit)
+            d = (limit > 0) ? 40 : -40;
+        else
+            d += dir + page * 5;
+        AdjustOffset(hwnd, pd, row, d);
+        return;
+    }
+
+    if (row < pd->ml->count && !pd->ml->monitors[row].controllable)
+        return;
+    int pct = RowPercent(pd, row);
+    if (limit)
+        pct = (limit > 0) ? 100 : 0;
+    else
+        pct += dir + page * 10;
+    KeyAdjustSlider(hwnd, pd, row, pct);
+}
+
 /* ---- Popup Window Procedure ---- */
 
 static LRESULT CALLBACK PopupWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
@@ -374,17 +590,62 @@ static LRESULT CALLBACK PopupWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
         CREATESTRUCTW *cs = (CREATESTRUCTW *)lParam;
         pd = (PopupData *)cs->lpCreateParams;
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, (LONG_PTR)pd);
+        A11y_Attach(hwnd, &g_popupModel);
         return 0;
     }
 
+    case WM_GETOBJECT: {
+        LRESULT r;
+        if (A11y_HandleGetObject(hwnd, wParam, lParam, &r))
+            return r;
+        break;
+    }
+
+    case WM_KEYDOWN:
+        if (pd) PopupKeyDown(hwnd, pd, wParam);
+        return 0;
+
+    case WM_KEYUP:
+        if (pd) EndKeyDrag(hwnd, pd);
+        return 0;
+
+    case WM_TIMER:
+        if (pd && wParam == POPUP_FLUSH_TIMER)
+            FlushKeyValue(hwnd, pd);
+        return 0;
+
+    case WM_CAPTURECHANGED:
+        /* Another window took the mouse mid-drag and will get the button-up.
+           Finish the drag here, or the next mouse move keeps dragging. */
+        if (pd && pd->activeSlider >= 0 && !pd->keyDrag) {
+            if (pd->dragPercent >= 0)
+                ApplySliderValue(pd, pd->activeSlider, pd->dragPercent);
+            pd->activeSlider = -1;
+            pd->dragPercent = -1;
+            RenderPopup(hwnd, pd);
+        }
+        return 0;
+
+    case WM_CLOSE:
+        /* Alt+F4 hides the popup. It is created once and reused, and lumos.c
+           keeps its handle, so destroying it here would leave that dangling. */
+        UI_HidePopup(hwnd);
+        return 0;
+
+    case WM_DESTROY:
+        A11y_Detach(hwnd);
+        return 0;
+
     case WM_LBUTTONDOWN: {
         if (!pd) break;
-        int x = LOWORD(lParam), y = HIWORD(lParam);
+        int x = GET_X_LPARAM(lParam), y = GET_Y_LPARAM(lParam);
 
         /* Check delta buttons first */
         int deltaRow;
         int deltaDir = HitTestDelta(pd, x, y, &deltaRow);
         if (deltaDir != 0 && deltaRow >= 0) {
+            EndKeyDrag(hwnd, pd);
+            pd->focusItem = deltaRow * 2 + 1;
             BrightMonitor *mon = &pd->ml->monitors[deltaRow];
             mon->delta += deltaDir;
             if (mon->delta < -40) mon->delta = -40;
@@ -396,6 +657,8 @@ static LRESULT CALLBACK PopupWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
 
         int row = HitTestSlider(pd, x, y);
         if (row >= 0) {
+            EndKeyDrag(hwnd, pd);
+            pd->focusItem = row * 2;
             pd->activeSlider = row;
             RECT rc;
             GetSliderRect(row, &rc);
@@ -410,14 +673,16 @@ static LRESULT CALLBACK PopupWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
     }
 
     case WM_MOUSEMOVE: {
-        if (!pd || pd->activeSlider < 0) break;
+        if (!pd || pd->activeSlider < 0 || pd->keyDrag) break;
         if (!(wParam & MK_LBUTTON)) {
             pd->activeSlider = -1;
             pd->dragPercent = -1;
             ReleaseCapture();
             break;
         }
-        int x = LOWORD(lParam);
+        /* Signed: with the mouse captured, a pointer left of the popup has a
+           negative x, which LOWORD would turn into ~65535 and so 100%. */
+        int x = GET_X_LPARAM(lParam);
         int row = pd->activeSlider;
         RECT rc;
         GetSliderRect(row, &rc);
@@ -451,8 +716,10 @@ static LRESULT CALLBACK PopupWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
         return 0;
 
     case WM_ACTIVATE:
-        if (LOWORD(wParam) == WA_INACTIVE && pd)
+        if (LOWORD(wParam) == WA_INACTIVE && pd) {
+            EndKeyDrag(hwnd, pd);
             UI_HidePopup(hwnd);
+        }
         return 0;
 
     default:
@@ -468,6 +735,7 @@ HWND UI_CreatePopup(HINSTANCE hInst, MonitorList *ml)
     g_popupData.activeSlider = -1;
     g_popupData.dragPercent = -1;
     g_popupData.masterPercent = GetMasterPercent(ml);
+    g_popupData.focusItem = MasterItem(&g_popupData);
 
     int h = GetPopupHeight(&g_popupData);
 
@@ -481,20 +749,26 @@ HWND UI_CreatePopup(HINSTANCE hInst, MonitorList *ml)
     return hwnd;
 }
 
-void UI_ShowPopup(HWND hwnd, MonitorList *ml)
+void UI_ShowPopup(HWND hwnd, MonitorList *ml, const POINT *anchor, BOOL fromKeyboard)
 {
     if (!hwnd) return;
 
     Monitor_RefreshBrightness(ml);
     g_popupData.ml = ml;
     g_popupData.masterPercent = GetMasterPercent(ml);
+    /* Every opening starts on "All Monitors", the control most people want. */
+    g_popupData.focusItem = MasterItem(&g_popupData);
+    g_popupData.focusVisible = fromKeyboard;
 
     int h = GetPopupHeight(&g_popupData);
     SetWindowPos(hwnd, NULL, 0, 0, POPUP_WIDTH, h, SWP_NOMOVE | SWP_NOZORDER);
 
-    /* Position near cursor (tray icon), adjusted to stay on-screen */
+    /* Position near the anchor (the tray icon) or the cursor, adjusted to stay on-screen */
     POINT pt;
-    GetCursorPos(&pt);
+    if (anchor)
+        pt = *anchor;
+    else
+        GetCursorPos(&pt);
 
     HMONITOR hMon = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
     MONITORINFO mi = { sizeof(mi) };
@@ -529,6 +803,7 @@ void UI_ShowPopup(HWND hwnd, MonitorList *ml)
     RenderPopup(hwnd, &g_popupData);
     ShowWindow(hwnd, SW_SHOWNOACTIVATE);
     SetForegroundWindow(hwnd);
+    A11y_NotifyFocus(hwnd, g_popupData.focusItem);
 }
 
 void UI_HidePopup(HWND hwnd)
@@ -542,7 +817,7 @@ void UI_TogglePopup(HWND hwnd, MonitorList *ml)
     if (IsWindowVisible(hwnd))
         UI_HidePopup(hwnd);
     else
-        UI_ShowPopup(hwnd, ml);
+        UI_ShowPopup(hwnd, ml, NULL, FALSE);
 }
 
 BOOL UI_IsPopupVisible(HWND hwnd)
@@ -553,9 +828,16 @@ BOOL UI_IsPopupVisible(HWND hwnd)
 void UI_RefreshPopup(HWND hwnd, MonitorList *ml)
 {
     if (!hwnd || !IsWindowVisible(hwnd)) return;
-    g_popupData.ml = ml;
-    g_popupData.masterPercent = GetMasterPercent(ml);
-    RenderPopup(hwnd, &g_popupData);
+    PopupData *pd = &g_popupData;
+    int row = ItemRow(pd->focusItem);
+    int before = ItemIsOffset(pd, pd->focusItem) ? 0 : RowPercent(pd, row);
+    pd->ml = ml;
+    pd->masterPercent = GetMasterPercent(ml);
+    RenderPopup(hwnd, pd);
+    /* A hotkey or the schedule changed the level under the focused slider:
+       the screen reader hears it as the slider's new value. */
+    if (!ItemIsOffset(pd, pd->focusItem) && RowPercent(pd, row) != before)
+        A11y_NotifyValue(hwnd, pd->focusItem);
 }
 
 /* ---- Class registration ---- */

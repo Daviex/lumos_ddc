@@ -4,6 +4,7 @@
 #include <windows.h>
 #include "monitor.h"
 #include "schedule.h"
+#include "hotkey.h"
 
 #define MAX_PRESETS 10
 #define MAX_PRESET_NAME 64
@@ -28,6 +29,7 @@ typedef struct {
     BOOL          idleDimEnabled;
     int           idleDimPercent;   /* level held while the session is idle (0-100) */
     int           idleDimMinutes;   /* idle time before dimming */
+    Hotkey        hotkeys[HOTKEY_COUNT];   /* indexed by HOTKEY_BRIGHTEN etc. */
 } Settings;
 
 /* Initialize settings path and load from INI */

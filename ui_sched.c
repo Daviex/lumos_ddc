@@ -1,4 +1,5 @@
 #include "ui_internal.h"
+#include <windowsx.h>
 
 static const WCHAR SCHED_CLASS[]   = L"LumosSched";
 static HWND g_schedHwnd = NULL;
@@ -37,14 +38,12 @@ static void SchedFieldRect(int row, int field, RECT *rc)
     }
 }
 
-/* Footer button rects: Add (left), Save (right). */
-static void SchedButtonRects(SchedEditData *d, RECT *rcAdd, RECT *rcSave)
+/* Footer button rects: Add on the left, the shared Cancel and Save on the right. */
+static void SchedButtonRects(SchedEditData *d, RECT *rcAdd, RECT *rcCancel, RECT *rcSave)
 {
     int y = SCHED_HEADER_H + d->count * SCHED_ROW_H + 8;
-    rcAdd->left = 16;  rcAdd->right = 120;
-    rcAdd->top = y;    rcAdd->bottom = y + 28;
-    rcSave->right = SCHED_WIDTH - 16; rcSave->left = SCHED_WIDTH - 120;
-    rcSave->top = y;   rcSave->bottom = y + 28;
+    SetRect(rcAdd, DLG_MARGIN, y, DLG_MARGIN + DLG_BTN_W, y + DLG_BTN_H);
+    DialogButtonRects(SCHED_WIDTH, y, rcCancel, rcSave);
 }
 
 /* Returns row index and sets *outField, or -1. */
@@ -163,23 +162,11 @@ static void RenderSchedEditor(HWND hwnd, SchedEditData *d)
     }
 
     /* Footer buttons */
-    RECT rcAdd, rcSave;
-    SchedButtonRects(d, &rcAdd, &rcSave);
-    HBRUSH btn = CreateSolidBrush(HexToColorRef(CLR_SURFACE));
-    HBRUSH acc = CreateSolidBrush(HexToColorRef(CLR_ACCENT));
-    HBRUSH ob = (HBRUSH)SelectObject(dc, btn);
-    RoundRect(dc, rcAdd.left, rcAdd.top, rcAdd.right, rcAdd.bottom, 8, 8);
-    SelectObject(dc, acc);
-    RoundRect(dc, rcSave.left, rcSave.top, rcSave.right, rcSave.bottom, 8, 8);
-    SelectObject(dc, ob);
-    DeleteObject(btn);
-    DeleteObject(acc);
-
-    SelectObject(dc, hFont);
-    SetTextColor(dc, HexToColorRef(CLR_TEXT));
-    DrawTextW(dc, L"+ Add", -1, &rcAdd, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-    SetTextColor(dc, HexToColorRef(CLR_BG));
-    DrawTextW(dc, L"Save", -1, &rcSave, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    RECT rcAdd, rcCancel, rcSave;
+    SchedButtonRects(d, &rcAdd, &rcCancel, &rcSave);
+    DrawDialogButton(dc, &rcAdd, L"+ Add", FALSE, hFont);
+    DrawDialogButton(dc, &rcCancel, L"Cancel", FALSE, hFont);
+    DrawDialogButton(dc, &rcSave, L"Save", TRUE, hFont);
 
     SelectObject(dc, oldPen);
     DeleteObject(noPen);
@@ -206,11 +193,16 @@ static LRESULT CALLBACK SchedWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
 
     switch (msg) {
     case WM_LBUTTONDOWN: {
-        int x = LOWORD(lParam), y = HIWORD(lParam);
+        int x = GET_X_LPARAM(lParam), y = GET_Y_LPARAM(lParam);
 
         /* Footer buttons */
-        RECT rcAdd, rcSave;
-        SchedButtonRects(d, &rcAdd, &rcSave);
+        RECT rcAdd, rcCancel, rcSave;
+        SchedButtonRects(d, &rcAdd, &rcCancel, &rcSave);
+        if (x >= rcCancel.left && x <= rcCancel.right && y >= rcCancel.top && y <= rcCancel.bottom) {
+            DestroyWindow(hwnd);   /* discard the edits, like Esc or a click outside */
+            g_schedHwnd = NULL;
+            return 0;
+        }
         if (x >= rcAdd.left && x <= rcAdd.right && y >= rcAdd.top && y <= rcAdd.bottom) {
             if (d->count < MAX_SCHEDULE) {
                 d->pts[d->count].minutes = 12 * 60;  /* default new point 12:00 = 50 */
@@ -246,9 +238,18 @@ static LRESULT CALLBACK SchedWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
                 SchedResize(hwnd, d);
             }
             RenderSchedEditor(hwnd, d);
+        } else {
+            BeginWindowDrag(hwnd);   /* anywhere that is not a control moves the window */
         }
         return 0;
     }
+
+    case WM_KEYDOWN:
+        if (wParam == VK_ESCAPE) {
+            DestroyWindow(hwnd);
+            g_schedHwnd = NULL;
+        }
+        return 0;
 
     case WM_MOUSEWHEEL: {
         int dir = ((short)HIWORD(wParam) > 0) ? 1 : -1;
@@ -306,12 +307,11 @@ void UI_ShowScheduleEditor(HWND hwndOwner, Settings *s)
     MONITORINFO mi = { sizeof(mi) };
     GetMonitorInfoW(hMon, &mi);
 
-    int x = pt.x;
-    int y = pt.y - h;
-    if (y < mi.rcWork.top) y = pt.y;
-    if (x + w > mi.rcWork.right) x = mi.rcWork.right - w;
-    if (x < mi.rcWork.left) x = mi.rcWork.left;
-    if (y + h > mi.rcWork.bottom) y = mi.rcWork.bottom - h;
+    /* Centered on the monitor the cursor is on, like Settings. Hanging off
+       the cursor put a long schedule into the top corner of the screen. */
+    int x = (mi.rcWork.left + mi.rcWork.right - w) / 2;
+    int y = (mi.rcWork.top + mi.rcWork.bottom - h) / 2;
+    if (y < mi.rcWork.top) y = mi.rcWork.top;
 
     g_schedHwnd = CreateWindowExW(
         WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_LAYERED,

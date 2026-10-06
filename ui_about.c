@@ -4,6 +4,73 @@
 static const WCHAR ABOUT_CLASS[]   = L"LumosAbout";
 static HWND g_aboutHwnd = NULL;
 static RECT g_aboutLinkRect = { 0, 0, 0, 0 };  /* hit rect for the repo link */
+static BOOL g_aboutFocusVisible = FALSE;         /* ring on the link once a key is used */
+
+/* ---- Screen reader model ----
+   The text lines are read-only items, so NVDA reads them as the dialog text;
+   the repository link is the one focusable item. */
+
+typedef struct {
+    LONG         role;
+    const WCHAR *text;
+    RECT         rect;
+} AboutLine;
+
+static const AboutLine kAboutLines[] = {
+    { ROLE_SYSTEM_STATICTEXT, APP_NAME,                               { 0, 18, ABOUT_WIDTH, 50 } },
+    { ROLE_SYSTEM_STATICTEXT, L"Monitor brightness for DDC/CI + WMI", { 0, 54, ABOUT_WIDTH, 72 } },
+    { ROLE_SYSTEM_STATICTEXT, L"Version " APP_VERSION,                { 0, 84, ABOUT_WIDTH, 104 } },
+    { ROLE_SYSTEM_STATICTEXT, L"by " APP_AUTHOR,                      { 0, 106, ABOUT_WIDTH, 124 } },
+};
+#define ABOUT_LINES ((int)(sizeof(kAboutLines) / sizeof(kAboutLines[0])))
+#define ABOUT_LINK_ITEM ABOUT_LINES   /* the link follows the text lines */
+
+static int AboutA11yCount(void *ctx) { (void)ctx; return ABOUT_LINES + 1; }
+static int AboutA11yFocused(void *ctx) { (void)ctx; return ABOUT_LINK_ITEM; }
+
+static void AboutA11yDescribe(void *ctx, int index, A11yItem *out)
+{
+    (void)ctx;
+    if (index < 0) {
+        out->role = ROLE_SYSTEM_DIALOG;
+        out->state = STATE_SYSTEM_FOCUSABLE;
+        wcscpy(out->name, L"About " APP_NAME);
+    } else if (index < ABOUT_LINES) {
+        out->role = kAboutLines[index].role;
+        out->state = STATE_SYSTEM_READONLY;
+        out->rect = kAboutLines[index].rect;
+        wcsncpy(out->name, kAboutLines[index].text, 159);
+    } else {
+        out->role = ROLE_SYSTEM_LINK;
+        out->state = STATE_SYSTEM_FOCUSABLE | STATE_SYSTEM_LINKED;
+        out->rect = g_aboutLinkRect;
+        wcscpy(out->name, APP_REPO_DISPLAY);
+        wcscpy(out->value, APP_REPO_URL);
+        wcscpy(out->action, L"Jump");
+    }
+}
+
+static void AboutOpenLink(HWND hwnd)
+{
+    DestroyWindow(hwnd);
+    ShellExecuteW(NULL, L"open", APP_REPO_URL, NULL, NULL, SW_SHOWNORMAL);
+}
+
+/* Posted so the link opens after an MSAA call has returned. */
+#define WM_ABOUT_OPEN_LINK (WM_APP + 1)
+
+static BOOL AboutA11yInvoke(void *ctx, int index)
+{
+    (void)ctx;
+    if (index != ABOUT_LINK_ITEM || !g_aboutHwnd)
+        return FALSE;
+    PostMessageW(g_aboutHwnd, WM_ABOUT_OPEN_LINK, 0, 0);
+    return TRUE;
+}
+
+static const A11yModel g_aboutModel = {
+    AboutA11yCount, AboutA11yDescribe, AboutA11yFocused, AboutA11yInvoke, NULL
+};
 
 /* ---- About window ---- */
 
@@ -80,7 +147,13 @@ static void RenderAbout(HWND hwnd)
     SelectObject(dc, hSmall);
     SetTextColor(dc, HexToColorRef(CLR_SUBTEXT));
     rc = (RECT){ 0, 160, w, 178 };
-    DrawTextW(dc, L"Esc to close", -1, &rc, DT_CENTER | DT_SINGLELINE);
+    DrawTextW(dc, L"Enter opens the link, Esc closes", -1, &rc, DT_CENTER | DT_SINGLELINE);
+
+    if (g_aboutFocusVisible) {
+        RECT rcFocus = g_aboutLinkRect;
+        InflateRect(&rcFocus, 2, 2);
+        DrawFocusRing(dc, &rcFocus, 8);
+    }
 
     /* Release fonts (deselect first so none is active) */
     SelectObject(dc, (HFONT)GetStockObject(SYSTEM_FONT));
@@ -116,9 +189,26 @@ static LRESULT CALLBACK AboutWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
         return TRUE;
     }
 
+    case WM_GETOBJECT: {
+        LRESULT r;
+        if (A11y_HandleGetObject(hwnd, wParam, lParam, &r))
+            return r;
+        break;
+    }
+
     case WM_KEYDOWN:
-        if (wParam == VK_ESCAPE)
+        if (wParam == VK_ESCAPE) {
             DestroyWindow(hwnd);
+        } else if (wParam == VK_RETURN || wParam == VK_SPACE) {
+            AboutOpenLink(hwnd);
+        } else if (!g_aboutFocusVisible) {
+            g_aboutFocusVisible = TRUE;   /* Tab or any other key shows where focus is */
+            RenderAbout(hwnd);
+        }
+        return 0;
+
+    case WM_ABOUT_OPEN_LINK:
+        AboutOpenLink(hwnd);
         return 0;
 
     case WM_ACTIVATE:
@@ -127,6 +217,7 @@ static LRESULT CALLBACK AboutWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
         return 0;
 
     case WM_DESTROY:
+        A11y_Detach(hwnd);
         g_aboutHwnd = NULL;
         return 0;
 
@@ -163,10 +254,13 @@ void UI_ShowAbout(HWND hwndOwner)
         ABOUT_CLASS, L"", WS_POPUP,
         x, y, w, h, hwndOwner, NULL, g_uiInst, NULL);
     if (!g_aboutHwnd) return;
+    A11y_Attach(g_aboutHwnd, &g_aboutModel);
+    g_aboutFocusVisible = FALSE;
 
     RenderAbout(g_aboutHwnd);
     ShowWindow(g_aboutHwnd, SW_SHOWNOACTIVATE);
     SetForegroundWindow(g_aboutHwnd);
+    A11y_NotifyFocus(g_aboutHwnd, ABOUT_LINK_ITEM);
 }
 
 

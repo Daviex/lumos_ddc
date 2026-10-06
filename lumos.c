@@ -4,6 +4,7 @@
 #include <commctrl.h>
 #include <wtsapi32.h>
 #include <shlobj.h>
+#include <windowsx.h>
 #include <stdio.h>
 #include <stdarg.h>
 #include <stdlib.h>
@@ -90,6 +91,17 @@ static DWORD        g_rescanAwaitedGen = 0;   /* the only generation whose resul
 static int          g_rescanRetry = 0;        /* index into kRescanBackoffMs */
 static int          g_rescanWriteOffs = 0;    /* consecutive workers the watchdog gave up on */
 static DWORD        g_lastRescanTick = 0;     /* when the last worker was launched */
+static Hotkey       g_hotkeysActive[HOTKEY_COUNT]; /* what RegisterHotKey currently holds */
+static int          g_hotkeyStartupFailure = -1;   /* first action we could not register, or -1 */
+static BOOL         g_hotkeysSuspended = FALSE;    /* released while Settings captures keys */
+static DWORD        g_trayRightClickTick = 0;      /* last right button down or up on the icon */
+static DWORD        g_trayKeySelectTick = 0;       /* last NIN_KEYSELECT */
+#define TRAY_CLICK_WINDOW_MS 1000
+
+/* RegisterHotKey id per HOTKEY_* action, which is also the WM_HOTKEY wParam. */
+static const int kHotkeyIds[HOTKEY_COUNT] = {
+    WM_HOTKEY_BRIGHTEN, WM_HOTKEY_DIM, WM_HOTKEY_POPUP
+};
 
 static const WCHAR APPCLASS[] = L"LumosMain";
 
@@ -99,7 +111,10 @@ static void CreateTrayIcon(HWND hwnd);
 static void RemoveTrayIcon(void);
 static void RegisterHotkeys(HWND hwnd);
 static void UnregisterHotkeys(HWND hwnd);
-static void ShowContextMenu(HWND hwnd);
+static int  ApplyHotkeys(const Hotkey *hotkeys);
+static void SuspendHotkeys(BOOL suspended);
+static int  FirstFailedHotkey(void);
+static void ShowContextMenu(HWND hwnd, const POINT *anchor, BOOL fromKeyboard);
 static void HandleHotkey(int id);
 static void ApplyPreset(int index);
 static void InstallMouseHook(void);
@@ -194,6 +209,8 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdLineA, int showCmd
     /* Create popup (hidden) */
     g_hwndPopup = UI_CreatePopup(hInst, &g_monitors);
     UI_SetDeltaSaveCallback(SaveDeltasCallback);
+    static const HotkeyHost hotkeyHost = { ApplyHotkeys, SuspendHotkeys, FirstFailedHotkey };
+    UI_SetHotkeyHost(&hotkeyHost);
 
     /* Tray icon, hotkeys, mouse hook */
     CreateTrayIcon(g_hwndHidden);
@@ -249,6 +266,13 @@ static void CreateTrayIcon(HWND hwnd)
         g_nid.hIcon = LoadIconW(NULL, IDI_APPLICATION);
     wcscpy(g_nid.szTip, APP_NAME L" - Monitor Brightness");
     Shell_NotifyIconW(NIM_ADD, &g_nid);
+
+    /* Version 4 is what makes the icon usable from the keyboard: Win+B, then
+       Enter or Space arrives as NIN_KEYSELECT and Shift+F10 or the Menu key as
+       WM_CONTEXTMENU. It also moves the event into LOWORD(lParam) and puts the
+       icon's anchor point into wParam. */
+    g_nid.uVersion = NOTIFYICON_VERSION_4;
+    Shell_NotifyIconW(NIM_SETVERSION, &g_nid);
 }
 
 static void RemoveTrayIcon(void)
@@ -358,23 +382,103 @@ static void RemoveMouseHook(void)
 
 /* ---- Hotkeys ---- */
 
+/* Holding the brighten or dim combination keeps stepping, as it always has.
+   The popup hotkey gets MOD_NOREPEAT, because a held key would otherwise open
+   and close the popup over and over. */
+static BOOL RegisterOne(int action, Hotkey hk)
+{
+    if (hk.vk == 0)
+        return TRUE;   /* disabled, nothing to hold */
+    UINT mods = hk.mods | (action == HOTKEY_POPUP ? MOD_NOREPEAT : 0);
+    return RegisterHotKey(g_hwndHidden, kHotkeyIds[action], mods, hk.vk);
+}
+
+static void ReleaseAll(void)
+{
+    for (int i = 0; i < HOTKEY_COUNT; i++)
+        UnregisterHotKey(g_hwndHidden, kHotkeyIds[i]);
+}
+
+/* Put g_hotkeysActive back after a capture or a rejected Save. Another program
+   can take a combination in the meantime; such a hotkey is dropped and
+   reported, so the Settings window shows it instead of claiming it works. */
+static void ReregisterActive(void)
+{
+    for (int i = 0; i < HOTKEY_COUNT; i++) {
+        if (!RegisterOne(i, g_hotkeysActive[i])) {
+            DbgLog("hotkey %d was taken by another program", i);
+            g_hotkeysActive[i].vk = 0;
+            if (g_hotkeyStartupFailure < 0)
+                g_hotkeyStartupFailure = i;
+        }
+    }
+}
+
+/* Startup: register what the settings ask for. A combination another program
+   already holds is skipped, since there is nobody to ask at this point. The
+   Settings window shows the conflict on the row when it next opens. */
 static void RegisterHotkeys(HWND hwnd)
 {
-    RegisterHotKey(hwnd, WM_HOTKEY_BRIGHTEN, MOD_CONTROL | MOD_ALT, VK_UP);
-    RegisterHotKey(hwnd, WM_HOTKEY_DIM,      MOD_CONTROL | MOD_ALT, VK_DOWN);
+    (void)hwnd;
+    for (int i = 0; i < HOTKEY_COUNT; i++) {
+        g_hotkeysActive[i] = g_settings.hotkeys[i];
+        if (!RegisterOne(i, g_settings.hotkeys[i])) {
+            DbgLog("hotkey %d is in use by another program", i);
+            g_hotkeysActive[i].vk = 0;
+            if (g_hotkeyStartupFailure < 0)
+                g_hotkeyStartupFailure = i;
+        }
+    }
 }
 
 static void UnregisterHotkeys(HWND hwnd)
 {
-    UnregisterHotKey(hwnd, WM_HOTKEY_BRIGHTEN);
-    UnregisterHotKey(hwnd, WM_HOTKEY_DIM);
+    (void)hwnd;
+    ReleaseAll();
+}
+
+/* Swap in a whole new set, or none of it. Our own registrations are released
+   first, because RegisterHotKey refuses a combination this window already
+   holds under another id. On failure the previous set goes back, so a rejected
+   Save never leaves the user without working hotkeys. */
+static int ApplyHotkeys(const Hotkey *hotkeys)
+{
+    ReleaseAll();
+    for (int i = 0; i < HOTKEY_COUNT; i++) {
+        if (!RegisterOne(i, hotkeys[i])) {
+            ReleaseAll();
+            ReregisterActive();
+            return i;
+        }
+    }
+    for (int i = 0; i < HOTKEY_COUNT; i++)
+        g_hotkeysActive[i] = hotkeys[i];
+    g_hotkeysSuspended = FALSE;
+    g_hotkeyStartupFailure = -1;
+    return -1;
+}
+
+static int FirstFailedHotkey(void)
+{
+    return g_hotkeyStartupFailure;
+}
+
+static void SuspendHotkeys(BOOL suspended)
+{
+    if (suspended == g_hotkeysSuspended)
+        return;
+    g_hotkeysSuspended = suspended;
+    if (suspended)
+        ReleaseAll();
+    else
+        ReregisterActive();
 }
 
 /* ---- Context Menu ---- */
 
-static void ShowContextMenu(HWND hwnd)
+static void ShowContextMenu(HWND hwnd, const POINT *anchor, BOOL fromKeyboard)
 {
-    UI_ShowContextMenu(hwnd, &g_settings);
+    UI_ShowContextMenu(hwnd, &g_settings, anchor, fromKeyboard);
 }
 
 /* ---- Hotkey Handler ---- */
@@ -403,6 +507,22 @@ static void HandleHotkey(int id)
     switch (id) {
     case WM_HOTKEY_BRIGHTEN: delta = step;  break;
     case WM_HOTKEY_DIM:      delta = -step; break;
+    case WM_HOTKEY_POPUP:
+        /* No tray icon to anchor to, so the popup opens in the middle of the
+           monitor the cursor is on. WM_HOTKEY grants the foreground right that
+           UI_ShowPopup needs to take the keyboard focus. */
+        if (UI_IsPopupVisible(g_hwndPopup)) {
+            UI_HidePopup(g_hwndPopup);
+        } else {
+            POINT pt;
+            GetCursorPos(&pt);
+            MONITORINFO mi = { sizeof(mi) };
+            GetMonitorInfoW(MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST), &mi);
+            POINT center = { (mi.rcWork.left + mi.rcWork.right) / 2,
+                             (mi.rcWork.top + mi.rcWork.bottom) / 2 };
+            UI_ShowPopup(g_hwndPopup, &g_monitors, &center, TRUE);
+        }
+        return;
     default: return;
     }
 
@@ -445,7 +565,7 @@ static void HandleHotkey(int id)
                 break;
             }
         }
-        UI_ShowOSD(g_hInst, hCurMon, pct);
+        UI_ShowOSD(g_hInst, hCurMon, pct, !UI_IsPopupVisible(g_hwndPopup));
     }
 
     /* Update popup if visible */
@@ -739,16 +859,37 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
     }
 
     switch (msg) {
-    case WM_TRAYICON:
+    case WM_TRAYICON: {
+        /* NOTIFYICON_VERSION_4: event in LOWORD(lParam), anchor in wParam. */
+        POINT anchor = { GET_X_LPARAM(wParam), GET_Y_LPARAM(wParam) };
         switch (LOWORD(lParam)) {
-        case WM_LBUTTONUP:
-            UI_TogglePopup(g_hwndPopup, &g_monitors);
+        case NIN_SELECT:          /* left click */
+            /* Ignored right after a keyboard select, in case the shell sends
+               both for one Enter: the toggle would close the popup again. */
+            if (GetTickCount() - g_trayKeySelectTick > TRAY_CLICK_WINDOW_MS)
+                UI_TogglePopup(g_hwndPopup, &g_monitors);
             break;
+        case NIN_KEYSELECT:
+            /* Show, never toggle: Enter can deliver NIN_KEYSELECT twice, and a
+               toggle would close the popup again at once. */
+            g_trayKeySelectTick = GetTickCount();
+            if (!UI_IsPopupVisible(g_hwndPopup))
+                UI_ShowPopup(g_hwndPopup, &g_monitors, &anchor, TRUE);
+            break;
+        case WM_RBUTTONDOWN:
         case WM_RBUTTONUP:
-            ShowContextMenu(hwnd);
+            g_trayRightClickTick = GetTickCount();
+            break;
+        case WM_CONTEXTMENU:      /* right click, Shift+F10 or the Menu key */
+            /* A right click sends button messages just before; without one,
+               the menu was opened from the keyboard. The button-up counts too,
+               so a long press still reads as a click. */
+            ShowContextMenu(hwnd, &anchor,
+                            GetTickCount() - g_trayRightClickTick > TRAY_CLICK_WINDOW_MS);
             break;
         }
         return 0;
+    }
 
     case WM_HOTKEY:
         HandleHotkey((int)wParam);
@@ -933,12 +1074,17 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
             /* Release the handles we are replacing, except any the fresh list
                has acquired again: destroying those would invalidate the list we
                are about to adopt. */
+            /* The popup goes first. Destroying it while active finishes any
+               key or mouse drag, which writes to the monitor of that row; that
+               must happen while the row still means the same monitor and its
+               handle is still open. */
+            if (g_hwndPopup) DestroyWindow(g_hwndPopup);
+            g_hwndPopup = NULL;
             TIMED("rescan done: cleanup",
                   Monitor_CleanupExcept(&g_monitors, fresh));
             g_monitors = *fresh;            /* adopt fresh list (plain struct copy) */
             free(fresh);
             Settings_LoadDeltas(&g_settings, &g_monitors);
-            if (g_hwndPopup) DestroyWindow(g_hwndPopup);
             g_hwndPopup = UI_CreatePopup(g_hInst, &g_monitors);
             /* g_idleDimmed is included so a monitor plugged in during an idle
                stretch gets the idle level too, instead of staying bright. */

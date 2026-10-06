@@ -8,6 +8,7 @@
 #define WM_HOTKEY_DIM       2
 #define WM_HOTKEY_PREV_MON  3
 #define WM_HOTKEY_NEXT_MON  4
+#define WM_HOTKEY_POPUP     5
 
 #define IDM_RESCAN          2001
 #define IDM_AUTOSTART       2002

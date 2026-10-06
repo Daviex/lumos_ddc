@@ -12,6 +12,7 @@
 #define CLR_TRACK       0x313244   /* #313244 */
 #define CLR_SURFACE     0x2D2E3E   /* #2d2e3e */
 #define CLR_SUBTEXT     0x9EA0B0   /* #9ea0b0 */
+#define CLR_ERROR       0xF38BA8   /* #f38ba8, a hotkey that could not be used */
 
 /* Popup dimensions */
 #define POPUP_WIDTH     320
@@ -31,8 +32,10 @@ void UI_Shutdown(void);
 /* Create the popup window (hidden initially) */
 HWND UI_CreatePopup(HINSTANCE hInst, MonitorList *ml);
 
-/* Show popup above tray icon */
-void UI_ShowPopup(HWND hwnd, MonitorList *ml);
+/* Show the popup. anchor is the screen point to place it at (NULL = the
+   cursor). fromKeyboard draws the focus ring from the start, the way Windows
+   shows focus cues only once the keyboard is in use. */
+void UI_ShowPopup(HWND hwnd, MonitorList *ml, const POINT *anchor, BOOL fromKeyboard);
 
 /* Hide popup */
 void UI_HidePopup(HWND hwnd);
@@ -46,8 +49,10 @@ BOOL UI_IsPopupVisible(HWND hwnd);
 /* Refresh popup visuals (call after brightness changes) */
 void UI_RefreshPopup(HWND hwnd, MonitorList *ml);
 
-/* Show brief OSD overlay on a monitor */
-void UI_ShowOSD(HINSTANCE hInst, HMONITOR hMon, int percent);
+/* Show brief OSD overlay on a monitor. announce also speaks the level to a
+   screen reader; pass FALSE while the popup is open, since its focused slider
+   already reports the change. */
+void UI_ShowOSD(HINSTANCE hInst, HMONITOR hMon, int percent, BOOL announce);
 
 /* Set callback invoked when delta buttons are clicked (for saving to INI) */
 typedef void (*DeltaSaveCallback)(void);
@@ -65,8 +70,9 @@ void UI_SetManualChangeCallback(ManualChangeCallback cb);
 #define CTXMENU_CORNER  8
 #define CTXMENU_PAD     6
 
-/* Show custom dark context menu at cursor */
-void UI_ShowContextMenu(HWND hwndOwner, Settings *s);
+/* Show custom dark context menu at anchor (NULL = the cursor). fromKeyboard
+   puts the highlight on the first item. */
+void UI_ShowContextMenu(HWND hwndOwner, Settings *s, const POINT *anchor, BOOL fromKeyboard);
 
 /* Editor window dimensions */
 #define SCHED_WIDTH     300
@@ -90,6 +96,18 @@ void UI_ShowScheduleEditor(HWND hwndOwner, Settings *s);
 /* Show the settings window. On Save it writes the edited values into *s and
    posts WM_COMMAND(IDM_SETTINGS_SAVED) to hwndOwner. */
 void UI_ShowSettings(HWND hwndOwner, Settings *s);
+
+/* The settings window cannot register hotkeys itself, because the owner window
+   holds them. apply tries a full set and returns -1 when every hotkey was
+   registered, or the HOTKEY_* action that failed (the previous set is then
+   restored). suspend releases the hotkeys while the user is pressing a new
+   combination, which would otherwise fire the old action instead. */
+typedef struct {
+    int  (*apply)(const Hotkey *hotkeys);
+    void (*suspend)(BOOL suspended);
+    int  (*firstFailed)(void);   /* configured but not registered at startup, or -1 */
+} HotkeyHost;
+void UI_SetHotkeyHost(const HotkeyHost *host);
 
 /* About window dimensions */
 #define ABOUT_WIDTH     300

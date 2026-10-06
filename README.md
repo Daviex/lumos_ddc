@@ -23,6 +23,7 @@
 - [How it works](#how-it-works)
 - [Install](#install)
 - [Usage](#usage)
+- [Keyboard and screen readers](#keyboard-and-screen-readers)
 - [Configuration](#configuration)
 - [Requirements](#requirements)
 - [Notes and limitations](#notes-and-limitations)
@@ -43,7 +44,8 @@ Windows can dim a laptop panel, but it will not touch the brightness of external
 | Dim internal laptop panel | Yes | Yes |
 | Dim external monitors (DDC/CI) | No | Yes |
 | One control for all screens at once | No | Yes |
-| Global hotkeys | No | Yes |
+| Global hotkeys | No | Yes, configurable |
+| Keyboard and screen reader access | n/a | Yes |
 | Mouse-wheel over tray icon | No | Yes |
 | Per-monitor offset (delta) | No | Yes |
 | Time-of-day brightness schedule | No | Yes |
@@ -65,13 +67,14 @@ Windows can dim a laptop panel, but it will not touch the brightness of external
 
 - **Dual backend** - External monitors via DDC/CI (dxva2), internal laptop panels via WMI, transparently in the same UI.
 - **Tray popup** - Dark themed, per-monitor sliders plus an "All Monitors" master slider.
-- **Global hotkeys** - `Ctrl+Alt+Up` / `Ctrl+Alt+Down` change brightness on all screens.
+- **Global hotkeys** - `Ctrl+Win+Up` / `Ctrl+Win+Down` change brightness on all screens, and `Ctrl+Win+B` opens the popup. All three can be changed in the Settings window. An existing installation that is upgraded keeps `Ctrl+Alt+Up` / `Ctrl+Alt+Down`.
+- **Keyboard and screen reader access** - The tray icon, the popup, the menu, Settings and About work entirely from the keyboard, and screen readers such as NVDA and Narrator read every control. With NVDA, a hotkey or tray-wheel change is spoken ("Brightness 45%") even while another application has the focus.
 - **Mouse wheel on the tray icon** - Scroll over the tray icon to nudge brightness up or down.
 - **Per-monitor delta** - Offset an individual monitor (-40..+40) so mismatched panels line up under the master slider.
 - **Brightness schedule** - Optional time-of-day schedule that smoothly ramps brightness across the day (piecewise-linear, wraps around midnight). A manual change suspends it until the next anchor.
 - **Idle auto-dim** - Optional. After a configurable idle period (default 5 minutes) the brightness drops to a configurable low level (default 5%), and it returns to the previous level as soon as you touch the keyboard or the mouse. Fullscreen video, presentation mode and live calls are skipped, so a movie you are watching or a Teams call you are sitting through without touching anything is not dimmed. Calls are detected by the microphone or the camera being in use, not by the name of the application, so any conferencing tool counts.
 - **Presets** - Night, Day, and Presentation, with editable brightness values.
-- **Settings window** - A dark themed screen for the brightness step, the idle dim level and timeout, the schedule and autostart switches, and the preset values. Right-click the tray icon and pick Settings.
+- **Settings window** - A dark themed screen for the brightness step, the hotkeys, the idle dim level and timeout, the schedule and autostart switches, and the preset values. Right-click the tray icon and pick Settings.
 - **On-screen display** - A clean overlay with the current percentage and a progress bar.
 - **Auto-reconnect and restore** - Re-detects monitors on plug/unplug, session unlock, display power-on, and wake from sleep. Beyond recovering stale DDC handles, it re-applies your brightness (the schedule value, or the last master level) because displays often reset to full brightness across sleep or standby.
 - **Autostart** - Optional launch at login.
@@ -103,9 +106,9 @@ mkdir -p build
 x86_64-w64-mingw32-windres lumos.rc -O coff -o build/lumos.res
 x86_64-w64-mingw32-gcc -O2 -Wall -mwindows -DUNICODE -D_UNICODE -D_WIN32_WINNT=0x0A00 \
   lumos.c monitor.c ui.c ui_draw.c ui_popup.c ui_osd.c ui_menu.c ui_sched.c ui_settings.c ui_about.c \
-  presets.c schedule.c wmibright.c capture.c build/lumos.res \
+  presets.c schedule.c hotkey.c a11y.c wmibright.c capture.c build/lumos.res \
   -o build/lumos.exe \
-  -ldxva2 -luser32 -lgdi32 -lshell32 -lcomctl32 -ladvapi32 -lole32 -loleaut32 -lwbemuuid -ldwmapi -lwtsapi32 -lkernel32 -lm
+  -ldxva2 -luser32 -lgdi32 -lshell32 -lcomctl32 -ladvapi32 -lole32 -loleaut32 -lwbemuuid -ldwmapi -lwtsapi32 -loleacc -lkernel32 -lm
 ```
 
 Or with MSVC from a Developer Command Prompt (also writes to `build/`):
@@ -122,9 +125,27 @@ build.bat debug      :: debug build, logs to %APPDATA%\Lumos\lumos-*.log
 | **Left-click** tray icon | Open the brightness popup |
 | **Right-click** tray icon | Context menu (presets, re-scan, settings, schedule, idle dim, autostart, exit) |
 | **Mouse wheel** over tray icon | Brightness up / down by one step (default 5%) |
-| `Ctrl+Alt+Up` / `Ctrl+Alt+Down` | Brightness up / down on all monitors |
+| `Ctrl+Win+Up` / `Ctrl+Win+Down` | Brightness up / down on all monitors |
+| `Ctrl+Win+B` | Open the brightness popup with keyboard focus |
 | Drag a slider in the popup | Set that monitor; drag the master slider for all at once |
 | Click the `-` / `+` on a monitor row | Adjust that monitor's delta offset |
+
+## Keyboard and screen readers
+
+Everything Lumos does can be reached without a mouse, and every window exposes its controls to screen readers through Microsoft Active Accessibility. The windows are drawn by Lumos itself rather than built from standard Windows controls, so this support is part of each window and not something Windows supplies on its own.
+
+To reach the tray icon, press `Win+B` and move to the Lumos icon with the arrow keys. `Enter` or `Space` opens the popup, and `Shift+F10` or the Menu key opens the context menu. The `Ctrl+Win+B` hotkey opens the popup directly.
+
+| Window | Keys |
+|---|---|
+| Popup | `Tab` / `Shift+Tab` move between sliders and offsets. The arrow keys change the value by 1 (`Up` and `Right` raise it), `Page Up` / `Page Down` by 10, and `Home` / `End` jump to the limits. `Esc` closes. |
+| Context menu | `Up` / `Down` move, `Home` / `End` jump to the first or last item, a letter jumps to the next item that starts with it, `Enter` or `Space` chooses, and `Esc` closes. |
+| Settings | `Tab`, `Shift+Tab`, `Up` and `Down` move between rows and the Save button. `Left` / `Right` change a number or flip a switch, and `Space` flips a switch. `Enter` on a hotkey row starts recording a new combination, and anywhere else it saves. `Esc` closes without saving. |
+| About | `Enter` opens the project page and `Esc` closes. |
+
+To change a hotkey, focus its row in Settings, press `Enter`, and press the new combination. A hotkey needs `Ctrl`, `Alt` or `Win`. While a row is recording, `Esc` cancels and `Backspace` turns the hotkey off. If another program already uses the combination, Save leaves the window open and the row says "In use by another app".
+
+When a hotkey or the mouse wheel changes the brightness, the on-screen display announces the level ("Brightness 45%") as a live region. NVDA reads it even while another application has the focus. Narrator does not, because it ignores announcements from applications in the background; with Narrator, open the popup (`Ctrl+Win+B`) to hear the current level. While the popup is open, the focused slider reports every change.
 
 ## Configuration
 
@@ -148,6 +169,9 @@ ScheduleEnabled=0
 IdleDimEnabled=0
 IdleDimPercent=5
 IdleDimMinutes=5
+HotkeyBrighten=Ctrl+Win+Up
+HotkeyDim=Ctrl+Win+Down
+HotkeyPopup=Ctrl+Win+B
 
 [Schedule]
 07:00=60
@@ -156,7 +180,9 @@ IdleDimMinutes=5
 23:00=25
 ```
 
-In the Settings window a value changes by clicking its `-` and `+` buttons or by scrolling the wheel over the row, a switch flips by clicking it, and nothing is written until you press Save. Clicking outside the window cancels.
+In the Settings window a value changes by clicking its `-` and `+` buttons or by scrolling the wheel over the row, a switch flips by clicking it, and nothing is written until you press Save. Cancel, `Esc` or a click outside the window closes it without saving. The schedule editor works the same way, and both windows can be moved by dragging any spot that is not a control.
+
+Hotkeys are stored as text. Modifiers are `Ctrl`, `Alt`, `Shift` and `Win`, and keys are letters, digits, `F1` to `F24`, the arrows, `Home`, `End`, `PageUp`, `PageDown`, `Insert`, `Delete`, `Space`, `Enter`, `Tab`, `Backspace`, `Pause` and the numeric keypad (`Num0` to `Num9`, `NumPlus`, `NumMinus`, `NumMultiply`, `NumDivide`, `NumDecimal`). `None` turns a hotkey off. A value that cannot be read falls back to the default. A `config.ini` from version 1.1 or older has no hotkey lines, and it keeps the `Ctrl+Alt+Up` / `Ctrl+Alt+Down` brightness hotkeys that those versions used.
 
 The idle auto-dim keys work together. `IdleDimEnabled` turns the feature on and off, and the tray context menu toggles the same key. `IdleDimPercent` is the level held while the session is idle (0 to 100). `IdleDimMinutes` is how long there must be no keyboard or mouse input before the dim happens (1 to 1440 minutes).
 

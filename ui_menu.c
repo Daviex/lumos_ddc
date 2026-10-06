@@ -1,4 +1,5 @@
 #include "ui_internal.h"
+#include <wctype.h>
 
 static const WCHAR CTXMENU_CLASS[] = L"LumosCtxMenu";
 static HWND g_ctxHwnd = NULL;
@@ -25,6 +26,10 @@ typedef struct {
 } CtxMenuData;
 
 static CtxMenuData g_ctxData;
+
+/* Posted to the menu itself, so an item chosen through MSAA (inside a COM
+   call) closes the menu after the call has returned. wParam = item index. */
+#define WM_CTX_INVOKE (WM_APP + 1)
 
 static void BuildContextMenu(CtxMenuData *d, Settings *s)
 {
@@ -237,18 +242,177 @@ static void RenderContextMenu(HWND hwnd, CtxMenuData *d)
     DeleteDC(dc);
 }
 
+/* ---- Keyboard and screen reader ----
+   Separators are drawing only: screen readers see the selectable items, which
+   is why the model index and the item index are told apart below. */
+
+static int CtxSelectableCount(CtxMenuData *d)
+{
+    int n = 0;
+    for (int i = 0; i < d->count; i++)
+        if (d->items[i].type == CTX_ITEM_NORMAL) n++;
+    return n;
+}
+
+static int CtxItemFromModel(CtxMenuData *d, int index)
+{
+    for (int i = 0; i < d->count; i++)
+        if (d->items[i].type == CTX_ITEM_NORMAL && index-- == 0)
+            return i;
+    return -1;
+}
+
+static int CtxModelFromItem(CtxMenuData *d, int item)
+{
+    if (item < 0 || item >= d->count || d->items[item].type != CTX_ITEM_NORMAL)
+        return -1;
+    int n = 0;
+    for (int i = 0; i < item; i++)
+        if (d->items[i].type == CTX_ITEM_NORMAL) n++;
+    return n;
+}
+
+static void CtxItemRect(CtxMenuData *d, int item, RECT *rc)
+{
+    int cy = CTXMENU_PAD;
+    for (int i = 0; i < item; i++)
+        cy += (d->items[i].type == CTX_ITEM_SEPARATOR) ? CTXMENU_SEP_H : CTXMENU_ITEM_H;
+    SetRect(rc, 4, cy, CTXMENU_WIDTH - 4, cy + CTXMENU_ITEM_H);
+}
+
+static int CtxA11yCount(void *ctx)
+{
+    return CtxSelectableCount((CtxMenuData *)ctx);
+}
+
+static void CtxA11yDescribe(void *ctx, int index, A11yItem *out)
+{
+    CtxMenuData *d = (CtxMenuData *)ctx;
+    if (index < 0) {
+        out->role = ROLE_SYSTEM_MENUPOPUP;
+        wcscpy(out->name, APP_NAME);
+        return;
+    }
+    int item = CtxItemFromModel(d, index);
+    if (item < 0)
+        return;
+    out->role = ROLE_SYSTEM_MENUITEM;
+    out->state = STATE_SYSTEM_FOCUSABLE;
+    if (d->items[item].checked)
+        out->state |= STATE_SYSTEM_CHECKED;
+    CtxItemRect(d, item, &out->rect);
+    wcsncpy(out->name, d->items[item].label, 159);
+    wcscpy(out->action, L"Execute");
+}
+
+static int CtxA11yFocused(void *ctx)
+{
+    CtxMenuData *d = (CtxMenuData *)ctx;
+    return CtxModelFromItem(d, d->hoverIndex);
+}
+
+static BOOL CtxA11yInvoke(void *ctx, int index)
+{
+    int item = CtxItemFromModel((CtxMenuData *)ctx, index);
+    if (item < 0 || !g_ctxHwnd)
+        return FALSE;
+    PostMessageW(g_ctxHwnd, WM_CTX_INVOKE, (WPARAM)item, 0);
+    return TRUE;
+}
+
+static const A11yModel g_ctxModel = {
+    CtxA11yCount, CtxA11yDescribe, CtxA11yFocused, CtxA11yInvoke, &g_ctxData
+};
+
+static void CtxSetHover(HWND hwnd, CtxMenuData *d, int item)
+{
+    if (item == d->hoverIndex)
+        return;
+    d->hoverIndex = item;
+    RenderContextMenu(hwnd, d);
+    int index = CtxModelFromItem(d, item);
+    if (index >= 0)
+        A11y_NotifyFocus(hwnd, index);
+}
+
+/* Next selectable item from 'from' in direction dir (+1/-1), wrapping. */
+static int CtxStep(CtxMenuData *d, int from, int dir)
+{
+    for (int n = 0; n < d->count; n++) {
+        from = (from + dir + d->count) % d->count;
+        if (d->items[from].type == CTX_ITEM_NORMAL)
+            return from;
+    }
+    return -1;
+}
+
+static void CtxInvoke(HWND hwnd, CtxMenuData *d, int item)
+{
+    if (item < 0 || item >= d->count || d->items[item].type != CTX_ITEM_NORMAL)
+        return;
+    int id = d->items[item].id;
+    HWND owner = d->hwndOwner;
+    DestroyWindow(hwnd);
+    g_ctxHwnd = NULL;
+    PostMessageW(owner, WM_COMMAND, (WPARAM)id, 0);
+}
+
+/* Standard menu keys: Up and Down move (wrapping), Home and End jump, Enter
+   and Space choose, Escape closes. A letter jumps to the next item starting
+   with it, as in a native menu. */
+static void CtxKeyDown(HWND hwnd, CtxMenuData *d, WPARAM vk)
+{
+    switch (vk) {
+    case VK_DOWN:   CtxSetHover(hwnd, d, CtxStep(d, d->hoverIndex < 0 ? -1 : d->hoverIndex, 1)); return;
+    case VK_UP:     CtxSetHover(hwnd, d, CtxStep(d, d->hoverIndex < 0 ? 0 : d->hoverIndex, -1)); return;
+    case VK_HOME:   CtxSetHover(hwnd, d, CtxStep(d, -1, 1)); return;
+    case VK_END:    CtxSetHover(hwnd, d, CtxStep(d, 0, -1)); return;
+    case VK_RETURN:
+    case VK_SPACE:  CtxInvoke(hwnd, d, d->hoverIndex); return;
+    case VK_ESCAPE:
+        DestroyWindow(hwnd);
+        g_ctxHwnd = NULL;
+        return;
+    default:
+        break;
+    }
+    if ((vk >= 'A' && vk <= 'Z') || (vk >= '0' && vk <= '9')) {
+        int i = d->hoverIndex < 0 ? -1 : d->hoverIndex;
+        for (int n = 0; n < d->count; n++) {
+            i = CtxStep(d, i, 1);
+            if (i >= 0 && (WCHAR)towupper(d->items[i].label[0]) == (WCHAR)vk) {
+                CtxSetHover(hwnd, d, i);
+                return;
+            }
+        }
+    }
+}
+
 static LRESULT CALLBACK CtxMenuWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
     CtxMenuData *d = &g_ctxData;
 
     switch (msg) {
+    case WM_GETOBJECT: {
+        LRESULT r;
+        if (A11y_HandleGetObject(hwnd, wParam, lParam, &r))
+            return r;
+        break;
+    }
+
+    case WM_KEYDOWN:
+        CtxKeyDown(hwnd, d, wParam);
+        return 0;
+
+    case WM_CTX_INVOKE:
+        CtxInvoke(hwnd, d, (int)wParam);
+        return 0;
+
     case WM_MOUSEMOVE: {
         int y = (short)HIWORD(lParam);
         int idx = CtxMenuHitTest(d, y);
-        if (idx != d->hoverIndex) {
-            d->hoverIndex = idx;
-            RenderContextMenu(hwnd, d);
-        }
+        if (idx >= 0)
+            CtxSetHover(hwnd, d, idx);
         TRACKMOUSEEVENT tme = { sizeof(tme), TME_LEAVE, hwnd, 0 };
         TrackMouseEvent(&tme);
         return 0;
@@ -263,14 +427,7 @@ static LRESULT CALLBACK CtxMenuWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
 
     case WM_LBUTTONUP: {
         int y = (short)HIWORD(lParam);
-        int idx = CtxMenuHitTest(d, y);
-        if (idx >= 0 && idx < d->count && d->items[idx].type == CTX_ITEM_NORMAL) {
-            int id = d->items[idx].id;
-            HWND owner = d->hwndOwner;
-            DestroyWindow(hwnd);
-            g_ctxHwnd = NULL;
-            PostMessageW(owner, WM_COMMAND, (WPARAM)id, 0);
-        }
+        CtxInvoke(hwnd, d, CtxMenuHitTest(d, y));
         return 0;
     }
 
@@ -282,6 +439,8 @@ static LRESULT CALLBACK CtxMenuWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
         return 0;
 
     case WM_DESTROY:
+        A11y_NotifyMenuPopup(hwnd, FALSE);
+        A11y_Detach(hwnd);
         g_ctxHwnd = NULL;
         return 0;
 
@@ -291,7 +450,7 @@ static LRESULT CALLBACK CtxMenuWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
     return DefWindowProcW(hwnd, msg, wParam, lParam);
 }
 
-void UI_ShowContextMenu(HWND hwndOwner, Settings *s)
+void UI_ShowContextMenu(HWND hwndOwner, Settings *s, const POINT *anchor, BOOL fromKeyboard)
 {
     /* Destroy previous if still open */
     if (g_ctxHwnd && IsWindow(g_ctxHwnd)) {
@@ -305,9 +464,12 @@ void UI_ShowContextMenu(HWND hwndOwner, Settings *s)
     int w = CTXMENU_WIDTH;
     int h = GetCtxMenuHeight(&g_ctxData);
 
-    /* Position at cursor, adjusted to stay on-screen */
+    /* Position at the anchor (the tray icon) or the cursor, adjusted to stay on-screen */
     POINT pt;
-    GetCursorPos(&pt);
+    if (anchor)
+        pt = *anchor;
+    else
+        GetCursorPos(&pt);
 
     HMONITOR hMon = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
     MONITORINFO mi = { sizeof(mi) };
@@ -334,10 +496,19 @@ void UI_ShowContextMenu(HWND hwndOwner, Settings *s)
         NULL, NULL, g_uiInst, NULL);
 
     if (!g_ctxHwnd) return;
+    A11y_Attach(g_ctxHwnd, &g_ctxModel);
+
+    /* From the keyboard the first item starts highlighted, as in a native menu.
+       A mouse user gets the highlight when the pointer moves over an item. */
+    if (fromKeyboard)
+        g_ctxData.hoverIndex = CtxStep(&g_ctxData, -1, 1);
 
     RenderContextMenu(g_ctxHwnd, &g_ctxData);
     ShowWindow(g_ctxHwnd, SW_SHOWNOACTIVATE);
     SetForegroundWindow(g_ctxHwnd);
+    A11y_NotifyMenuPopup(g_ctxHwnd, TRUE);
+    if (g_ctxData.hoverIndex >= 0)
+        A11y_NotifyFocus(g_ctxHwnd, CtxModelFromItem(&g_ctxData, g_ctxData.hoverIndex));
 }
 
 /* ---- Class registration ---- */
