@@ -7,7 +7,7 @@ setlocal
 
 if not exist build mkdir build
 
-set DEFS=/D_UNICODE /DUNICODE
+set DEFS=/D_UNICODE /DUNICODE /D_WIN32_WINNT=0x0A00
 if /i "%1"=="debug" (
     echo Building Lumos [DEBUG]...
     set DEFS=%DEFS% /DDEBUG
@@ -24,7 +24,8 @@ if errorlevel 1 (
 
 :: Compile and link (all intermediates and the exe go to build\)
 cl /nologo /O2 /W4 /WX- %DEFS% ^
-   lumos.c monitor.c ui.c presets.c schedule.c wmibright.c capture.c ^
+   lumos.c monitor.c ui.c ui_draw.c ui_popup.c ui_osd.c ui_menu.c ^
+   ui_sched.c ui_settings.c ui_about.c presets.c schedule.c wmibright.c capture.c ^
    build\lumos.res ^
    /Fo"build\\" /Fe:build\lumos.exe ^
    /link /subsystem:windows ^

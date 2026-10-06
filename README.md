@@ -101,8 +101,9 @@ Cross-compile from Linux/WSL with MinGW (outputs land in `build/`):
 ```bash
 mkdir -p build
 x86_64-w64-mingw32-windres lumos.rc -O coff -o build/lumos.res
-x86_64-w64-mingw32-gcc -O2 -Wall -mwindows -DUNICODE -D_UNICODE \
-  lumos.c monitor.c ui.c presets.c schedule.c wmibright.c capture.c build/lumos.res \
+x86_64-w64-mingw32-gcc -O2 -Wall -mwindows -DUNICODE -D_UNICODE -D_WIN32_WINNT=0x0A00 \
+  lumos.c monitor.c ui.c ui_draw.c ui_popup.c ui_osd.c ui_menu.c ui_sched.c ui_settings.c ui_about.c \
+  presets.c schedule.c wmibright.c capture.c build/lumos.res \
   -o build/lumos.exe \
   -ldxva2 -luser32 -lgdi32 -lshell32 -lcomctl32 -ladvapi32 -lole32 -loleaut32 -lwbemuuid -ldwmapi -lwtsapi32 -lkernel32 -lm
 ```
