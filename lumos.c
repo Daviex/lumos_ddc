@@ -14,6 +14,7 @@
 #include "ui.h"
 #include "presets.h"
 #include "capture.h"
+#include "remote.h"
 
 /* GUID_CONSOLE_DISPLAY_STATE {6FE69556-704A-47A0-8F24-C28D936FDA47}
    Defined manually because some MinGW headers omit it. Fires on display
@@ -120,6 +121,8 @@ static void ApplyPreset(int index);
 static void InstallMouseHook(void);
 static void RemoveMouseHook(void);
 static void ScheduleRescan(HWND hwnd);
+static void ScheduleRescanFromTrigger(HWND hwnd);
+static const AppControl kAppControl;   /* lumosctl actions, defined below */
 static void StartRescan(HWND hwnd);
 static DWORD WINAPI RescanThreadProc(LPVOID param);
 
@@ -211,6 +214,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdLineA, int showCmd
     UI_SetDeltaSaveCallback(SaveDeltasCallback);
     static const HotkeyHost hotkeyHost = { ApplyHotkeys, SuspendHotkeys, FirstFailedHotkey };
     UI_SetHotkeyHost(&hotkeyHost);
+    Remote_Init(&kAppControl);
 
     /* Tray icon, hotkeys, mouse hook */
     CreateTrayIcon(g_hwndHidden);
@@ -491,12 +495,44 @@ static int MasterTargetFromMonitors(void)
     for (int i = 0; i < g_monitors.count; i++) {
         BrightMonitor *mon = &g_monitors.monitors[i];
         if (!mon->controllable) continue;
-        DWORD range = mon->brightnessMax - mon->brightnessMin;
-        int pct = range > 0 ? (int)(((mon->brightnessCur - mon->brightnessMin) * 100) / range) : 0;
-        sum += pct - mon->delta;
+        sum += Monitor_GetPercent(mon) - mon->delta;
         cnt++;
     }
     return cnt > 0 ? sum / cnt : 50;
+}
+
+/* Move the master level by delta, the way the All Monitors slider would.
+   Shared by the hotkeys, the tray wheel and lumosctl; the OSD is the caller's. */
+static void StepMaster(int delta)
+{
+    /* Initialize target from current state if needed */
+    if (g_masterTarget < 0)
+        g_masterTarget = MasterTargetFromMonitors();
+
+    g_masterTarget += delta;
+
+    /* Allow target to exceed 0-100 so monitors with large deltas can reach full range.
+       Limits: every monitor's (target + delta) should be able to span 0-100. */
+    int minDelta = 0, maxDelta = 0;
+    for (int i = 0; i < g_monitors.count; i++) {
+        if (!g_monitors.monitors[i].controllable) continue;
+        int d = g_monitors.monitors[i].delta;
+        if (d < minDelta) minDelta = d;
+        if (d > maxDelta) maxDelta = d;
+    }
+    int lo = 0 - maxDelta;   /* so monitor with max delta can reach 0 */
+    int hi = 100 - minDelta;  /* so monitor with min delta can reach 100 */
+    if (g_masterTarget < lo) g_masterTarget = lo;
+    if (g_masterTarget > hi) g_masterTarget = hi;
+
+    TIMED("step: SetAllBrightness",
+          Monitor_SetAllBrightness(&g_monitors, g_masterTarget));
+    TIMED("step: RefreshBrightness", Monitor_RefreshBrightness(&g_monitors));
+
+    /* Update popup if visible */
+    UI_RefreshPopup(g_hwndPopup, &g_monitors);
+
+    ManualChange();
 }
 
 static void HandleHotkey(int id)
@@ -526,31 +562,9 @@ static void HandleHotkey(int id)
     default: return;
     }
 
-    /* Initialize target from current state if needed */
-    if (g_masterTarget < 0)
-        g_masterTarget = MasterTargetFromMonitors();
-
-    g_masterTarget += delta;
-
-    /* Allow target to exceed 0-100 so monitors with large deltas can reach full range.
-       Limits: every monitor's (target + delta) should be able to span 0-100. */
-    int minDelta = 0, maxDelta = 0;
-    for (int i = 0; i < g_monitors.count; i++) {
-        if (!g_monitors.monitors[i].controllable) continue;
-        int d = g_monitors.monitors[i].delta;
-        if (d < minDelta) minDelta = d;
-        if (d > maxDelta) maxDelta = d;
-    }
-    int lo = 0 - maxDelta;   /* so monitor with max delta can reach 0 */
-    int hi = 100 - minDelta;  /* so monitor with min delta can reach 100 */
-    if (g_masterTarget < lo) g_masterTarget = lo;
-    if (g_masterTarget > hi) g_masterTarget = hi;
-
-    TIMED("hotkey: SetAllBrightness",
-          Monitor_SetAllBrightness(&g_monitors, g_masterTarget));
+    StepMaster(delta);
 
     /* Show OSD on primary monitor (where cursor is) */
-    TIMED("hotkey: RefreshBrightness", Monitor_RefreshBrightness(&g_monitors));
     {
         POINT curPos;
         GetCursorPos(&curPos);
@@ -559,19 +573,12 @@ static void HandleHotkey(int id)
         int pct = 50;
         for (int i = 0; i < g_monitors.count; i++) {
             if (g_monitors.monitors[i].hMonitor == hCurMon && g_monitors.monitors[i].controllable) {
-                BrightMonitor *mon = &g_monitors.monitors[i];
-                DWORD range = mon->brightnessMax - mon->brightnessMin;
-                pct = range > 0 ? (int)(((mon->brightnessCur - mon->brightnessMin) * 100) / range) : 0;
+                pct = Monitor_GetPercent(&g_monitors.monitors[i]);
                 break;
             }
         }
         UI_ShowOSD(g_hInst, hCurMon, pct, !UI_IsPopupVisible(g_hwndPopup));
     }
-
-    /* Update popup if visible */
-    UI_RefreshPopup(g_hwndPopup, &g_monitors);
-
-    ManualChange();
 }
 
 /* ---- Apply Preset ---- */
@@ -586,6 +593,51 @@ static void ApplyPreset(int index)
 
     ManualChange();
 }
+
+/* Forward declarations for the switches below (defined further down). */
+static void SetScheduleEnabled(BOOL on);
+static void SetIdleDimEnabled(BOOL on);
+
+/* ---- lumosctl (remote.c runs the protocol, these are its actions) ---- */
+
+static MonitorList *AppMonitors(void) { return &g_monitors; }
+static Settings    *AppSettings(void) { return &g_settings; }
+
+/* What the monitors show now, as an All Monitors level. Read from the
+   monitors rather than g_masterTarget, which holds the level to come back to
+   while the idle dim is on. */
+static int AppMasterLevel(void)
+{
+    int v = MasterTargetFromMonitors();
+    return v < 0 ? 0 : (v > 100 ? 100 : v);
+}
+
+static void AppSetMaster(int percent)
+{
+    g_masterTarget = percent;
+    Monitor_SetAllBrightness(&g_monitors, percent);
+    Monitor_RefreshBrightness(&g_monitors);
+    UI_RefreshPopup(g_hwndPopup, &g_monitors);
+    ManualChange();
+}
+
+static void AppSetMonitor(int index, int percent)
+{
+    if (index < 0 || index >= g_monitors.count) return;
+    Monitor_SetBrightness(&g_monitors.monitors[index], (DWORD)percent);
+    UI_RefreshPopup(g_hwndPopup, &g_monitors);
+    ManualChange();
+}
+
+static void AppRescan(void)
+{
+    ScheduleRescanFromTrigger(g_hwndHidden);
+}
+
+static const AppControl kAppControl = {
+    AppMonitors, AppSettings, AppMasterLevel, AppSetMaster, StepMaster,
+    AppSetMonitor, ApplyPreset, SetScheduleEnabled, SetIdleDimEnabled, AppRescan
+};
 
 /* ---- Monitor rescan (async) ---- */
 
@@ -847,6 +899,25 @@ static void Idle_Tick(void)
     else if (!idle && g_idleDimmed)  Idle_Restore();
 }
 
+/* ---- Switches shared by the tray menu and lumosctl ---- */
+
+static void SetScheduleEnabled(BOOL on)
+{
+    g_settings.scheduleEnabled = on;
+    Settings_Save(&g_settings);
+    g_scheduleSuspended = FALSE;      /* re-enable takes effect immediately */
+    g_scheduleLastApplied = -1;
+    Schedule_ApplyNow();
+}
+
+static void SetIdleDimEnabled(BOOL on)
+{
+    g_settings.idleDimEnabled = on;
+    Settings_Save(&g_settings);
+    if (!on)
+        Idle_Restore();   /* undo an active dim immediately */
+}
+
 /* ---- Main Window Proc ---- */
 
 static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
@@ -895,6 +966,13 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
         HandleHotkey((int)wParam);
         return 0;
 
+    case WM_COPYDATA: {
+        LRESULT r;
+        if (Remote_HandleCopyData(hwnd, wParam, lParam, &r))
+            return r;
+        break;
+    }
+
     case WM_COMMAND: {
         int cmd = LOWORD(wParam);
         if (cmd >= IDM_PRESET_BASE && cmd < IDM_PRESET_BASE + MAX_PRESETS) {
@@ -911,17 +989,10 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
             break;
         }
         case IDM_SCHEDULE_TOGGLE:
-            g_settings.scheduleEnabled = !g_settings.scheduleEnabled;
-            Settings_Save(&g_settings);
-            g_scheduleSuspended = FALSE;      /* re-enable takes effect immediately */
-            g_scheduleLastApplied = -1;
-            Schedule_ApplyNow();
+            SetScheduleEnabled(!g_settings.scheduleEnabled);
             break;
         case IDM_IDLEDIM_TOGGLE:
-            g_settings.idleDimEnabled = !g_settings.idleDimEnabled;
-            Settings_Save(&g_settings);
-            if (!g_settings.idleDimEnabled)
-                Idle_Restore();   /* undo an active dim immediately */
+            SetIdleDimEnabled(!g_settings.idleDimEnabled);
             break;
         case IDM_SETTINGS:
             UI_ShowSettings(hwnd, &g_settings);

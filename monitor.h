@@ -43,6 +43,10 @@ void Monitor_Cleanup(MonitorList *ml);
 /* Refresh brightness values from hardware */
 void Monitor_RefreshBrightness(MonitorList *ml);
 
+/* Current level of a monitor as a percentage of its own range (cached value,
+   no DDC traffic). */
+int Monitor_GetPercent(const BrightMonitor *mon);
+
 /* Set brightness for a single monitor (0-100 percentage) */
 BOOL Monitor_SetBrightness(BrightMonitor *mon, DWORD percent);
 

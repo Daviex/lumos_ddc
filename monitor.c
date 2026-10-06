@@ -517,11 +517,11 @@ void Monitor_SetAllBrightness(MonitorList *ml, int percent)
     }
 }
 
-static DWORD BrightnessToPercent(BrightMonitor *mon)
+int Monitor_GetPercent(const BrightMonitor *mon)
 {
     DWORD range = mon->brightnessMax - mon->brightnessMin;
     if (range == 0) return 0;
-    return ((mon->brightnessCur - mon->brightnessMin) * 100) / range;
+    return (int)(((mon->brightnessCur - mon->brightnessMin) * 100) / range);
 }
 
 void Monitor_AdjustActive(MonitorList *ml, int delta)
@@ -533,7 +533,7 @@ void Monitor_AdjustActive(MonitorList *ml, int delta)
     BrightMonitor *mon = &ml->monitors[ml->active];
     if (!mon->controllable) return;
 
-    int pct = (int)BrightnessToPercent(mon) + delta;
+    int pct = Monitor_GetPercent(mon) + delta;
     if (pct < 0) pct = 0;
     if (pct > 100) pct = 100;
 

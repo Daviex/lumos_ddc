@@ -34,9 +34,7 @@ static int MasterTargetToSlider(MonitorList *ml, int target);
 
 static int GetMonPercent(BrightMonitor *mon)
 {
-    DWORD range = mon->brightnessMax - mon->brightnessMin;
-    if (range == 0) return 0;
-    return (int)(((mon->brightnessCur - mon->brightnessMin) * 100) / range);
+    return Monitor_GetPercent(mon);
 }
 
 static int GetMasterPercent(MonitorList *ml)

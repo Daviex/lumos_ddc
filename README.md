@@ -24,6 +24,7 @@
 - [Install](#install)
 - [Usage](#usage)
 - [Keyboard and screen readers](#keyboard-and-screen-readers)
+- [Command line](#command-line)
 - [Configuration](#configuration)
 - [Requirements](#requirements)
 - [Notes and limitations](#notes-and-limitations)
@@ -74,6 +75,7 @@ Windows can dim a laptop panel, but it will not touch the brightness of external
 - **Brightness schedule** - Optional time-of-day schedule that smoothly ramps brightness across the day (piecewise-linear, wraps around midnight). A manual change suspends it until the next anchor.
 - **Idle auto-dim** - Optional. After a configurable idle period (default 5 minutes) the brightness drops to a configurable low level (default 5%), and it returns to the previous level as soon as you touch the keyboard or the mouse. Fullscreen video, presentation mode and live calls are skipped, so a movie you are watching or a Teams call you are sitting through without touching anything is not dimmed. Calls are detected by the microphone or the camera being in use, not by the name of the application, so any conferencing tool counts.
 - **Presets** - Night, Day, and Presentation, with editable brightness values.
+- **Command line** - `lumosctl.exe` sets, raises, lowers and reads the brightness of all monitors or one of them, applies presets and switches the schedule and idle dim, through the running Lumos.
 - **Settings window** - A dark themed screen for the brightness step, the hotkeys, the idle dim level and timeout, the schedule and autostart switches, and the preset values. Right-click the tray icon and pick Settings.
 - **On-screen display** - A clean overlay with the current percentage and a progress bar.
 - **Auto-reconnect and restore** - Re-detects monitors on plug/unplug, session unlock, display power-on, and wake from sleep. Beyond recovering stale DDC handles, it re-applies your brightness (the schedule value, or the last master level) because displays often reset to full brightness across sleep or standby.
@@ -106,9 +108,11 @@ mkdir -p build
 x86_64-w64-mingw32-windres lumos.rc -O coff -o build/lumos.res
 x86_64-w64-mingw32-gcc -O2 -Wall -mwindows -DUNICODE -D_UNICODE -D_WIN32_WINNT=0x0A00 \
   lumos.c monitor.c ui.c ui_draw.c ui_popup.c ui_osd.c ui_menu.c ui_sched.c ui_settings.c ui_about.c \
-  presets.c schedule.c hotkey.c a11y.c wmibright.c capture.c build/lumos.res \
+  presets.c schedule.c hotkey.c a11y.c remote.c wmibright.c capture.c build/lumos.res \
   -o build/lumos.exe \
   -ldxva2 -luser32 -lgdi32 -lshell32 -lcomctl32 -ladvapi32 -lole32 -loleaut32 -lwbemuuid -ldwmapi -lwtsapi32 -loleacc -lkernel32 -lm
+x86_64-w64-mingw32-gcc -O2 -Wall -municode -DUNICODE -D_UNICODE -D_WIN32_WINNT=0x0A00 \
+  lumosctl.c cliparse.c -o build/lumosctl.exe -luser32
 ```
 
 Or with MSVC from a Developer Command Prompt (also writes to `build/`):
@@ -146,6 +150,28 @@ To reach the tray icon, press `Win+B` and move to the Lumos icon with the arrow 
 To change a hotkey, focus its row in Settings, press `Enter`, and press the new combination. A hotkey needs `Ctrl`, `Alt` or `Win`. While a row is recording, `Esc` cancels and `Backspace` turns the hotkey off. If another program already uses the combination, Save leaves the window open and the row says "In use by another app".
 
 When a hotkey or the mouse wheel changes the brightness, the on-screen display announces the level ("Brightness 45%") as a live region. NVDA reads it even while another application has the focus. Narrator does not, because it ignores announcements from applications in the background; with Narrator, open the popup (`Ctrl+Win+B`) to hear the current level. While the popup is open, the focused slider reports every change.
+
+## Command line
+
+`lumosctl.exe` controls the running Lumos from a terminal, a script or a shortcut. Put it next to `lumos.exe` or anywhere on your `PATH`. It talks to Lumos, so Lumos has to be running.
+
+```
+lumosctl --set 40                 all monitors to 40%, each keeping its offset
+lumosctl --up                     one brightness step up (--down for down)
+lumosctl --down 10                10% down
+lumosctl --get                    print the current levels
+lumosctl --list                   list the monitors with their numbers
+lumosctl --set 60 --monitor 2     one monitor only, by number from --list
+lumosctl --up -m dell             or by a name, or a unique part of it
+lumosctl --preset Night           apply a preset
+lumosctl --schedule off           turn the schedule on or off
+lumosctl --idle-dim on            turn dim when idle on or off
+lumosctl --rescan                 look for monitors again
+```
+
+Every command prints the result, which also makes it usable with a screen reader in the terminal. Changes from the command line count as manual changes, so they pause the schedule until its next point, and they do not show the on-screen display.
+
+The exit code is 0 when the command worked, 1 for wrong usage, 2 when Lumos is not running, 3 when the command failed (an unknown preset or monitor, for example), and 4 when Lumos did not answer.
 
 ## Configuration
 

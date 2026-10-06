@@ -39,6 +39,15 @@ if errorlevel 1 (
     exit /b 1
 )
 
+:: lumosctl: console program for the command line
+cl /nologo /O2 /W4 /WX- %DEFS% lumosctl.c cliparse.c ^
+   /Fo"build\\" /Fe:build\lumosctl.exe /link /subsystem:console user32.lib
+
+if errorlevel 1 (
+    echo lumosctl build failed.
+    exit /b 1
+)
+
 echo.
 echo Build successful: build\lumos.exe
 del /q build\*.obj 2>nul
