@@ -31,6 +31,10 @@ static const GUID kGuidConsoleDisplayState =
    lParam = MonitorList* (heap, adopted and freed by the main thread). */
 #define WM_APP_RESCAN_DONE  (WM_APP + 1)
 
+/* Posted by the mouse hook when wheel notches over the tray icon start to
+   pile up; the notches themselves are counted in g_wheelPending. */
+#define WM_APP_WHEEL        (WM_APP + 2)
+
 /* Schedule tick: recompute the interpolated brightness once a minute. */
 #define SCHEDULE_TIMER_ID   0xB101
 #define SCHEDULE_TICK_MS    60000
@@ -97,6 +101,9 @@ static int          g_hotkeyStartupFailure = -1;   /* first action we could not 
 static BOOL         g_hotkeysSuspended = FALSE;    /* released while Settings captures keys */
 static DWORD        g_trayRightClickTick = 0;      /* last right button down or up on the icon */
 static DWORD        g_trayKeySelectTick = 0;       /* last NIN_KEYSELECT */
+static DWORD        g_lastRemoteTick = 0;          /* last lumosctl command, counted as activity */
+static int          g_wheelPending = 0;            /* tray wheel notches not applied yet (hook and handler share the UI thread) */
+static BOOL         g_remoteSeen = FALSE;          /* g_lastRemoteTick is valid */
 #define TRAY_CLICK_WINDOW_MS 1000
 
 /* RegisterHotKey id per HOTKEY_* action, which is also the WM_HOTKEY wParam. */
@@ -117,7 +124,7 @@ static void SuspendHotkeys(BOOL suspended);
 static int  FirstFailedHotkey(void);
 static void ShowContextMenu(HWND hwnd, const POINT *anchor, BOOL fromKeyboard);
 static void HandleHotkey(int id);
-static void ApplyPreset(int index);
+static BOOL ApplyPreset(int index);
 static void InstallMouseHook(void);
 static void RemoveMouseHook(void);
 static void ScheduleRescan(HWND hwnd);
@@ -263,7 +270,9 @@ static void CreateTrayIcon(HWND hwnd)
     g_nid.cbSize = sizeof(g_nid);
     g_nid.hWnd = hwnd;
     g_nid.uID = 1;
-    g_nid.uFlags = NIF_ICON | NIF_TIP | NIF_MESSAGE;
+    /* NIF_SHOWTIP: with NOTIFYICON_VERSION_4 (below) the shell shows the
+       standard tooltip only when asked to; without it hovering showed nothing. */
+    g_nid.uFlags = NIF_ICON | NIF_TIP | NIF_MESSAGE | NIF_SHOWTIP;
     g_nid.uCallbackMessage = WM_TRAYICON;
     g_nid.hIcon = LoadIconW(g_hInst, MAKEINTRESOURCEW(IDI_LUMOS));
     if (!g_nid.hIcon)
@@ -361,9 +370,17 @@ static LRESULT CALLBACK MouseHookProc(int nCode, WPARAM wParam, LPARAM lParam)
         DbgLog("WM_MOUSEWHEEL at [%d,%d] mouseData=0x%08X",
                (int)mhs->pt.x, (int)mhs->pt.y, (unsigned)mhs->mouseData);
         if (IsCursorOverTrayIcon(mhs->pt)) {
+            /* Notches are counted, not posted one by one. A brightness step
+               keeps the UI thread busy for 150 ms or more (DDC and WMI writes),
+               and a fast scroll sends 10 to 20 notches a second; one message per
+               notch built a queue that kept the brightness moving long after
+               the wheel stopped. The handler applies all pending notches in
+               one write. */
             short delta = (short)HIWORD(mhs->mouseData);
-            PostMessageW(g_hwndHidden, WM_HOTKEY,
-                         (WPARAM)(delta > 0 ? WM_HOTKEY_BRIGHTEN : WM_HOTKEY_DIM), 0);
+            int before = g_wheelPending;
+            g_wheelPending += (delta > 0) ? 1 : -1;
+            if (before == 0)
+                PostMessageW(g_hwndHidden, WM_APP_WHEEL, 0, 0);
             return 1;
         }
     }
@@ -503,7 +520,7 @@ static int MasterTargetFromMonitors(void)
 
 /* Move the master level by delta, the way the All Monitors slider would.
    Shared by the hotkeys, the tray wheel and lumosctl; the OSD is the caller's. */
-static void StepMaster(int delta)
+static BOOL StepMaster(int delta)
 {
     /* Initialize target from current state if needed */
     if (g_masterTarget < 0)
@@ -525,14 +542,39 @@ static void StepMaster(int delta)
     if (g_masterTarget < lo) g_masterTarget = lo;
     if (g_masterTarget > hi) g_masterTarget = hi;
 
+    /* No DDC read-back: Monitor_SetBrightness already stores the written
+       level, and the read cost about half of every step, which made the tray
+       wheel lag. */
+    BOOL ok = TRUE;
     TIMED("step: SetAllBrightness",
-          Monitor_SetAllBrightness(&g_monitors, g_masterTarget));
-    TIMED("step: RefreshBrightness", Monitor_RefreshBrightness(&g_monitors));
+          ok = Monitor_SetAllBrightness(&g_monitors, g_masterTarget));
 
     /* Update popup if visible */
     UI_RefreshPopup(g_hwndPopup, &g_monitors);
 
     ManualChange();
+    return ok;
+}
+
+/* A brightness step from the hotkeys or the tray wheel: the step itself, then
+   the OSD on the monitor under the cursor. */
+static void StepWithOsd(int delta)
+{
+    StepMaster(delta);
+
+    /* Show OSD on primary monitor (where cursor is) */
+    POINT curPos;
+    GetCursorPos(&curPos);
+    HMONITOR hCurMon = MonitorFromPoint(curPos, MONITOR_DEFAULTTOPRIMARY);
+    /* Find matching monitor for percentage display, fallback to first */
+    int pct = 50;
+    for (int i = 0; i < g_monitors.count; i++) {
+        if (g_monitors.monitors[i].hMonitor == hCurMon && g_monitors.monitors[i].controllable) {
+            pct = Monitor_GetPercent(&g_monitors.monitors[i]);
+            break;
+        }
+    }
+    UI_ShowOSD(g_hInst, hCurMon, pct, !UI_IsPopupVisible(g_hwndPopup));
 }
 
 static void HandleHotkey(int id)
@@ -562,36 +604,21 @@ static void HandleHotkey(int id)
     default: return;
     }
 
-    StepMaster(delta);
-
-    /* Show OSD on primary monitor (where cursor is) */
-    {
-        POINT curPos;
-        GetCursorPos(&curPos);
-        HMONITOR hCurMon = MonitorFromPoint(curPos, MONITOR_DEFAULTTOPRIMARY);
-        /* Find matching monitor for percentage display, fallback to first */
-        int pct = 50;
-        for (int i = 0; i < g_monitors.count; i++) {
-            if (g_monitors.monitors[i].hMonitor == hCurMon && g_monitors.monitors[i].controllable) {
-                pct = Monitor_GetPercent(&g_monitors.monitors[i]);
-                break;
-            }
-        }
-        UI_ShowOSD(g_hInst, hCurMon, pct, !UI_IsPopupVisible(g_hwndPopup));
-    }
+    StepWithOsd(delta);
 }
 
 /* ---- Apply Preset ---- */
 
-static void ApplyPreset(int index)
+static BOOL ApplyPreset(int index)
 {
-    if (index < 0 || index >= g_settings.presetCount) return;
+    if (index < 0 || index >= g_settings.presetCount) return FALSE;
     g_masterTarget = (int)g_settings.presets[index].brightness;
-    Monitor_SetAllBrightness(&g_monitors, g_settings.presets[index].brightness);
+    BOOL ok = Monitor_SetAllBrightness(&g_monitors, g_masterTarget);
     Monitor_RefreshBrightness(&g_monitors);
     UI_RefreshPopup(g_hwndPopup, &g_monitors);
 
     ManualChange();
+    return ok;
 }
 
 /* Forward declarations for the switches below (defined further down). */
@@ -599,6 +626,18 @@ static void SetScheduleEnabled(BOOL on);
 static void SetIdleDimEnabled(BOOL on);
 
 /* ---- lumosctl (remote.c runs the protocol, these are its actions) ---- */
+
+/* A lumosctl command is the user acting, even though no key was pressed: it
+   ends an idle dim the way input would, and the idle countdown starts again
+   from it. Without this, the next idle tick dimmed a level the user had just
+   set (a scheduled "lumosctl --preset Day" was undone two seconds later). */
+static void RemoteActivity(void)
+{
+    g_lastRemoteTick = GetTickCount();
+    g_remoteSeen = TRUE;
+    if (g_idleDimmed)
+        Idle_Restore();
+}
 
 static MonitorList *AppMonitors(void) { return &g_monitors; }
 static Settings    *AppSettings(void) { return &g_settings; }
@@ -612,31 +651,46 @@ static int AppMasterLevel(void)
     return v < 0 ? 0 : (v > 100 ? 100 : v);
 }
 
-static void AppSetMaster(int percent)
+static BOOL AppSetMaster(int percent)
 {
+    RemoteActivity();
     g_masterTarget = percent;
-    Monitor_SetAllBrightness(&g_monitors, percent);
+    BOOL ok = Monitor_SetAllBrightness(&g_monitors, percent);
     Monitor_RefreshBrightness(&g_monitors);
     UI_RefreshPopup(g_hwndPopup, &g_monitors);
     ManualChange();
+    return ok;
 }
 
-static void AppSetMonitor(int index, int percent)
+static BOOL AppStepMaster(int delta)
 {
-    if (index < 0 || index >= g_monitors.count) return;
-    Monitor_SetBrightness(&g_monitors.monitors[index], (DWORD)percent);
+    RemoteActivity();
+    return StepMaster(delta);
+}
+
+static BOOL AppSetMonitor(int index, int percent)
+{
+    if (index < 0 || index >= g_monitors.count) return FALSE;
+    RemoteActivity();
+    BOOL ok = Monitor_SetBrightness(&g_monitors.monitors[index], (DWORD)percent);
     UI_RefreshPopup(g_hwndPopup, &g_monitors);
     ManualChange();
+    return ok;
 }
 
-static void AppRescan(void)
+static BOOL AppApplyPreset(int index)
 {
-    ScheduleRescanFromTrigger(g_hwndHidden);
+    RemoteActivity();
+    return ApplyPreset(index);
 }
+
+static void AppSetSchedule(BOOL on)  { RemoteActivity(); SetScheduleEnabled(on); }
+static void AppSetIdleDim(BOOL on)   { RemoteActivity(); SetIdleDimEnabled(on); }
+static void AppRescan(void)          { RemoteActivity(); ScheduleRescanFromTrigger(g_hwndHidden); }
 
 static const AppControl kAppControl = {
-    AppMonitors, AppSettings, AppMasterLevel, AppSetMaster, StepMaster,
-    AppSetMonitor, ApplyPreset, SetScheduleEnabled, SetIdleDimEnabled, AppRescan
+    AppMonitors, AppSettings, AppMasterLevel, AppSetMaster, AppStepMaster,
+    AppSetMonitor, AppApplyPreset, AppSetSchedule, AppSetIdleDim, AppRescan
 };
 
 /* ---- Monitor rescan (async) ---- */
@@ -828,7 +882,12 @@ static DWORD IdleMilliseconds(void)
     lii.dwTime = 0;
     if (!GetLastInputInfo(&lii))
         return 0;
-    return GetTickCount() - lii.dwTime;   /* unsigned math, so the 49-day wrap is fine */
+    DWORD now = GetTickCount();
+    DWORD idle = now - lii.dwTime;        /* unsigned math, so the 49-day wrap is fine */
+    /* A lumosctl command counts as activity too (see RemoteActivity). */
+    if (g_remoteSeen && now - g_lastRemoteTick < idle)
+        idle = now - g_lastRemoteTick;
+    return idle;
 }
 
 /* Reasons to leave the brightness alone even though no input has arrived. */
@@ -965,6 +1024,14 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
     case WM_HOTKEY:
         HandleHotkey((int)wParam);
         return 0;
+
+    case WM_APP_WHEEL: {
+        int notches = g_wheelPending;
+        g_wheelPending = 0;
+        if (notches != 0)
+            StepWithOsd(notches * g_settings.step);
+        return 0;
+    }
 
     case WM_COPYDATA: {
         LRESULT r;

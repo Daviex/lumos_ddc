@@ -11,14 +11,17 @@
 #include "monitor.h"
 #include "presets.h"
 
+/* Every action first counts as user activity: it ends an idle dim and restarts
+   the idle countdown, as keyboard or mouse input would. The brightness actions
+   return FALSE when a monitor refused the write. */
 typedef struct {
     MonitorList *(*monitors)(void);
     Settings    *(*settings)(void);
     int  (*masterLevel)(void);                  /* base level of "All monitors" */
-    void (*setMaster)(int percent);             /* absolute, like a preset */
-    void (*stepMaster)(int delta);              /* relative, like a hotkey, no OSD */
-    void (*setMonitor)(int index, int percent); /* one monitor, absolute */
-    void (*applyPreset)(int index);
+    BOOL (*setMaster)(int percent);             /* absolute, like a preset */
+    BOOL (*stepMaster)(int delta);              /* relative, like a hotkey, no OSD */
+    BOOL (*setMonitor)(int index, int percent); /* one monitor, absolute */
+    BOOL (*applyPreset)(int index);
     void (*setSchedule)(BOOL on);
     void (*setIdleDim)(BOOL on);
     void (*rescan)(void);

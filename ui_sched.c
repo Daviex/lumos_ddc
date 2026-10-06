@@ -252,14 +252,16 @@ static LRESULT CALLBACK SchedWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
         return 0;
 
     case WM_MOUSEWHEEL: {
-        int dir = ((short)HIWORD(wParam) > 0) ? 1 : -1;
+        static int wheelAccum = 0;
+        int notches = WheelNotches(&wheelAccum, wParam);
         POINT pt = { (short)LOWORD(lParam), (short)HIWORD(lParam) };
         ScreenToClient(hwnd, &pt);
         int field;
         int row = SchedHitField(d, pt.x, pt.y, &field);
-        if (row >= 0 && field != SF_DEL) {
+        if (notches != 0 && row >= 0 && field != SF_DEL) {
             d->selectedRow = row;
-            SchedAdjust(d, row, field, dir);
+            for (int n = notches; n != 0; n += (n > 0 ? -1 : 1))
+                SchedAdjust(d, row, field, n > 0 ? 1 : -1);
             RenderSchedEditor(hwnd, d);
         }
         return 0;

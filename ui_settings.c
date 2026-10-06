@@ -48,7 +48,7 @@ typedef struct {
     BOOL   focusVisible;   /* draw the ring: set once the keyboard is in use */
     int    captureRow;     /* hotkey row waiting for a key combination, or -1 */
     int    errorRow;       /* hotkey row showing errorText, or -1 */
-    WPARAM captureEndVk;   /* key that ended the last capture; its repeats are dropped */
+    WPARAM captureEndVk;   /* key that started or ended a capture; its repeats are dropped */
     WCHAR  errorText[64];
     Settings *settings;
     HWND   owner;
@@ -834,14 +834,20 @@ static LRESULT CALLBACK SetWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
         break;
     }
 
-    case WM_KEYDOWN:
+    case WM_KEYDOWN: {
         if ((lParam & 0x40000000) && wParam == d->captureEndVk)
-            return 0;   /* repeat of the key that ended a capture */
+            return 0;   /* repeat of the key that started or ended a capture */
         if ((lParam & 0x40000000) && d->captureRow < 0 &&
             (wParam == VK_ESCAPE || wParam == VK_RETURN || wParam == VK_SPACE))
             return 0;   /* hold-to-repeat must not save, close or flip twice */
+        BOOL wasCapturing = (d->captureRow >= 0);
         SetKeyDown(hwnd, d, wParam);
+        /* Enter or Space just opened a capture. Held a little too long, its
+           repeat would arrive as the "new hotkey" and end the capture at once. */
+        if (!wasCapturing && d->captureRow >= 0)
+            d->captureEndVk = wParam;
         return 0;
+    }
 
     case WM_SYSKEYDOWN:
         /* Alt combinations arrive here. While capturing they are the new
@@ -861,6 +867,10 @@ static LRESULT CALLBACK SetWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
         break;
 
     case WM_SET_ACTIVATE:
+        /* A screen reader acted on another row: an open capture ends, as it
+           does when the mouse clicks elsewhere, so the hotkeys come back. */
+        if (d->captureRow >= 0 && d->captureRow != (int)wParam)
+            SetEndCapture(hwnd, d);
         if ((int)wParam <= SET_SAVE(d)) {
             d->focusRow = (int)wParam;
             SetActivate(hwnd, d, (int)wParam);
@@ -925,13 +935,15 @@ static LRESULT CALLBACK SetWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
     }
 
     case WM_MOUSEWHEEL: {
-        int dir = ((short)HIWORD(wParam) > 0) ? 1 : -1;
+        static int wheelAccum = 0;
+        int notches = WheelNotches(&wheelAccum, wParam);
         POINT pt = { (short)LOWORD(lParam), (short)HIWORD(lParam) };
         ScreenToClient(hwnd, &pt);
         int hit;
         int row = SetHitTest(d, pt.x, pt.y, &hit);
-        if (row >= 0 && d->rows[row].kind == SET_NUMBER) {
-            SetAdjust(&d->rows[row], dir);
+        if (notches != 0 && row >= 0 && d->rows[row].kind == SET_NUMBER) {
+            for (int n = notches; n != 0; n += (n > 0 ? -1 : 1))
+                SetAdjust(&d->rows[row], n > 0 ? 1 : -1);
             d->hoverRow = row;
             SetRowChanged(hwnd, d, row);
         }

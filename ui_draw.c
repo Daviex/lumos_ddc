@@ -123,3 +123,14 @@ void DrawDialogButton(HDC dc, const RECT *rc, const WCHAR *label, BOOL primary, 
     DrawTextW(dc, label, -1, &r, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
     SelectObject(dc, oldFont);
 }
+
+/* Whole wheel notches in a WM_MOUSEWHEEL, keeping the remainder in *accum for
+   the next message: a touchpad or a high-resolution wheel sends fractions of
+   WHEEL_DELTA, and one step per message made a single notch count several times. */
+int WheelNotches(int *accum, WPARAM wParam)
+{
+    *accum += (short)HIWORD(wParam);
+    int n = *accum / WHEEL_DELTA;
+    *accum -= n * WHEEL_DELTA;
+    return n;
+}

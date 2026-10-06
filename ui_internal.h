@@ -31,6 +31,9 @@ void DrawFocusRing(HDC dc, const RECT *rc, int radius);
 /* Move a caption-less window by dragging any spot that is not a control. */
 void BeginWindowDrag(HWND hwnd);
 
+/* Signed count of whole wheel notches; the remainder stays in *accum. */
+int WheelNotches(int *accum, WPARAM wParam);
+
 /* Dialog footer: Cancel and Save on the right edge, the same in every dialog. */
 #define DLG_BTN_W    84
 #define DLG_BTN_H    28

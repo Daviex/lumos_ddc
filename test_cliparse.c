@@ -52,6 +52,7 @@ int main(void)
     CHECK(!P(&c, 2, L"--get", L"--list", NULL, NULL), "two commands rejected");
     CHECK(!P(&c, 1, L"--brighter", NULL, NULL, NULL), "unknown option rejected");
     CHECK(!P(&c, 2, L"-m", L"1", NULL, NULL), "monitor alone rejected");
+    CHECK(!P(&c, 4, L"--set", L"5", L"--monitor", L""), "empty monitor name rejected");
 
     if (failures == 0)
         printf("All cliparse tests passed\n");

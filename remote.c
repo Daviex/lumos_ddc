@@ -88,9 +88,19 @@ static int FindMonitor(Reply *r, MonitorList *ml, const WCHAR *spec)
         return -1;
     }
 
+    /* Two identical models share a name, so an exact match must be unique too. */
+    int exact = -1, exactCount = 0;
     for (int i = 0; i < ml->count; i++)
-        if (_wcsicmp(ml->monitors[i].name, spec) == 0)
-            return i;
+        if (_wcsicmp(ml->monitors[i].name, spec) == 0) { exact = i; exactCount++; }
+    if (exactCount == 1)
+        return exact;
+    if (exactCount > 1) {
+        Say(r, L"More than one monitor is called \"%ls\". Use its number:\n", spec);
+        for (int i = 0; i < ml->count; i++)
+            if (_wcsicmp(ml->monitors[i].name, spec) == 0)
+                SayMonitor(r, ml, i);
+        return -1;
+    }
 
     int found = -1, matches = 0;
     for (int i = 0; i < ml->count; i++) {
@@ -120,12 +130,35 @@ static int FindPreset(Settings *s, const WCHAR *name)
     return -1;
 }
 
+static void SayWriteFailed(Reply *r)
+{
+    Say(r, L"A monitor did not accept the new brightness. lumosctl --rescan may help.\n");
+}
+
 static int Clamp100(int v)
 {
     return v < 0 ? 0 : (v > 100 ? 100 : v);
 }
 
 /* ---- Commands ---- */
+
+/* The request comes from another process, so its numbers are checked here
+   again: cliparse.c guards only lumosctl itself, not any other sender. */
+static BOOL ValidRequest(const IpcRequest *q)
+{
+    switch (q->command) {
+    case CLI_SET:      return q->value >= 0 && q->value <= 100;
+    case CLI_UP:
+    case CLI_DOWN:     return q->value >= 0 && q->value <= 100;   /* 0 = the step setting */
+    case CLI_SCHEDULE:
+    case CLI_IDLE_DIM: return q->value == 0 || q->value == 1;
+    case CLI_GET:
+    case CLI_LIST:
+    case CLI_PRESET:
+    case CLI_RESCAN:   return TRUE;
+    default:           return FALSE;
+    }
+}
 
 /* Runs one request; returns IPC_RESULT_*. */
 static int Execute(const IpcRequest *q, Reply *r)
@@ -155,19 +188,23 @@ static int Execute(const IpcRequest *q, Reply *r)
         int step = (q->value > 0) ? q->value : s->step;
         if (q->command == CLI_DOWN)
             step = -step;
+        BOOL ok;
         if (mon >= 0) {
             int target = (q->command == CLI_SET) ? q->value
                          : Monitor_GetPercent(&ml->monitors[mon]) + step;
-            g_app->setMonitor(mon, Clamp100(target));
-            SayMonitor(r, ml, mon);
+            ok = g_app->setMonitor(mon, Clamp100(target));
+        } else if (q->command == CLI_SET) {
+            ok = g_app->setMaster(q->value);
         } else {
-            if (q->command == CLI_SET)
-                g_app->setMaster(q->value);
-            else
-                g_app->stepMaster(step);
-            SayLevels(r, ml);
+            ok = g_app->stepMaster(step);
         }
-        return IPC_RESULT_OK;
+        if (!ok)
+            SayWriteFailed(r);
+        if (mon >= 0)
+            SayMonitor(r, ml, mon);
+        else
+            SayLevels(r, ml);
+        return ok ? IPC_RESULT_OK : IPC_RESULT_FAILED;
     }
 
     case CLI_GET:
@@ -190,7 +227,11 @@ static int Execute(const IpcRequest *q, Reply *r)
             Say(r, L"\n");
             return IPC_RESULT_FAILED;
         }
-        g_app->applyPreset(p);
+        if (!g_app->applyPreset(p)) {
+            SayWriteFailed(r);
+            SayLevels(r, ml);
+            return IPC_RESULT_FAILED;
+        }
         Say(r, L"Preset %ls (%u%%) applied.\n", s->presets[p].name, s->presets[p].brightness);
         SayLevels(r, ml);
         return IPC_RESULT_OK;
@@ -220,41 +261,78 @@ static int Execute(const IpcRequest *q, Reply *r)
     }
 }
 
+static void SendReply(HWND from, HWND to, int result, const Reply *r)
+{
+    if (!to || !IsWindow(to))
+        return;
+    static IpcReply out;   /* 8 KB; static so it stays off the UI thread's stack */
+    out.size = sizeof(out);
+    out.result = result;
+    memcpy(out.text, r->text, (r->len + 1) * sizeof(WCHAR));
+    COPYDATASTRUCT back;
+    back.dwData = IPC_REPLY_MAGIC;
+    back.cbData = sizeof(out);
+    back.lpData = &out;
+    DWORD_PTR ignored;
+    SendMessageTimeoutW(to, WM_COPYDATA, (WPARAM)from, (LPARAM)&back,
+                        SMTO_ABORTIFHUNG, 2000, &ignored);
+}
+
 BOOL Remote_HandleCopyData(HWND hwnd, WPARAM wParam, LPARAM lParam, LRESULT *result)
 {
     const COPYDATASTRUCT *cds = (const COPYDATASTRUCT *)lParam;
     if (!g_app || !cds || cds->dwData != IPC_REQUEST_MAGIC)
         return FALSE;
 
-    /* Everything from another process is checked before it is used: the size
-       must match exactly, and both strings get a terminator of our own. */
-    IpcRequest q;
-    if (cds->cbData != sizeof(q) || !cds->lpData) {
+    HWND replyTo = (HWND)wParam;
+    static Reply reply;   /* static so it stays off the UI thread's stack */
+    reply.len = 0;
+    reply.text[0] = L'\0';
+
+    /* A command runs after ReplyMessage below, and a WMI write inside it makes
+       COM calls whose waits dispatch incoming messages. A second request that
+       arrives then is turned away rather than run in the middle of the first. */
+    static BOOL busy = FALSE;
+    if (busy) {
+        Say(&reply, L"Lumos is busy with another lumosctl command. Try again.\n");
+        SendReply(hwnd, replyTo, IPC_RESULT_FAILED, &reply);
         *result = IPC_RESULT_FAILED;
         return TRUE;
     }
-    memcpy(&q, cds->lpData, sizeof(q));
-    if (q.size != sizeof(q)) {
+
+    /* Everything from another process is checked before it is used: the size
+       must match exactly, and both strings get a terminator of our own. The
+       data is copied out now, because it is gone once the sender is released. */
+    IpcRequest q;
+    BOOL wellFormed = (cds->cbData == sizeof(q) && cds->lpData);
+    if (wellFormed) {
+        memcpy(&q, cds->lpData, sizeof(q));
+        wellFormed = (q.size == sizeof(q));
+    }
+    if (!wellFormed) {
+        Say(&reply, L"This lumosctl does not match the running Lumos. Use the lumosctl from the same release.\n");
+        SendReply(hwnd, replyTo, IPC_RESULT_FAILED, &reply);
         *result = IPC_RESULT_FAILED;
         return TRUE;
     }
     q.name[CLI_NAME_MAX - 1] = L'\0';
     q.monitor[CLI_NAME_MAX - 1] = L'\0';
-
-    static Reply reply;   /* 8 KB; static so it stays off the UI thread's stack */
-    reply.len = 0;
-    reply.text[0] = L'\0';
-    *result = Execute(&q, &reply);
-
-    HWND replyTo = (HWND)wParam;
-    if (replyTo && IsWindow(replyTo)) {
-        COPYDATASTRUCT back;
-        back.dwData = IPC_REPLY_MAGIC;
-        back.cbData = (DWORD)((reply.len + 1) * sizeof(WCHAR));
-        back.lpData = reply.text;
-        DWORD_PTR ignored;
-        SendMessageTimeoutW(replyTo, WM_COPYDATA, (WPARAM)hwnd, (LPARAM)&back,
-                            SMTO_ABORTIFHUNG, 2000, &ignored);
+    if (!ValidRequest(&q)) {
+        Say(&reply, L"The request has an invalid command or value.\n");
+        SendReply(hwnd, replyTo, IPC_RESULT_FAILED, &reply);
+        *result = IPC_RESULT_FAILED;
+        return TRUE;
     }
+
+    /* Release lumosctl before running anything: COM refuses outgoing calls
+       while a SendMessage from another process is being handled, and the WMI
+       backend is exactly such a call. */
+    busy = TRUE;
+    ReplyMessage(IPC_RESULT_ACCEPTED);
+    int res = Execute(&q, &reply);
+    SendReply(hwnd, replyTo, res, &reply);
+    busy = FALSE;
+
+    *result = IPC_RESULT_ACCEPTED;   /* already delivered by ReplyMessage */
     return TRUE;
 }

@@ -100,6 +100,10 @@ int Cli_Parse(int argc, wchar_t **argv, CliCommand *out, wchar_t *err, int errLe
                 SetError(err, errLen, L"--monitor is given twice", NULL);
                 return 0;
             }
+            if (!argv[i + 1][0]) {
+                SetError(err, errLen, L"%ls needs a monitor number or name, not an empty one", a);
+                return 0;
+            }
             if (!CopyName(out->monitor, argv[++i])) {
                 SetError(err, errLen, L"the monitor name is too long", NULL);
                 return 0;

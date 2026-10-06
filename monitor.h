@@ -62,8 +62,10 @@ void Monitor_CleanupExcept(MonitorList *ml, const MonitorList *keep);
    still coming back after sleep. */
 BOOL Monitor_HasControllable(const MonitorList *ml);
 
-/* Set brightness for all monitors (base percent, can exceed 0-100 with deltas) */
-void Monitor_SetAllBrightness(MonitorList *ml, int percent);
+/* Set brightness for all monitors (base percent, can exceed 0-100 with deltas).
+   Returns FALSE when a controllable monitor refused the write (a stale DDC
+   handle after sleep, for example). */
+BOOL Monitor_SetAllBrightness(MonitorList *ml, int percent);
 
 /* Adjust active monitor brightness by delta (-10 or +10 etc) */
 void Monitor_AdjustActive(MonitorList *ml, int delta);

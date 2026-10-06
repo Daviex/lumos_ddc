@@ -19,28 +19,35 @@ enum {
 
 static WCHAR g_reply[IPC_REPLY_MAX];
 static BOOL  g_gotReply = FALSE;
+static int   g_replyResult = 0;
+static HWND  g_lumos = NULL;   /* replies are accepted only from this window */
 
 /* Console output that also works when redirected to a file or a pipe: the
    console gets UTF-16 directly, anything else gets UTF-8. */
-static void Write(HANDLE h, const WCHAR *text)
+/* Returns FALSE when the text could not be written completely (a full disk
+   or a closed pipe), so the exit code does not claim a result nobody got. */
+static BOOL Write(HANDLE h, const WCHAR *text)
 {
-    DWORD mode, written;
+    DWORD mode, written = 0;
     int len = lstrlenW(text);
-    if (GetConsoleMode(h, &mode)) {
-        WriteConsoleW(h, text, (DWORD)len, &written, NULL);
-        return;
-    }
+    if (len == 0)
+        return TRUE;
+    if (GetConsoleMode(h, &mode))
+        return WriteConsoleW(h, text, (DWORD)len, &written, NULL) && written == (DWORD)len;
     int bytes = WideCharToMultiByte(CP_UTF8, 0, text, len, NULL, 0, NULL, NULL);
-    char *buf = (char *)HeapAlloc(GetProcessHeap(), 0, bytes > 0 ? bytes : 1);
+    if (bytes <= 0)
+        return FALSE;
+    char *buf = (char *)HeapAlloc(GetProcessHeap(), 0, bytes);
     if (!buf)
-        return;
+        return FALSE;
     WideCharToMultiByte(CP_UTF8, 0, text, len, buf, bytes, NULL, NULL);
-    WriteFile(h, buf, (DWORD)bytes, &written, NULL);
+    BOOL ok = WriteFile(h, buf, (DWORD)bytes, &written, NULL) && written == (DWORD)bytes;
     HeapFree(GetProcessHeap(), 0, buf);
+    return ok;
 }
 
-static void Out(const WCHAR *text) { Write(GetStdHandle(STD_OUTPUT_HANDLE), text); }
-static void Err(const WCHAR *text) { Write(GetStdHandle(STD_ERROR_HANDLE), text); }
+static BOOL Out(const WCHAR *text) { return Write(GetStdHandle(STD_OUTPUT_HANDLE), text); }
+static BOOL Err(const WCHAR *text) { return Write(GetStdHandle(STD_ERROR_HANDLE), text); }
 
 static const WCHAR kUsage[] =
     L"lumosctl: control the brightness through the running Lumos.\n"
@@ -70,16 +77,37 @@ static LRESULT CALLBACK ReplyProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPa
 {
     if (msg == WM_COPYDATA) {
         const COPYDATASTRUCT *cds = (const COPYDATASTRUCT *)lParam;
-        if (cds && cds->dwData == IPC_REPLY_MAGIC && cds->lpData &&
-            cds->cbData >= sizeof(WCHAR) && cds->cbData <= sizeof(g_reply)) {
-            memcpy(g_reply, cds->lpData, cds->cbData);
-            g_reply[IPC_REPLY_MAX - 1] = L'\0';
-            g_reply[cds->cbData / sizeof(WCHAR) - 1] = L'\0';
-            g_gotReply = TRUE;
-            return TRUE;
+        if (cds && (HWND)wParam == g_lumos && cds->dwData == IPC_REPLY_MAGIC &&
+            cds->lpData && cds->cbData == sizeof(IpcReply)) {
+            const IpcReply *r = (const IpcReply *)cds->lpData;
+            if (r->size == sizeof(IpcReply)) {
+                memcpy(g_reply, r->text, sizeof(g_reply));
+                g_reply[IPC_REPLY_MAX - 1] = L'\0';
+                g_replyResult = r->result;
+                g_gotReply = TRUE;
+                return TRUE;
+            }
         }
     }
     return DefWindowProcW(hwnd, msg, wParam, lParam);
+}
+
+/* Pump messages until the reply has arrived or the time is up. The reply is
+   a message sent to our window, so it is delivered while we wait here. */
+static void WaitForReply(DWORD timeoutMs)
+{
+    DWORD start = GetTickCount();
+    while (!g_gotReply) {
+        DWORD spent = GetTickCount() - start;
+        if (spent >= timeoutMs)
+            return;
+        MsgWaitForMultipleObjects(0, NULL, FALSE, timeoutMs - spent, QS_ALLINPUT);
+        MSG m;
+        while (PeekMessageW(&m, NULL, 0, 0, PM_REMOVE)) {
+            TranslateMessage(&m);
+            DispatchMessageW(&m);
+        }
+    }
 }
 
 int wmain(int argc, wchar_t **argv)
@@ -92,16 +120,13 @@ int wmain(int argc, wchar_t **argv)
         Err(L"\nRun lumosctl --help for the commands.\n");
         return EXIT_USAGE;
     }
-    if (cmd.command == CLI_HELP) {
-        Out(kUsage);
-        return EXIT_OK;
-    }
-    if (cmd.command == CLI_VERSION) {
-        Out(L"lumosctl " APP_VERSION L"\n");
-        return EXIT_OK;
-    }
+    if (cmd.command == CLI_HELP)
+        return Out(kUsage) ? EXIT_OK : EXIT_FAILED;
+    if (cmd.command == CLI_VERSION)
+        return Out(L"lumosctl " APP_VERSION L"\n") ? EXIT_OK : EXIT_FAILED;
 
     HWND lumos = FindWindowW(LUMOS_MAIN_CLASS, NULL);
+    g_lumos = lumos;
     if (!lumos) {
         Err(L"Lumos is not running.\n");
         return EXIT_NOT_RUNNING;
@@ -135,9 +160,9 @@ int wmain(int argc, wchar_t **argv)
     cds.cbData = sizeof(q);
     cds.lpData = &q;
 
-    /* The reply arrives as a message sent to replyWnd while this call waits;
-       Windows dispatches it here, so no message loop is needed. Ten seconds
-       covers a DDC write to a slow monitor. */
+    /* Lumos accepts the request at once and runs it afterwards (see ipc.h).
+       Thirty seconds covers DDC writes to several slow monitors, close to a
+       second each on some DisplayPort panels. */
     DWORD_PTR result = 0;
     if (!SendMessageTimeoutW(lumos, WM_COPYDATA, (WPARAM)replyWnd, (LPARAM)&cds,
                              SMTO_ABORTIFHUNG, 10000, &result)) {
@@ -145,13 +170,19 @@ int wmain(int argc, wchar_t **argv)
         return EXIT_NO_ANSWER;
     }
     if (result == 0) {
-        Err(L"The running Lumos is too old for lumosctl. Update Lumos.\n");
+        Err(L"The running Lumos is too old for this lumosctl. Update Lumos.\n");
         return EXIT_NO_ANSWER;
     }
+    if (result == IPC_RESULT_ACCEPTED)
+        WaitForReply(30000);
 
-    if (g_gotReply) {
-        if (result == IPC_RESULT_OK) Out(g_reply);
-        else                         Err(g_reply);
+    if (!g_gotReply) {
+        Err(L"Lumos did not send a reply.\n");
+        return EXIT_NO_ANSWER;
     }
-    return (result == IPC_RESULT_OK) ? EXIT_OK : EXIT_FAILED;
+    if (g_replyResult != IPC_RESULT_OK) {
+        Err(g_reply);
+        return EXIT_FAILED;
+    }
+    return Out(g_reply) ? EXIT_OK : EXIT_FAILED;
 }

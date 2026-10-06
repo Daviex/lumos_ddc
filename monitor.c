@@ -507,14 +507,17 @@ BOOL Monitor_HasControllable(const MonitorList *ml)
     return FALSE;
 }
 
-void Monitor_SetAllBrightness(MonitorList *ml, int percent)
+BOOL Monitor_SetAllBrightness(MonitorList *ml, int percent)
 {
+    BOOL allOk = TRUE;
     for (int i = 0; i < ml->count; i++) {
         int adj = percent + ml->monitors[i].delta;
         if (adj < 0) adj = 0;
         if (adj > 100) adj = 100;
-        Monitor_SetBrightness(&ml->monitors[i], (DWORD)adj);
+        if (!Monitor_SetBrightness(&ml->monitors[i], (DWORD)adj) && ml->monitors[i].controllable)
+            allOk = FALSE;
     }
+    return allOk;
 }
 
 int Monitor_GetPercent(const BrightMonitor *mon)
