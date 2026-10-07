@@ -35,7 +35,7 @@ static void SayMonitor(Reply *r, MonitorList *ml, int i)
     if (mon->controllable)
         Say(r, L"%d. %ls: %d%%\n", i + 1, mon->name, Monitor_GetPercent(mon));
     else
-        Say(r, L"%d. %ls: cannot be controlled\n", i + 1, mon->name);
+        Say(r, L"%d. %ls: unavailable\n", i + 1, mon->name);
 }
 
 static void SayLevels(Reply *r, MonitorList *ml)
@@ -54,7 +54,7 @@ static void SayList(Reply *r, MonitorList *ml)
     for (int i = 0; i < ml->count; i++) {
         BrightMonitor *mon = &ml->monitors[i];
         if (!mon->controllable) {
-            Say(r, L"%d. %ls (cannot be controlled)\n", i + 1, mon->name);
+            Say(r, L"%d. %ls (unavailable)\n", i + 1, mon->name);
             continue;
         }
         Say(r, L"%d. %ls (%ls, %d%%, offset %+d)\n", i + 1, mon->name,
@@ -172,7 +172,7 @@ static int Execute(const IpcRequest *q, Reply *r)
         if (mon < 0)
             return IPC_RESULT_FAILED;
         if (!ml->monitors[mon].controllable && q->command != CLI_GET) {
-            Say(r, L"Monitor %d (%ls) cannot be controlled.\n", mon + 1, ml->monitors[mon].name);
+            Say(r, L"Monitor %d (%ls) is unavailable.\n", mon + 1, ml->monitors[mon].name);
             return IPC_RESULT_FAILED;
         }
     }

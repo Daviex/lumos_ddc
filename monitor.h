@@ -26,6 +26,7 @@ typedef struct {
     int      delta;        /* per-monitor brightness offset, -40..+40 */
     MonitorBackend backend;
     WCHAR    wmiInstance[256]; /* WMI InstanceName when backend == BACKEND_WMI */
+    BOOL     awaitingAnswer;   /* was controllable on an earlier scan, does not answer now */
 } BrightMonitor;
 
 typedef struct {
@@ -62,8 +63,15 @@ void Monitor_CleanupExcept(MonitorList *ml, const MonitorList *keep);
    still coming back after sleep. */
 BOOL Monitor_HasControllable(const MonitorList *ml);
 
-/* Set brightness for all monitors (base percent, can exceed 0-100 with deltas).
-   Returns FALSE when a controllable monitor refused the write (a stale DDC
+/* Mark the monitors of *fresh that were controllable in *prev (or were already
+   waiting) but did not answer this scan. A monitor is matched by its EDID name,
+   which comes from the registry and survives a display that has not woken up
+   enough to answer DDC/CI. Returns how many monitors are waiting, and sets
+   *recovered when a monitor that was waiting answers again. */
+int Monitor_TrackUnanswered(MonitorList *fresh, const MonitorList *prev, BOOL *recovered);
+
+/* Set all monitors from an All Monitors level (0-100), each through its offset
+   (see brightmap.h). Returns FALSE when a controllable monitor refused the write (a stale DDC
    handle after sleep, for example). */
 BOOL Monitor_SetAllBrightness(MonitorList *ml, int percent);
 

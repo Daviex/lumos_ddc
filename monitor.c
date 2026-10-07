@@ -1,4 +1,5 @@
 #include "monitor.h"
+#include "brightmap.h"
 #include "wmibright.h"
 #include <physicalmonitorenumerationapi.h>
 #include <highlevelmonitorconfigurationapi.h>
@@ -507,13 +508,48 @@ BOOL Monitor_HasControllable(const MonitorList *ml)
     return FALSE;
 }
 
+/* The monitor of *prev that matches monitor i of *ml: same name, and the same
+   position among the monitors of that name, so two identical models pair up
+   in order instead of both matching the first. */
+static const BrightMonitor *FindPrevious(const MonitorList *prev,
+                                         const MonitorList *ml, int i)
+{
+    const WCHAR *name = ml->monitors[i].name;
+    int nth = 0;
+    for (int j = 0; j < i; j++)
+        if (wcscmp(ml->monitors[j].name, name) == 0)
+            nth++;
+    for (int j = 0; j < prev->count; j++)
+        if (wcscmp(prev->monitors[j].name, name) == 0 && nth-- == 0)
+            return &prev->monitors[j];
+    return NULL;
+}
+
+int Monitor_TrackUnanswered(MonitorList *fresh, const MonitorList *prev, BOOL *recovered)
+{
+    int waiting = 0;
+    *recovered = FALSE;
+    for (int i = 0; i < fresh->count; i++) {
+        BrightMonitor *mon = &fresh->monitors[i];
+        const BrightMonitor *old = FindPrevious(prev, fresh, i);
+        if (!old)
+            continue;   /* newly plugged in: nothing to compare against */
+        if (mon->controllable) {
+            if (old->awaitingAnswer)
+                *recovered = TRUE;
+        } else if (old->controllable || old->awaitingAnswer) {
+            mon->awaitingAnswer = TRUE;
+            waiting++;
+        }
+    }
+    return waiting;
+}
+
 BOOL Monitor_SetAllBrightness(MonitorList *ml, int percent)
 {
     BOOL allOk = TRUE;
     for (int i = 0; i < ml->count; i++) {
-        int adj = percent + ml->monitors[i].delta;
-        if (adj < 0) adj = 0;
-        if (adj > 100) adj = 100;
+        int adj = BrightMap_Level(percent, ml->monitors[i].delta);
         if (!Monitor_SetBrightness(&ml->monitors[i], (DWORD)adj) && ml->monitors[i].controllable)
             allOk = FALSE;
     }

@@ -24,9 +24,9 @@ if errorlevel 1 (
 
 :: Compile and link (all intermediates and the exe go to build\)
 cl /nologo /O2 /W4 /WX- %DEFS% ^
-   lumos.c monitor.c ui.c ui_draw.c ui_popup.c ui_osd.c ui_menu.c ^
+   lumos.c monitor.c brightmap.c ui.c ui_draw.c ui_popup.c ui_osd.c ui_menu.c ^
    ui_sched.c ui_settings.c ui_about.c presets.c schedule.c hotkey.c a11y.c ^
-   wmibright.c capture.c ^
+   remote.c wmibright.c capture.c ^
    build\lumos.res ^
    /Fo"build\\" /Fe:build\lumos.exe ^
    /link /subsystem:windows ^

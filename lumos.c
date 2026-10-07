@@ -11,6 +11,7 @@
 
 #include "resource.h"
 #include "monitor.h"
+#include "brightmap.h"
 #include "ui.h"
 #include "presets.h"
 #include "capture.h"
@@ -51,6 +52,15 @@ static const GUID kGuidConsoleDisplayState =
 #define RESCAN_RETRY_TIMER_ID     0xB104
 static const DWORD kRescanBackoffMs[] = { 2000, 5000, 10000, 20000 };
 #define RESCAN_MAX_RETRIES ((int)(sizeof(kRescanBackoffMs) / sizeof(kRescanBackoffMs[0])))
+
+/* An external monitor can come back from sleep slower than the laptop panel
+   beside it: the list then has a controllable monitor and is adopted, while the
+   external one does not answer DDC/CI yet. Such a monitor is rescanned on the
+   backoff above and then at this interval until it answers. A retry that falls
+   due while the popup is open waits for it to close, because adopting a list
+   rebuilds the popup and would close it under the user. */
+#define RESCAN_AWAIT_STEADY_MS    60000
+#define RESCAN_AWAIT_DEFER_MS     2000
 
 /* A written-off worker stays parked in the driver call forever, so retrying
    without a bound would leak one thread every watchdog period for as long as
@@ -94,6 +104,7 @@ static DWORD        g_rescanStartTick = 0;    /* when the current worker was lau
 static DWORD        g_rescanGeneration = 0;   /* incremented per launch */
 static DWORD        g_rescanAwaitedGen = 0;   /* the only generation whose result we accept */
 static int          g_rescanRetry = 0;        /* index into kRescanBackoffMs */
+static int          g_awaitRetry = 0;         /* index into kRescanBackoffMs for unanswered monitors */
 static int          g_rescanWriteOffs = 0;    /* consecutive workers the watchdog gave up on */
 static DWORD        g_lastRescanTick = 0;     /* when the last worker was launched */
 static Hotkey       g_hotkeysActive[HOTKEY_COUNT]; /* what RegisterHotKey currently holds */
@@ -139,6 +150,7 @@ typedef struct { HWND hwnd; DWORD gen; } RescanArgs;
 static void Schedule_ApplyNow(void);
 static void Schedule_Suspend(void);
 static void ManualChange(void);
+static void PopupChange(int masterLevel);
 static int  MasterTargetFromMonitors(void);
 static void Idle_Tick(void);
 static void Idle_Restore(void);
@@ -230,7 +242,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdLineA, int showCmd
 
     /* Brightness schedule: suspend on manual slider changes, tick every minute,
        and apply the current time slot immediately at startup. */
-    UI_SetManualChangeCallback(ManualChange);
+    UI_SetManualChangeCallback(PopupChange);
     SetTimer(g_hwndHidden, SCHEDULE_TIMER_ID, SCHEDULE_TICK_MS, NULL);
     Schedule_ApplyNow();
 
@@ -504,15 +516,15 @@ static void ShowContextMenu(HWND hwnd, const POINT *anchor, BOOL fromKeyboard)
 
 /* ---- Hotkey Handler ---- */
 
-/* Recover the intended base percent from what the monitors currently report:
-   average the readings, subtracting each monitor's delta to get the base. */
+/* Recover the All Monitors level from what the monitors currently report:
+   map each reading back through its offset and average the results. */
 static int MasterTargetFromMonitors(void)
 {
     int sum = 0, cnt = 0;
     for (int i = 0; i < g_monitors.count; i++) {
         BrightMonitor *mon = &g_monitors.monitors[i];
         if (!mon->controllable) continue;
-        sum += Monitor_GetPercent(mon) - mon->delta;
+        sum += BrightMap_Master(Monitor_GetPercent(mon), mon->delta);
         cnt++;
     }
     return cnt > 0 ? sum / cnt : 50;
@@ -527,20 +539,8 @@ static BOOL StepMaster(int delta)
         g_masterTarget = MasterTargetFromMonitors();
 
     g_masterTarget += delta;
-
-    /* Allow target to exceed 0-100 so monitors with large deltas can reach full range.
-       Limits: every monitor's (target + delta) should be able to span 0-100. */
-    int minDelta = 0, maxDelta = 0;
-    for (int i = 0; i < g_monitors.count; i++) {
-        if (!g_monitors.monitors[i].controllable) continue;
-        int d = g_monitors.monitors[i].delta;
-        if (d < minDelta) minDelta = d;
-        if (d > maxDelta) maxDelta = d;
-    }
-    int lo = 0 - maxDelta;   /* so monitor with max delta can reach 0 */
-    int hi = 100 - minDelta;  /* so monitor with min delta can reach 100 */
-    if (g_masterTarget < lo) g_masterTarget = lo;
-    if (g_masterTarget > hi) g_masterTarget = hi;
+    if (g_masterTarget < 0) g_masterTarget = 0;
+    if (g_masterTarget > 100) g_masterTarget = 100;
 
     /* No DDC read-back: Monitor_SetBrightness already stores the written
        level, and the read cost about half of every step, which made the tray
@@ -764,6 +764,7 @@ static void ScheduleRescanThrottled(HWND hwnd)
 {
     g_rescanWriteOffs = 0;
     g_rescanRetry = 0;
+    g_awaitRetry = 0;
     DWORD since = GetTickCount() - g_lastRescanTick;
     DWORD delay = (since >= RESCAN_MIN_INTERVAL_MS)
                   ? RESCAN_DEBOUNCE_MS
@@ -777,6 +778,7 @@ static void ScheduleRescanFromTrigger(HWND hwnd)
 {
     g_rescanWriteOffs = 0;
     g_rescanRetry = 0;
+    g_awaitRetry = 0;
     KillTimer(hwnd, RESCAN_RETRY_TIMER_ID);   /* a pending backoff is now moot */
     ScheduleRescan(hwnd);
 }
@@ -870,6 +872,18 @@ static void ManualChange(void)
 {
     g_idleDimmed = FALSE;   /* the user just set a level; do not restore over it */
     Schedule_Suspend();
+}
+
+/* A popup slider moved. The next hotkey or wheel step starts from
+   g_masterTarget, so it must follow the slider: the All Monitors slider sets it
+   directly, and a single monitor's slider sets it to what the monitors now
+   show. Left alone, the next step jumped back to the level the wheel had last
+   set. It is not cleared to -1 instead, because ReapplyBrightness reads -1 as
+   "never set" and would skip the restore after a wake. */
+static void PopupChange(int masterLevel)
+{
+    g_masterTarget = (masterLevel >= 0) ? masterLevel : MasterTargetFromMonitors();
+    ManualChange();
 }
 
 /* ---- Idle auto-dim ---- */
@@ -1160,7 +1174,10 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
             }
         } else if (wParam == RESCAN_RETRY_TIMER_ID) {
             KillTimer(hwnd, RESCAN_RETRY_TIMER_ID);
-            StartRescan(hwnd);
+            if (g_hwndPopup && IsWindowVisible(g_hwndPopup))
+                SetTimer(hwnd, RESCAN_RETRY_TIMER_ID, RESCAN_AWAIT_DEFER_MS, NULL);
+            else
+                StartRescan(hwnd);
         }
         return 0;
 
@@ -1209,6 +1226,9 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
         g_rescanRetry = 0;
 
         if (fresh) {
+            BOOL recovered;
+            int waiting = Monitor_TrackUnanswered(fresh, &g_monitors, &recovered);
+
             /* Release the handles we are replacing, except any the fresh list
                has acquired again: destroying those would invalidate the list we
                are about to adopt. */
@@ -1226,10 +1246,23 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
             g_hwndPopup = UI_CreatePopup(g_hInst, &g_monitors);
             /* g_idleDimmed is included so a monitor plugged in during an idle
                stretch gets the idle level too, instead of staying bright. */
-            if (g_reapplyOnRescan || g_idleDimmed) {
+            /* A monitor that answers again after a wake missed the restore
+               that ran without it, so it gets the level now. */
+            if (g_reapplyOnRescan || g_idleDimmed || recovered) {
                 g_reapplyOnRescan = FALSE;
                 /* restore our level after wake/unlock/display-on */
                 TIMED("rescan done: ReapplyBrightness", ReapplyBrightness());
+            }
+
+            if (waiting > 0) {
+                DWORD delay = (g_awaitRetry < RESCAN_MAX_RETRIES)
+                              ? kRescanBackoffMs[g_awaitRetry++]
+                              : RESCAN_AWAIT_STEADY_MS;
+                DbgLog("rescan: %d monitor(s) not answering, retry in %lu ms",
+                       waiting, delay);
+                SetTimer(hwnd, RESCAN_RETRY_TIMER_ID, delay, NULL);
+            } else {
+                g_awaitRetry = 0;
             }
         }
         g_rescanBusy = 0;

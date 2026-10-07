@@ -59,8 +59,9 @@ typedef void (*DeltaSaveCallback)(void);
 void UI_SetDeltaSaveCallback(DeltaSaveCallback cb);
 
 /* Called when the user manually changes brightness via the popup slider,
-   so the schedule can suspend itself. */
-typedef void (*ManualChangeCallback)(void);
+   so the schedule can suspend itself. masterLevel is the All Monitors level
+   that was set, or -1 when the slider of a single monitor moved. */
+typedef void (*ManualChangeCallback)(int masterLevel);
 void UI_SetManualChangeCallback(ManualChangeCallback cb);
 
 /* Context menu dimensions */

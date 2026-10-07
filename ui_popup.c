@@ -1,4 +1,5 @@
 #include "ui_internal.h"
+#include "brightmap.h"
 #include <shellapi.h>
 #include <windowsx.h>
 
@@ -28,10 +29,6 @@ typedef struct {
 
 static PopupData g_popupData;
 
-/* Forward declarations */
-static void GetDeltaRange(MonitorList *ml, int *outMin, int *outMax);
-static int MasterTargetToSlider(MonitorList *ml, int target);
-
 static int GetMonPercent(BrightMonitor *mon)
 {
     return Monitor_GetPercent(mon);
@@ -39,16 +36,15 @@ static int GetMonPercent(BrightMonitor *mon)
 
 static int GetMasterPercent(MonitorList *ml)
 {
-    /* Recover base target by subtracting deltas, then map to slider 0-100 */
+    /* Map each reading back through its offset and average the results */
     int sum = 0, cnt = 0;
     for (int i = 0; i < ml->count; i++) {
         if (ml->monitors[i].controllable) {
-            sum += GetMonPercent(&ml->monitors[i]) - ml->monitors[i].delta;
+            sum += BrightMap_Master(GetMonPercent(&ml->monitors[i]), ml->monitors[i].delta);
             cnt++;
         }
     }
-    int target = cnt > 0 ? sum / cnt : 50;
-    return MasterTargetToSlider(ml, target);
+    return cnt > 0 ? sum / cnt : 50;
 }
 
 /* Forward declarations for layout helpers */
@@ -225,7 +221,10 @@ static void PopupA11yDescribe(void *ctx, int index, A11yItem *out)
             wcscpy(out->name, L"All monitors");
         else
             _snwprintf(out->name, 159, L"%s", mon->name);
-        _snwprintf(out->value, 63, L"%d%%", RowPercent(pd, row));
+        if (mon && !mon->controllable)
+            wcscpy(out->value, L"Unavailable");
+        else
+            _snwprintf(out->value, 63, L"%d%%", RowPercent(pd, row));
     }
 }
 
@@ -281,9 +280,12 @@ static void RenderPopup(HWND hwnd, PopupData *pd)
 
     for (int row = 0; row < totalRows; row++) {
         BOOL isMaster = (row == ml->count);
+        /* A monitor that does not answer shows no level and no thumb: the last
+           value read from it may be long out of date. */
+        BOOL unavailable = !isMaster && !ml->monitors[row].controllable;
         int pct;
         WCHAR label[140];
-        WCHAR pctStr[8];
+        WCHAR pctStr[16];
 
         if (isMaster) {
             pct = pd->masterPercent;
@@ -296,7 +298,11 @@ static void RenderPopup(HWND hwnd, PopupData *pd)
         if (pd->activeSlider == row && pd->dragPercent >= 0)
             pct = pd->dragPercent;
 
-        wsprintfW(pctStr, L"%d%%", pct);
+        if (unavailable)
+            wcscpy(pctStr, L"Unavailable");
+        else
+            wsprintfW(pctStr, L"%d%%", pct);
+        int pctW = unavailable ? 80 : 40;
 
         if (isMaster) {
             int sepY = POPUP_PADDING + 24 + row * POPUP_ROW_H + 2;
@@ -307,12 +313,13 @@ static void RenderPopup(HWND hwnd, PopupData *pd)
         }
 
         int labelY = POPUP_PADDING + 24 + row * POPUP_ROW_H + 6;
-        RECT rcLabel = { POPUP_PADDING + 4, labelY, w - POPUP_PADDING - 40, labelY + 18 };
+        RECT rcLabel = { POPUP_PADDING + 4, labelY, w - POPUP_PADDING - pctW, labelY + 18 };
         SelectObject(dc, isMaster ? hFontBold : hFont);
-        SetTextColor(dc, HexToColorRef(isMaster ? CLR_ACCENT : CLR_TEXT));
+        SetTextColor(dc, HexToColorRef(isMaster ? CLR_ACCENT
+                                       : unavailable ? CLR_SUBTEXT : CLR_TEXT));
         DrawTextW(dc, label, -1, &rcLabel, DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS);
 
-        RECT rcPct = { w - POPUP_PADDING - 40, labelY, w - POPUP_PADDING - 4, labelY + 18 };
+        RECT rcPct = { w - POPUP_PADDING - pctW, labelY, w - POPUP_PADDING - 4, labelY + 18 };
         SelectObject(dc, hFontSmall);
         SetTextColor(dc, HexToColorRef(CLR_SUBTEXT));
         DrawTextW(dc, pctStr, -1, &rcPct, DT_RIGHT | DT_SINGLELINE);
@@ -324,15 +331,19 @@ static void RenderPopup(HWND hwnd, PopupData *pd)
         RoundRect(dc, rcSlider.left, rcSlider.top, rcSlider.right, rcSlider.bottom,
                   SLIDER_TRACK_H, SLIDER_TRACK_H);
 
-        int thumbX = XFromPercent(&rcSlider, pct);
-        SelectObject(dc, fillBrush);
-        RoundRect(dc, rcSlider.left, rcSlider.top, thumbX, rcSlider.bottom,
-                  SLIDER_TRACK_H, SLIDER_TRACK_H);
-        SelectObject(dc, oldBr);
+        if (unavailable) {
+            SelectObject(dc, oldBr);
+        } else {
+            int thumbX = XFromPercent(&rcSlider, pct);
+            SelectObject(dc, fillBrush);
+            RoundRect(dc, rcSlider.left, rcSlider.top, thumbX, rcSlider.bottom,
+                      SLIDER_TRACK_H, SLIDER_TRACK_H);
+            SelectObject(dc, oldBr);
 
-        int cy = (rcSlider.top + rcSlider.bottom) / 2;
-        Ellipse(dc, thumbX - SLIDER_THUMB_R, cy - SLIDER_THUMB_R,
-                thumbX + SLIDER_THUMB_R, cy + SLIDER_THUMB_R);
+            int cy = (rcSlider.top + rcSlider.bottom) / 2;
+            Ellipse(dc, thumbX - SLIDER_THUMB_R, cy - SLIDER_THUMB_R,
+                    thumbX + SLIDER_THUMB_R, cy + SLIDER_THUMB_R);
+        }
 
         /* Delta controls (skip master row) */
         if (!isMaster) {
@@ -393,6 +404,8 @@ static int HitTestSlider(PopupData *pd, int x, int y)
 {
     int totalRows = pd->ml->count + 1;
     for (int row = 0; row < totalRows; row++) {
+        if (row < pd->ml->count && !pd->ml->monitors[row].controllable)
+            continue;   /* no slider to drag on a monitor that does not answer */
         RECT rc;
         GetSliderRect(row, &rc);
         rc.top -= SLIDER_THUMB_R + 4;
@@ -403,44 +416,6 @@ static int HitTestSlider(PopupData *pd, int x, int y)
     return -1;
 }
 
-/* Get delta range across all DDC monitors */
-static void GetDeltaRange(MonitorList *ml, int *outMin, int *outMax)
-{
-    int lo = 0, hi = 0;
-    for (int i = 0; i < ml->count; i++) {
-        if (!ml->monitors[i].controllable) continue;
-        int d = ml->monitors[i].delta;
-        if (d < lo) lo = d;
-        if (d > hi) hi = d;
-    }
-    *outMin = lo;
-    *outMax = hi;
-}
-
-/* Map slider 0-100 to extended master target so all monitors can reach full range */
-static int SliderToMasterTarget(MonitorList *ml, int sliderPct)
-{
-    int minD, maxD;
-    GetDeltaRange(ml, &minD, &maxD);
-    int lo = -maxD;          /* slider 0%   → all monitors at 0 */
-    int hi = 100 - minD;     /* slider 100% → all monitors at 100 */
-    return lo + (sliderPct * (hi - lo)) / 100;
-}
-
-/* Map extended master target back to slider 0-100 */
-static int MasterTargetToSlider(MonitorList *ml, int target)
-{
-    int minD, maxD;
-    GetDeltaRange(ml, &minD, &maxD);
-    int lo = -maxD;
-    int hi = 100 - minD;
-    if (hi == lo) return 50;
-    int s = ((target - lo) * 100) / (hi - lo);
-    if (s < 0) s = 0;
-    if (s > 100) s = 100;
-    return s;
-}
-
 static void ApplySliderValue(PopupData *pd, int row, int percent)
 {
     MonitorList *ml = pd->ml;
@@ -448,13 +423,12 @@ static void ApplySliderValue(PopupData *pd, int row, int percent)
 
     if (isMaster) {
         pd->masterPercent = percent;
-        int target = SliderToMasterTarget(ml, percent);
-        Monitor_SetAllBrightness(ml, target);
+        Monitor_SetAllBrightness(ml, percent);
     } else {
         Monitor_SetBrightness(&ml->monitors[row], (DWORD)percent);
     }
 
-    if (g_manualChangeCb) g_manualChangeCb();
+    if (g_manualChangeCb) g_manualChangeCb(isMaster ? percent : -1);
 }
 
 /* ---- Keyboard ---- */
