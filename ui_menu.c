@@ -225,8 +225,8 @@ static void RenderContextMenu(HWND hwnd, CtxMenuData *d)
         SelectObject(dc, hFont);
         SetTextColor(dc, HexToColorRef(CLR_TEXT));
         RECT rcLabel = { textX, cy, w - 12, cy + CTXMENU_ITEM_H };
-        DrawTextW(dc, it->label, -1, &rcLabel,
-                  DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+        DrawTextW(dc, it->label, -1, &rcLabel,   /* preset names may hold "&" */
+                  DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
 
         cy += CTXMENU_ITEM_H;
     }

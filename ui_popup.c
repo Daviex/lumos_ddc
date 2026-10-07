@@ -317,7 +317,10 @@ static void RenderPopup(HWND hwnd, PopupData *pd)
         SelectObject(dc, isMaster ? hFontBold : hFont);
         SetTextColor(dc, HexToColorRef(isMaster ? CLR_ACCENT
                                        : unavailable ? CLR_SUBTEXT : CLR_TEXT));
-        DrawTextW(dc, label, -1, &rcLabel, DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS);
+        /* DT_NOPREFIX: monitor names contain "&" ("Wide viewing angle & High
+           density"), which DrawText would otherwise turn into an underline. */
+        DrawTextW(dc, label, -1, &rcLabel,
+                  DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
 
         RECT rcPct = { w - POPUP_PADDING - pctW, labelY, w - POPUP_PADDING - 4, labelY + 18 };
         SelectObject(dc, hFontSmall);

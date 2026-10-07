@@ -351,8 +351,8 @@ static void RenderSettings(HWND hwnd, SetEditData *d)
         RECT rcLabel = { 16, y, labelRight, y + SET_ROW_H };
         SelectObject(dc, hFont);
         SetTextColor(dc, HexToColorRef(CLR_TEXT));
-        DrawTextW(dc, r->label, -1, &rcLabel,
-                  DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+        DrawTextW(dc, r->label, -1, &rcLabel,   /* monitor and preset names may hold "&" */
+                  DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
 
         if (r->kind == SET_TOGGLE) {
             RECT rcT;

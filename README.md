@@ -56,12 +56,12 @@ Windows can dim a laptop panel, but it will not touch the brightness of external
 ## Screenshots
 
 <p align="center">
-  <img src="screenshots/01-popup.png" width="320" alt="Brightness popup: per-monitor slider and All Monitors master slider" />
+  <img src="screenshots/01-popup.png" width="320" alt="Brightness popup: a slider and a maximum for each monitor, and the All Monitors slider" />
   &nbsp;&nbsp;
-  <img src="screenshots/02-context-menu.png" width="250" alt="Dark context menu: presets, schedule, autostart, About" />
+  <img src="screenshots/02-context-menu.png" width="242" alt="Dark context menu: presets, re-scan, Settings, autostart, schedule, idle dim, About" />
 </p>
 <p align="center">
-  <img src="screenshots/03-osd.png" width="420" alt="On-screen display overlay with percentage and progress bar" />
+  <img src="screenshots/03-osd.png" width="248" alt="On-screen display overlay with percentage and progress bar" />
 </p>
 
 ## Features
