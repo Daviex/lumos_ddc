@@ -8,6 +8,10 @@
 void IdleBlack_Init(HINSTANCE instance, HWND owner);
 /* All calls belong to the UI thread. enabled is the global idle setting. */
 void IdleBlack_Update(const MonitorList *view, BOOL enabled, BOOL idle);
+/* Revalidate the input sample which led to the idle decision before covering
+   the desktop. A changed or unavailable sample requests a main-thread wake. */
+void IdleBlack_UpdateForInput(const MonitorList *view, BOOL enabled, BOOL idle,
+                             DWORD decisionInput);
 /* Hide immediately on user activity/topology changes; preserve the power request. */
 void IdleBlack_Clear(void);
 void IdleBlack_SetSessionLocked(BOOL locked);

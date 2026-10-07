@@ -140,7 +140,7 @@ Cross-compile from Linux or WSL with MinGW (the outputs go to `build/`):
 mkdir -p build
 x86_64-w64-mingw32-windres lumos.rc -O coff -o build/lumos.res
 x86_64-w64-mingw32-gcc -O2 -s -Wall -mwindows -DUNICODE -D_UNICODE -D_WIN32_WINNT=0x0A00 \
-  lumos.c monitor.c monitor_worker.c brightness.c monitor_selection.c idle_black.c diagnostics.c brightmap.c ui.c ui_draw.c ui_popup.c ui_graphics.c ui_monitor_selection.c ui_osd.c ui_menu.c ui_sched.c \
+  lumos.c monitor.c monitor_worker.c brightness.c monitor_selection.c idle_black.c idle_activity.c diagnostics.c brightmap.c ui.c ui_draw.c ui_popup.c ui_graphics.c ui_monitor_selection.c ui_osd.c ui_menu.c ui_sched.c \
   ui_settings.c ui_about.c presets.c schedule.c hotkey.c a11y.c remote.c wmibright.c capture.c \
   build/lumos.res -o build/lumos.exe \
   -ldxva2 -luser32 -lgdi32 -lshell32 -lcomctl32 -ladvapi32 -lole32 -loleaut32 -lwbemuuid -ldwmapi -lwtsapi32 -loleacc -lkernel32 -lm
@@ -159,6 +159,7 @@ build.bat debug      :: debug build, diagnostics and UI timings beside the exe
 
 - `lumos.c`: application lifecycle, tray/hotkeys, scheduling and monitor rescan coordination.
 - `idle_black.c`: per-monitor black idle windows, input wake and display power request.
+- `idle_activity.c`: monotonic inactivity tracking, including irregular Windows input timestamps and explicit activity.
 - `diagnostics.c`: shared, thread-safe runtime logging with bounded file rotation.
 - `monitor.c`, `wmibright.c`: hardware access and physical handle ownership.
 - `monitor_worker.c`: queued writes, refreshes and result delivery to the UI thread.
@@ -338,6 +339,15 @@ Hotkeys are stored as text. Modifiers are `Ctrl`, `Alt`, `Shift` and `Win`, and 
 Each line in `[Ranges]` is a monitor name followed by its minimum and maximum, the levels it takes when All Monitors is at 0% and at 100%. A second monitor with the same name is stored as `Name #2`, so two identical models keep separate ranges. A range is at least 20 points wide, so every brightness step still moves the monitor. A monitor without a line starts at `0,100`. A `config.ini` from an older version has a `[Deltas]` section with one offset per monitor instead. Lumos converts those offsets into ranges that keep the monitors matched the same way (offsets of +10 and -30 become `40,100` and `0,60`), and it leaves `[Deltas]` untouched so an older version still finds its offsets.
 
 `IdleDimEnabled` turns idle dim on and off, and the tray menu toggles the same key. `IdleDimPercent` is the level held while the session is idle (0 to 100). `IdleDimMinutes` is how long there must be no keyboard or mouse input before the dim happens (1 to 1440 minutes).
+
+Lumos counts changing Windows input timestamps as new activity even if a timestamp
+moves backwards. A failed input query leaves the desktop visible and restarts
+the timeout. State-changing `lumosctl` commands, overlay wake and session unlock
+also restart the timeout; commands which only read state do not. Fullscreen,
+presentation and detected microphone/camera exclusions are rechecked while dimmed.
+When an exclusion begins the display is restored; when it ends a full idle timeout
+starts again. General checks run every two seconds, and black-cover input wake
+is checked every 100 ms without adopting input which arrived during cover creation.
 
 For OLED displays, select the monitor in **Choose Monitors** and enable
 **OLED: true black when idle**, then Apply and Save. The existing idle timeout

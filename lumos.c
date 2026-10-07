@@ -19,6 +19,7 @@
 #include "capture.h"
 #include "ui_monitor_selection.h"
 #include "idle_black.h"
+#include "idle_activity.h"
 #include "brightmap.h"
 #include "remote.h"
 #include "diagnostics.h"
@@ -108,6 +109,8 @@ static BOOL         g_masterTargetValid;
 static BOOL         g_masterTargetExplicit; /* A requested group level, rather than an inferred UI average. */
 static BOOL         g_idleDimmed = FALSE;     /* TRUE while the idle level is on the monitors */
 static DWORD        g_idleEpoch;
+static IdleActivity g_idleActivity;
+static int          g_idleLastBlock;
 
 typedef struct {
     volatile LONG busy;          /* one awaited worker; timed-out workers may still finish */
@@ -128,9 +131,7 @@ static int          g_hotkeyStartupFailure = -1;   /* first action we could not 
 static BOOL         g_hotkeysSuspended = FALSE;    /* released while Settings captures keys */
 static DWORD        g_trayRightClickTick = 0;      /* last right button down or up on the icon */
 static DWORD        g_trayKeySelectTick = 0;       /* last NIN_KEYSELECT */
-static DWORD        g_lastRemoteTick = 0;          /* last lumosctl command, counted as activity */
 static int          g_wheelPending = 0;            /* tray wheel notches not applied yet (hook and handler share the UI thread) */
-static BOOL         g_remoteSeen = FALSE;          /* g_lastRemoteTick is valid */
 #define TRAY_CLICK_WINDOW_MS 1000
 
 /* RegisterHotKey id per HOTKEY_* action, which is also the WM_HOTKEY wParam. */
@@ -172,6 +173,8 @@ static void SliderManualChange(int row, int target);
 static int MasterTargetFromMonitors(void);
 static void Idle_Tick(void);
 static void Idle_Restore(void);
+static void Idle_Activity(void);
+static void UpdateIdleBlack(BOOL enabled, BOOL idle);
 static void RestoreIdleMonitor(BrightMonitor *monitor);
 static void ResumeSourceMonitor(BrightMonitor *monitor);
 static void RestartSourcePolling(void);
@@ -338,7 +341,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdLineA, int showCmd
        reliably send WM_DISPLAYCHANGE across a lock screen, so cached DDC handles
        go stale; these notifications trigger a rescan to re-acquire them. */
     IdleBlack_Init(hInst, g_hwndHidden);
-    IdleBlack_Update(&g_monitors, g_settings.idleDimEnabled, FALSE);
+    UpdateIdleBlack(g_settings.idleDimEnabled, FALSE);
     WTSRegisterSessionNotification(g_hwndHidden, NOTIFY_FOR_THIS_SESSION);
     g_hPowerNotify = RegisterPowerSettingNotification(
         g_hwndHidden, &kGuidConsoleDisplayState, DEVICE_NOTIFY_WINDOW_HANDLE);
@@ -759,10 +762,7 @@ static void SetIdleDimEnabled(BOOL on);
    set (a scheduled "lumosctl --preset Day" was undone two seconds later). */
 static void RemoteActivity(void)
 {
-    g_lastRemoteTick = GetTickCount();
-    g_remoteSeen = TRUE;
-    if (g_idleDimmed)
-        Idle_Restore();
+    Idle_Activity();
 }
 
 static MonitorList *AppMonitors(void) { return &g_monitors; }
@@ -1098,21 +1098,31 @@ static DWORD IdleMilliseconds(void)
     lii.dwTime = 0;
     if (!GetLastInputInfo(&lii)) {
         Diagnostics_Log("ERROR", "idle", "GetLastInputInfo FAILED error=0x%08lX", GetLastError());
-        return 0;
+        return IdleActivity_Sample(&g_idleActivity, GetTickCount64(), FALSE, 0);
     }
-    DWORD now = GetTickCount();
-    DWORD idle = now - lii.dwTime;        /* unsigned math, so the 49-day wrap is fine */
-    /* A lumosctl command counts as activity too (see RemoteActivity). */
-    if (g_remoteSeen && now - g_lastRemoteTick < idle)
-        idle = now - g_lastRemoteTick;
-    return idle;
+    return IdleActivity_Sample(&g_idleActivity, GetTickCount64(), TRUE, lii.dwTime);
+}
+
+/* Input, CLI actions and overlay wake all restart the same monotonic clock. */
+static void Idle_Activity(void)
+{
+    IdleActivity_Record(&g_idleActivity, GetTickCount64());
+    Idle_Restore();
+}
+
+static void UpdateIdleBlack(BOOL enabled, BOOL idle)
+{
+    if (idle && g_idleActivity.inputValid)
+        IdleBlack_UpdateForInput(&g_monitors, enabled, idle, g_idleActivity.inputTick);
+    else
+        IdleBlack_Update(&g_monitors, enabled, idle);
 }
 
 /* Reasons to leave the brightness alone even though no input has arrived. */
 enum { DIMBLOCK_NONE = 0, DIMBLOCK_FULLSCREEN, DIMBLOCK_CAPTURE };
 
 /* Fullscreen video, presentation mode and a live call all mean somebody is
-   watching without touching anything. Checked only when we would dim. */
+   watching without touching anything. Also checked while already dimmed. */
 static int Idle_DimBlocked(void)
 {
     QUERY_USER_NOTIFICATION_STATE state;
@@ -1174,7 +1184,7 @@ static void ApplyIdleBrightness(void)
 {
     for (int i = 0; i < g_monitors.count; i++)
         DimIdleMonitor(&g_monitors.monitors[i]);
-    IdleBlack_Update(&g_monitors, g_settings.idleDimEnabled, g_idleDimmed);
+    UpdateIdleBlack(g_settings.idleDimEnabled, g_idleDimmed);
 }
 
 /* This is the sole exception to the normal PC-input filter: undo our own
@@ -1213,16 +1223,7 @@ static void TryIdleHandoff(BrightMonitor *monitor)
 
 static void Idle_Dim(void)
 {
-    /* This path is retried every tick for as long as the call or the video
-       lasts, so the log records a reason only when the reason changes. */
-    static int lastBlock = DIMBLOCK_NONE;
     int block = Idle_DimBlocked();
-    if (block != lastBlock) {
-        lastBlock = block;
-        if (block != DIMBLOCK_NONE)
-            DbgLog("Idle dim skipped: %s", block == DIMBLOCK_FULLSCREEN
-                   ? "fullscreen or presentation" : "microphone or camera in use");
-    }
     if (block != DIMBLOCK_NONE)
         return;
     for (int i = 0; i < g_monitors.count; i++) {
@@ -1298,7 +1299,7 @@ static void Idle_Restore(void)
             g_monitors.monitors[i].idleReleasePending = FALSE;
         TryIdleHandoff(&g_monitors.monitors[i]);
     }
-    IdleBlack_Update(&g_monitors, g_settings.idleDimEnabled, FALSE);
+    UpdateIdleBlack(g_settings.idleDimEnabled, FALSE);
 }
 
 /* Removing the black cover is immediate, but a dimmed panel may reject its
@@ -1328,16 +1329,30 @@ static void Idle_Tick(void)
         g_settings.idleDimEnabled, idleMs, (DWORD)g_settings.idleDimMinutes * 60000u,
         g_idleDimmed, g_masterTargetValid, g_masterTarget);
     if (!g_settings.idleDimEnabled) {
+        g_idleLastBlock = DIMBLOCK_NONE;
         Idle_Restore();   /* setting turned off mid-dim */
         RetryIdleRestores();
-        IdleBlack_Update(&g_monitors, FALSE, FALSE);
+        UpdateIdleBlack(FALSE, FALSE);
         return;
     }
-    BOOL idle = idleMs >= (DWORD)g_settings.idleDimMinutes * 60000u;
+    DWORD threshold = (DWORD)g_settings.idleDimMinutes * 60000u;
+    /* The expensive capture lookup is needed at a dim decision, throughout
+       dimming, and while waiting for an existing exclusion to finish. */
+    int block = (idleMs >= threshold || g_idleDimmed || g_idleLastBlock != DIMBLOCK_NONE)
+                ? Idle_DimBlocked() : DIMBLOCK_NONE;
+    if (block != g_idleLastBlock) {
+        Diagnostics_Log("INFO", "idle", "exclusion changed previous=%d current=%d", g_idleLastBlock, block);
+        if (block == DIMBLOCK_NONE && g_idleLastBlock != DIMBLOCK_NONE) {
+            Idle_Activity(); /* Give the user a full timeout after video/call ends. */
+            idleMs = 0;
+        }
+        g_idleLastBlock = block;
+    }
+    BOOL idle = block == DIMBLOCK_NONE && idleMs >= threshold;
     if (idle && !g_idleDimmed)       Idle_Dim();
     else if (!idle && g_idleDimmed)  Idle_Restore();
     RetryIdleRestores();
-    IdleBlack_Update(&g_monitors, TRUE, g_idleDimmed);
+    UpdateIdleBlack(TRUE, g_idleDimmed);
 }
 
 /* ---- Main-thread message handlers ---- */
@@ -1418,7 +1433,7 @@ static void UpdateMonitorSelection(void)
                 ResumeSourceMonitor(monitor);
         }
         MonitorWorker_RefreshSources(&g_monitors, UI_MonitorSelectionIsOpen());
-        IdleBlack_Update(&g_monitors, g_settings.idleDimEnabled, g_idleDimmed);
+        UpdateIdleBlack(g_settings.idleDimEnabled, g_idleDimmed);
         return;
     }
     /* Saving a new scope is user activity. Restore an idle level only on
@@ -1455,7 +1470,7 @@ static void UpdateMonitorSelection(void)
     g_hwndPopup = UI_CreatePopup(g_hInst, &g_monitors);
     Monitor_RefreshBrightness(&g_monitors);
     MonitorWorker_RefreshSources(&g_monitors, UI_MonitorSelectionIsOpen());
-    IdleBlack_Update(&g_monitors, g_settings.idleDimEnabled, g_idleDimmed);
+    UpdateIdleBlack(g_settings.idleDimEnabled, g_idleDimmed);
 }
 
 static void HandleCommand(HWND hwnd, int cmd)
@@ -1741,7 +1756,7 @@ static void HandleMonitorResult(HWND hwnd, MonitorResult *result)
         UI_RefreshPopup(g_hwndPopup, &g_monitors);
         UI_MonitorSelectionRefresh(&g_monitors);
         Diagnostics_MonitorState(monitor, "result applied");
-        IdleBlack_Update(&g_monitors, g_settings.idleDimEnabled, g_idleDimmed);
+        UpdateIdleBlack(g_settings.idleDimEnabled, g_idleDimmed);
     } else if (stateIndex >= 0 && result->brightnessWritten && result->purpose == MONITOR_WRITE_IDLE) {
         /* Its brightness result was superseded, but an actual dim still needs
            undoing if the newer input telemetry belongs to another computer. */
@@ -1832,7 +1847,7 @@ static int AdoptMonitorList(MonitorList *fresh)
     /* Enumeration may have read before a write completed. */
     Monitor_RefreshBrightness(&g_monitors);
     MonitorWorker_RefreshSources(&g_monitors, UI_MonitorSelectionIsOpen());
-    IdleBlack_Update(&g_monitors, g_settings.idleDimEnabled, g_idleDimmed);
+    UpdateIdleBlack(g_settings.idleDimEnabled, g_idleDimmed);
     return waiting;
 }
 
@@ -1989,6 +2004,7 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
         if (wParam == WTS_SESSION_LOCK || wParam == WTS_CONSOLE_DISCONNECT) {
             IdleBlack_SetSessionLocked(TRUE);
         } else if (wParam == WTS_SESSION_UNLOCK || wParam == WTS_CONSOLE_CONNECT) {
+            Idle_Activity();
             IdleBlack_SetSessionLocked(FALSE);
             Idle_Tick(); /* Re-evaluate the input which unlocked the session before covering it. */
             g_rescan.reapplyBrightness = TRUE;   /* restore brightness after the recovery rescan */
@@ -2025,7 +2041,7 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
         return 0;
 
     case WM_IDLE_BLACK_WAKE:
-        Idle_Restore();
+        Idle_Activity();
         return 0;
 
     case WM_APP_RESCAN_DONE:

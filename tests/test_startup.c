@@ -29,7 +29,10 @@ static const HWND testWindow = (HWND)(UINT_PTR)1;
 static const HWND testPopup = (HWND)(UINT_PTR)2;
 static int nowMinute, nowDay, dayValue, dayCalls;
 static int mockRangeLo, mockRangeHi;
-static DWORD nowTick, lastInputTick;
+static ULONGLONG nowTick;
+static DWORD lastInputTick;
+static BOOL inputOk, captureActive;
+static QUERY_USER_NOTIFICATION_STATE notificationState;
 static int setAllCalls, setOneCalls, actualWrites, lastBase, lastUiTarget;
 static int refreshCalls, popupCalls, destroyCalls, workerResets, cleanupCalls;
 static int timerCalls, killCalls;
@@ -57,6 +60,7 @@ static UINT_PTR lastKilledTimer;
 
 static void WINAPI MockGetLocalTime(LPSYSTEMTIME time);
 static DWORD WINAPI MockGetTickCount(void);
+static ULONGLONG WINAPI MockGetTickCount64(void);
 static BOOL WINAPI MockGetLastInputInfo(PLASTINPUTINFO input);
 static UINT_PTR WINAPI MockSetTimer(HWND, UINT_PTR, UINT, TIMERPROC);
 static BOOL WINAPI MockKillTimer(HWND, UINT_PTR);
@@ -68,6 +72,7 @@ static void ConfigureTwoReadyMonitors(void);
 
 #define GetLocalTime MockGetLocalTime
 #define GetTickCount MockGetTickCount
+#define GetTickCount64 MockGetTickCount64
 #define GetLastInputInfo MockGetLastInputInfo
 #define SetTimer MockSetTimer
 #define KillTimer MockKillTimer
@@ -79,6 +84,7 @@ static void ConfigureTwoReadyMonitors(void);
 #include "../lumos.c"
 #undef GetLocalTime
 #undef GetTickCount
+#undef GetTickCount64
 #undef GetLastInputInfo
 #undef SetTimer
 #undef KillTimer
@@ -98,21 +104,22 @@ static void WINAPI MockGetLocalTime(LPSYSTEMTIME time)
     time->wMinute = (WORD)(nowMinute % 60);
 }
 
-static DWORD WINAPI MockGetTickCount(void) { return nowTick; }
+static DWORD WINAPI MockGetTickCount(void) { return (DWORD)nowTick; }
+static ULONGLONG WINAPI MockGetTickCount64(void) { return nowTick; }
 static BOOL WINAPI MockGetLastInputInfo(PLASTINPUTINFO input)
 {
     CHECK(input->cbSize == sizeof(*input));
     input->dwTime = lastInputTick;
-    return TRUE;
+    return inputOk;
 }
 
 static HRESULT WINAPI MockNotificationState(QUERY_USER_NOTIFICATION_STATE *state)
 {
-    *state = QUNS_ACCEPTS_NOTIFICATIONS;
+    *state = notificationState;
     return S_OK;
 }
 
-BOOL Capture_InUse(void) { return FALSE; }
+BOOL Capture_InUse(void) { return captureActive; }
 
 static BOOL WINAPI MockGetCursorPos(LPPOINT point)
 {
@@ -337,6 +344,11 @@ void IdleBlack_Update(const MonitorList *view, BOOL enabled, BOOL idle)
     blackIdle = idle;
     blackEnabled = enabled;
 }
+void IdleBlack_UpdateForInput(const MonitorList *view, BOOL enabled, BOOL idle, DWORD decisionInput)
+{
+    CHECK(g_idleActivity.inputValid && decisionInput == g_idleActivity.inputTick);
+    IdleBlack_Update(view, enabled, idle);
+}
 void IdleBlack_Clear(void) { blackClears++; blackIdle = FALSE; }
 void IdleBlack_SetSessionLocked(BOOL locked) { (void)locked; }
 void IdleBlack_Shutdown(void) { CHECK(FALSE); }
@@ -425,8 +437,11 @@ static void ResetState(void)
     g_idleDimmed = FALSE;
     g_idleEpoch = 0;
     g_awaitRetry = 0;
-    g_remoteSeen = FALSE;
-    g_lastRemoteTick = 0;
+    memset(&g_idleActivity, 0, sizeof(g_idleActivity));
+    g_idleLastBlock = DIMBLOCK_NONE;
+    inputOk = TRUE;
+    captureActive = FALSE;
+    notificationState = QUNS_ACCEPTS_NOTIFICATIONS;
     g_settings.sourcePollSeconds = DEFAULT_SOURCE_POLL_SECONDS;
     nowMinute = 570; /* 09:30 */
     nowDay = 1;
@@ -2042,7 +2057,7 @@ static void TestCliActivityRestartsIdleCountdownAndLatestRowIntent(void)
     CHECK(g_idleDimmed && g_monitors.monitors[0].brightnessCur == 5);
     CHECK(AppSetMaster(60));
     CHECK(!g_idleDimmed && g_monitors.monitors[0].brightnessCur == 60);
-    CHECK(g_remoteSeen && g_lastRemoteTick == nowTick && IdleMilliseconds() == 0);
+    CHECK(g_idleActivity.activityValid && g_idleActivity.activityTick == nowTick && IdleMilliseconds() == 0);
     nowTick += 59000;
     Idle_Tick();
     CHECK(!g_idleDimmed && g_monitors.monitors[0].brightnessCur == 60);
@@ -2065,7 +2080,7 @@ static void TestCliActivityRestartsIdleCountdownAndLatestRowIntent(void)
     int writes = actualWrites;
     (void)AppSetMonitor(0, 27); /* A suspended row retains this intent for its return. */
     CHECK(actualWrites == writes && g_monitors.monitors[0].desiredBrightness == 27);
-    CHECK(g_lastRemoteTick == nowTick);
+    CHECK(g_idleActivity.activityTick == nowTick);
     DeliverRescan(1, TRUE, 100);
     CHECK(!g_monitors.monitors[0].sourceKnown && actualWrites == writes);
     DeliverSourceResult(MONITOR_RESULT_SOURCE, TRUE, 15);
@@ -2095,6 +2110,103 @@ static void TestCliRangeAndRescanPreserveLatestMaster(void)
     CHECK(g_masterTarget == 55 && AppMasterLevel() == 55);
     CHECK(g_monitors.monitors[0].brightnessCur == 54 && g_monitors.monitors[1].brightnessCur == 54);
     CHECK(actualWrites == writes + 1);
+}
+
+static void ConfigureIdleTest(void)
+{
+    ResetState();
+    AddReadyMonitor();
+    g_settings.idleDimEnabled = TRUE;
+    g_settings.idleDimMinutes = 1;
+    g_settings.idleDimPercent = 5;
+    nowTick = 300000;
+    lastInputTick = 0;
+}
+
+static void TestIrregularInputRestartsIdleAndFailureRecovery(void)
+{
+    ConfigureIdleTest();
+    lastInputTick = (DWORD)nowTick + 1; /* An initial future tick is ambiguous. */
+    Idle_Tick();
+    CHECK(!g_idleDimmed && actualWrites == 0);
+    nowTick += 60000;
+    Idle_Tick();
+    CHECK(g_idleDimmed && g_monitors.monitors[0].brightnessCur == 5);
+    lastInputTick = 1000; /* Newly observed input has a retrograde timestamp. */
+    Idle_Tick();
+    CHECK(!g_idleDimmed && g_monitors.monitors[0].brightnessCur == 50);
+    CHECK(IdleMilliseconds() == 0);
+    nowTick += 60000;
+    Idle_Tick();
+    CHECK(g_idleDimmed);
+    inputOk = FALSE;
+    Idle_Tick();
+    CHECK(!g_idleDimmed && !g_idleActivity.inputValid);
+    nowTick += 120000;
+    inputOk = TRUE;
+    Idle_Tick(); /* An old raw timestamp after API recovery is fresh activity. */
+    CHECK(!g_idleDimmed && IdleMilliseconds() == 0);
+    nowTick += 59999;
+    Idle_Tick();
+    CHECK(!g_idleDimmed);
+    nowTick++;
+    Idle_Tick();
+    CHECK(g_idleDimmed);
+}
+
+static void TestLateExclusionsRestoreAndRearmOnce(void)
+{
+    ConfigureIdleTest();
+    Idle_Tick();
+    CHECK(g_idleDimmed);
+    notificationState = QUNS_PRESENTATION_MODE;
+    Idle_Tick();
+    CHECK(!g_idleDimmed && g_monitors.monitors[0].brightnessCur == 50);
+    nowTick += 300000;
+    notificationState = QUNS_ACCEPTS_NOTIFICATIONS;
+    captureActive = TRUE; /* Changing exclusion reason does not end the block. */
+    Idle_Tick();
+    CHECK(!g_idleDimmed && g_idleLastBlock == DIMBLOCK_CAPTURE);
+    nowTick += 300000;
+    captureActive = FALSE;
+    Idle_Tick();
+    CHECK(!g_idleDimmed && IdleMilliseconds() == 0);
+    nowTick += 59000;
+    Idle_Tick();
+    CHECK(!g_idleDimmed && IdleMilliseconds() == 59000);
+    nowTick += 1000;
+    Idle_Tick();
+    CHECK(g_idleDimmed); /* Clear ticks must not continually restart the clock. */
+
+    captureActive = TRUE; /* A call starting after dim restores too. */
+    Idle_Tick();
+    CHECK(!g_idleDimmed);
+
+    ConfigureIdleTest();
+    g_monitors.monitors[0].idleBlack = TRUE;
+    Idle_Tick();
+    CHECK(g_idleDimmed && blackIdle && idleWrites == 0);
+    notificationState = QUNS_RUNNING_D3D_FULL_SCREEN;
+    Idle_Tick();
+    CHECK(!g_idleDimmed && !blackIdle && actualWrites == 0);
+}
+
+static void TestExplicitWakeAndReadOnlyCommands(void)
+{
+    ConfigureIdleTest();
+    Idle_Tick();
+    CHECK(g_idleDimmed);
+    Idle_Activity(); /* Overlay close/wake can occur without a new raw tick. */
+    CHECK(!g_idleDimmed && IdleMilliseconds() == 0);
+    nowTick += 59000;
+    (void)AppMasterLevel();
+    (void)AppMonitors();
+    (void)AppSettings();
+    Idle_Tick();
+    CHECK(!g_idleDimmed && IdleMilliseconds() == 59000);
+    nowTick += 1000;
+    Idle_Tick();
+    CHECK(g_idleDimmed);
 }
 
 int main(void)
@@ -2136,6 +2248,9 @@ int main(void)
     TestTotalUnavailableBackoffAndPopupDeferral();
     TestValidExcludedTopologyDoesNotTriggerPlaceholderRetries();
     TestCliActivityRestartsIdleCountdownAndLatestRowIntent();
+    TestIrregularInputRestartsIdleAndFailureRecovery();
+    TestLateExclusionsRestoreAndRearmOnce();
+    TestExplicitWakeAndReadOnlyCommands();
     TestCliRangeAndRescanPreserveLatestMaster();
     TestMixedOledWakeRetriesOnlyUnrestoredMonitor();
     TestIdleWakePreservesIndividualTargetsAndSchedulePrecedence();

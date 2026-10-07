@@ -151,6 +151,18 @@ targets; failed writes and late dim acknowledgements retain ownership until
 the correct latest target or native baseline has been restored.
 Changing an already dimmed display to black idle restores the old brightness
 ownership, including failed restores and dim acknowledgements arriving late.
+Idle orchestration also covers retrograde input, query failure recovery,
+late presentation/capture exclusions, a full timeout after exclusions end,
+and explicit overlay wake without a changed input timestamp.
+
+`test_idle_activity.c` tests the pure monotonic activity tracker with simulated
+input and clocks: first-sample validation, normal DWORD wrap, unchanged input
+past 49 days, irregular new timestamps, query recovery and explicit activity.
+
+```powershell
+clang -std=c11 -Wall -Wextra -Werror -DUNICODE -D_UNICODE tests/test_idle_activity.c idle_activity.c -o build/test_idle_activity.exe
+./build/test_idle_activity.exe
+```
 
 `test_idle_black.c` exercises the overlay with mocked windows, monitor geometry,
 last-input timestamps, source selection and power requests. It verifies an
@@ -165,7 +177,7 @@ clang -std=c11 -Wall -Wextra -Werror -DSTRSAFE_NO_DEPRECATE -DUNICODE -D_UNICODE
 ```
 
 ```powershell
-clang -O2 -std=c11 -Wall -Wextra -Werror -DSTRSAFE_NO_DEPRECATE -DUNICODE -D_UNICODE -ffunction-sections -fdata-sections tests/test_startup.c tests/diagnostics_stub.c brightness.c brightmap.c schedule.c monitor_selection.c hotkey.c '-Wl,--gc-sections' -lshell32 -o build/test_startup.exe
+clang -O2 -std=c11 -Wall -Wextra -Werror -DSTRSAFE_NO_DEPRECATE -DUNICODE -D_UNICODE -ffunction-sections -fdata-sections tests/test_startup.c tests/diagnostics_stub.c brightness.c brightmap.c schedule.c monitor_selection.c hotkey.c idle_activity.c '-Wl,--gc-sections' -lshell32 -o build/test_startup.exe
 ./build/test_startup.exe
 ```
 

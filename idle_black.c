@@ -41,13 +41,17 @@ void IdleBlack_Clear(void)
     }
 }
 
-static void WakeFromBlack(const char *reason)
+static void NotifyBlackWake(const char *reason)
 {
-    if (!IdleBlack_Active()) return;
     Diagnostics_Log("INFO", "overlay", "WAKE reason=%s", reason);
     IdleBlack_Clear();
     if (!PostMessageW(g_blackOwner, WM_IDLE_BLACK_WAKE, 0, 0))
         Diagnostics_Log("ERROR", "overlay", "wake notification FAILED error=0x%08lX", GetLastError());
+}
+
+static void WakeFromBlack(const char *reason)
+{
+    if (IdleBlack_Active()) NotifyBlackWake(reason);
 }
 
 static LRESULT CALLBACK BlackWndProc(HWND window, UINT message, WPARAM wp, LPARAM lp)
@@ -115,7 +119,8 @@ void IdleBlack_Init(HINSTANCE instance, HWND owner)
    changing the awareness of Lumos's other windows. Available since Win10 1607. */
 typedef HANDLE (WINAPI *SetDpiContextProc)(HANDLE);
 
-void IdleBlack_Update(const MonitorList *view, BOOL enabled, BOOL idle)
+static void UpdateBlack(const MonitorList *view, BOOL enabled, BOOL idle,
+                        BOOL hasDecisionInput, DWORD decisionInput)
 {
     enabled = enabled && !g_blackSessionLocked;
     HMONITOR desired[MAX_MONITORS];
@@ -171,20 +176,29 @@ void IdleBlack_Update(const MonitorList *view, BOOL enabled, BOOL idle)
     }
     if (!count || !g_blackRegistered) return;
 
+    BOOL first = !IdleBlack_Active();
+    LASTINPUTINFO input = { sizeof(input), 0 };
+    if (first || hasDecisionInput) {
+        BOOL inputOk = GetLastInputInfo(&input);
+        if (!inputOk)
+            Diagnostics_Log("ERROR", "overlay", "last-input query FAILED error=0x%08lX", GetLastError());
+        if (hasDecisionInput && (!inputOk || input.dwTime != decisionInput ||
+                               (!first && input.dwTime != g_blackLastInput))) {
+            /* The decision's baseline belongs to the entire idle stretch.
+               A newer sample must wake existing covers, never rebase them. */
+            NotifyBlackWake(inputOk ? "input-changed-before-cover" : "last-input-query-failed");
+            return;
+        }
+        /* If the input query fails, leave the desktop visible. */
+        if (!inputOk) return;
+    }
+    if (first) g_blackLastInput = hasDecisionInput ? decisionInput : input.dwTime;
+
     union { FARPROC generic; SetDpiContextProc setDpi; } dpi;
     dpi.generic = GetProcAddress(GetModuleHandleW(L"user32.dll"), "SetThreadDpiAwarenessContext");
     SetDpiContextProc setDpi = dpi.setDpi;
     HANDLE oldDpi = setDpi ? setDpi((HANDLE)(LONG_PTR)-4) : NULL;
     if (setDpi && !oldDpi) oldDpi = setDpi((HANDLE)(LONG_PTR)-3);
-    BOOL first = !IdleBlack_Active();
-    LASTINPUTINFO input = { sizeof(input), 0 };
-    /* If the input query fails, leave the desktop visible. */
-    if (first && !GetLastInputInfo(&input)) {
-        Diagnostics_Log("ERROR", "overlay", "SKIP first overlay: last-input query FAILED error=0x%08lX", GetLastError());
-        if (oldDpi) setDpi(oldDpi);
-        return;
-    }
-    if (first) g_blackLastInput = input.dwTime;
     for (int j = 0; j < count; j++) {
         MONITORINFO info = {0};
         info.cbSize = sizeof(info);
@@ -233,6 +247,17 @@ void IdleBlack_Update(const MonitorList *view, BOOL enabled, BOOL idle)
             Diagnostics_Monitor(&black->identity, "ERROR", "overlay", "SetWindowPos FAILED error=0x%08lX", GetLastError());
     }
     if (oldDpi) setDpi(oldDpi);
+}
+
+void IdleBlack_Update(const MonitorList *view, BOOL enabled, BOOL idle)
+{
+    UpdateBlack(view, enabled, idle, FALSE, 0);
+}
+
+void IdleBlack_UpdateForInput(const MonitorList *view, BOOL enabled, BOOL idle,
+                             DWORD decisionInput)
+{
+    UpdateBlack(view, enabled, idle, TRUE, decisionInput);
 }
 
 void IdleBlack_Shutdown(void)

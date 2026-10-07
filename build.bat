@@ -25,7 +25,7 @@ if errorlevel 1 (
 :: /MT embeds the C runtime: distribute only the exe, no VC runtime DLLs.
 :: All intermediates and the exe go to build\.
 cl /nologo /O2 /MT /W4 /WX- %DEFS% ^
-   lumos.c monitor.c monitor_worker.c brightness.c brightmap.c monitor_selection.c idle_black.c diagnostics.c ^
+   lumos.c monitor.c monitor_worker.c brightness.c brightmap.c monitor_selection.c idle_black.c idle_activity.c diagnostics.c ^
    ui.c ui_draw.c ui_popup.c ui_graphics.c ui_monitor_selection.c ui_osd.c ui_menu.c ^
    ui_sched.c ui_settings.c ui_about.c presets.c schedule.c hotkey.c a11y.c ^
    remote.c wmibright.c capture.c ^

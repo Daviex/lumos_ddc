@@ -8,6 +8,7 @@
 static int failures, creates, destroys, wakes, powerCalls, positions;
 static DWORD inputTick = 100;
 static BOOL inputOk = TRUE, createOk = TRUE, timerOk = TRUE;
+static BOOL inputDuringCreate;
 static EXECUTION_STATE powerFlags;
 static EXECUTION_STATE mockPowerState = ES_CONTINUOUS;
 static DWORD windowStyle, windowExStyle;
@@ -33,6 +34,7 @@ static HWND WINAPI MockCreate(DWORD ex, LPCWSTR cls, LPCWSTR title, DWORD style,
     windowStyle = style;
     windowExStyle = ex;
     lastBounds = (RECT){x, y, x + width, y + height};
+    if (inputDuringCreate) inputTick++;
     return createOk ? (HWND)(UINT_PTR)(creates + 100) : NULL;
 }
 static BOOL WINAPI MockDestroy(HWND window)
@@ -132,6 +134,7 @@ static void Reset(void)
     IdleBlack_Shutdown();
     creates = destroys = wakes = powerCalls = positions = 0;
     inputOk = createOk = timerOk = TRUE;
+    inputDuringCreate = FALSE;
     offset = 0;
     inputTick = 100;
     mockPowerState = ES_CONTINUOUS;
@@ -222,6 +225,54 @@ static void TestPreserveExistingPowerRequest(void)
     CHECK(mockPowerState == (ES_CONTINUOUS | ES_SYSTEM_REQUIRED));
 }
 
+static void TestDecisionInputBeforeCover(void)
+{
+    Reset();
+    MonitorList view = MakeView();
+    inputTick = 101; /* Input arrived after the main thread decided to dim. */
+    IdleBlack_UpdateForInput(&view, TRUE, TRUE, 100);
+    CHECK(!IdleBlack_Active() && creates == 0 && wakes == 1);
+    CHECK(powerCalls == 1); /* A wake retains the existing OLED power policy. */
+
+    IdleBlack_UpdateForInput(&view, TRUE, TRUE, inputTick);
+    CHECK(IdleBlack_Active() && creates == 1 && g_blackLastInput == 101);
+    IdleBlack_UpdateForInput(&view, TRUE, TRUE, inputTick);
+    CHECK(IdleBlack_Active() && creates == 1 && wakes == 1);
+
+    inputTick = 99; /* A changed retrograde input sample is activity too. */
+    IdleBlack_UpdateForInput(&view, TRUE, TRUE, inputTick);
+    CHECK(!IdleBlack_Active() && creates == 1 && destroys == 1 && wakes == 2);
+    CHECK(g_blackLastInput == 101); /* Do not rebase an existing idle stretch. */
+}
+
+static void TestDecisionInputAfterValidation(void)
+{
+    Reset();
+    MonitorList view = MakeView();
+    inputDuringCreate = TRUE;
+    IdleBlack_UpdateForInput(&view, TRUE, TRUE, inputTick);
+    CHECK(IdleBlack_Active() && inputTick == 101 && g_blackLastInput == 100);
+    BlackWndProc(g_blackWindows[0].window, WM_TIMER, BLACK_INPUT_TIMER, 0);
+    CHECK(!IdleBlack_Active() && destroys == 1 && wakes == 1);
+}
+
+static void TestDecisionInputFailure(void)
+{
+    Reset();
+    MonitorList view = MakeView();
+    inputOk = FALSE;
+    IdleBlack_UpdateForInput(&view, TRUE, TRUE, inputTick);
+    CHECK(!IdleBlack_Active() && creates == 0 && wakes == 1);
+    inputOk = TRUE;
+    IdleBlack_UpdateForInput(&view, TRUE, TRUE, inputTick);
+    CHECK(IdleBlack_Active() && creates == 1);
+    inputOk = FALSE;
+    IdleBlack_UpdateForInput(&view, TRUE, TRUE, inputTick);
+    CHECK(!IdleBlack_Active() && destroys == 1 && wakes == 2);
+    IdleBlack_UpdateForInput(&view, TRUE, FALSE, inputTick);
+    CHECK(wakes == 2); /* Non-idle updates need no input validation. */
+}
+
 static void TestActualBlackPixels(void)
 {
     HDC dc = CreateCompatibleDC(NULL);
@@ -252,9 +303,12 @@ int main(void)
     TestCoverageAndWake();
     TestSourceScopeAndFailures();
     TestPreserveExistingPowerRequest();
+    TestDecisionInputBeforeCover();
+    TestDecisionInputAfterValidation();
+    TestDecisionInputFailure();
     TestActualBlackPixels();
     IdleBlack_Shutdown();
     if (failures) return 1;
-    puts("ALL PASS: opaque black pixels, monitor bounds, source/scope, input wake, lock and power cleanup (mocked windows)");
+    puts("ALL PASS: opaque black pixels, monitor bounds, source/scope, decision-input races, input wake, lock and power cleanup (mocked windows)");
     return 0;
 }
