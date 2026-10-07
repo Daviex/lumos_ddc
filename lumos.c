@@ -1146,11 +1146,18 @@ enum { DIMBLOCK_NONE = 0, DIMBLOCK_FULLSCREEN, DIMBLOCK_CAPTURE, DIMBLOCK_DISPLA
 static int Idle_DimBlocked(void)
 {
     QUERY_USER_NOTIFICATION_STATE state;
-    if (SUCCEEDED(SHQueryUserNotificationState(&state)) &&
-        (state == QUNS_RUNNING_D3D_FULL_SCREEN ||
-         state == QUNS_PRESENTATION_MODE ||
-         state == QUNS_BUSY))
-        return DIMBLOCK_FULLSCREEN;
+    if (SUCCEEDED(SHQueryUserNotificationState(&state))) {
+        BOOL blackActive = IdleBlack_Active();
+        /* The full-monitor black cover itself makes the shell report BUSY.
+           Keep explicit D3D/presentation exclusions, and verify other visible
+           fullscreen content before letting BUSY undo our own idle cover. */
+        if (state == QUNS_RUNNING_D3D_FULL_SCREEN || state == QUNS_PRESENTATION_MODE ||
+            (state == QUNS_BUSY && (!blackActive || IdleBlack_HasExternalFullscreen()))) {
+            if (g_idleLastBlock != DIMBLOCK_FULLSCREEN)
+                Diagnostics_Log("INFO", "idle", "fullscreen exclusion shellState=%d ownBlackActive=%d", state, blackActive);
+            return DIMBLOCK_FULLSCREEN;
+        }
+    }
 
     if (Capture_InUse())
         return DIMBLOCK_CAPTURE;
@@ -1382,7 +1389,9 @@ static void Idle_Tick(void)
     int block = (idleMs >= threshold || g_idleDimmed || g_idleLastBlock != DIMBLOCK_NONE)
                 ? Idle_DimBlocked() : DIMBLOCK_NONE;
     if (block != g_idleLastBlock) {
-        Diagnostics_Log("INFO", "idle", "exclusion changed previous=%d current=%d", g_idleLastBlock, block);
+        static const char *const reasons[] = { "none", "fullscreen", "capture", "display-request" };
+        Diagnostics_Log("INFO", "idle", "exclusion changed previous=%d current=%d reason=%s",
+                        g_idleLastBlock, block, reasons[block]);
         if (block == DIMBLOCK_NONE && g_idleLastBlock != DIMBLOCK_NONE) {
             Idle_Activity(); /* Give the user a full timeout after video/call ends. */
             idleMs = 0;

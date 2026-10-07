@@ -349,6 +349,10 @@ moves backwards. A failed input query leaves the desktop visible and restarts
 the timeout. State-changing `lumosctl` commands, overlay wake and session unlock
 also restart the timeout; commands which only read state do not. Fullscreen,
 presentation and detected microphone/camera exclusions are rechecked while dimmed.
+The fullscreen check excludes Lumos's own black covers. While a cover is visible,
+the shell's generic busy state is confirmed against other visible fullscreen
+applications; ordinary maximized windows and windows on another virtual desktop
+do not cancel idle. Exclusive Direct3D and Windows presentation mode still block it.
 When an exclusion begins the display is restored; when it ends a full idle timeout
 starts again. General checks run every two seconds, and black-cover input wake
 is checked every 100 ms without adopting input which arrived during cover creation.
@@ -414,7 +418,8 @@ errors and duration. Brightness writes report their purpose, requested value,
 native range, original idle baseline, result and skip/cancellation reason.
 Worker queue generations/sequences distinguish superseded requests and stale
 results. Idle checks record elapsed inactivity and threshold; fullscreen/capture
-exclusions, source handoffs, overlay show/hide/wake, settings persistence,
+exclusion reasons, external fullscreen window/process IDs, source handoffs,
+overlay show/hide/wake, settings persistence,
 schedule/manual actions, topology/power events and rescans are recorded too.
 
 To diagnose a monitor, start this version, reproduce the missed automation and

@@ -1,6 +1,7 @@
 /* Exercise real overlay/power policy with mock windows, input and monitor
    geometry. GDI painting targets an offscreen DIB; no screen is covered. */
 #include <windows.h>
+#include <dwmapi.h>
 #include <stdio.h>
 #include <string.h>
 #include "../idle_black.h"
@@ -16,7 +17,93 @@ static DWORD windowStyle, windowExStyle;
 static RECT lastBounds;
 static int offset;
 static HWND owner = (HWND)(UINT_PTR)99;
+typedef struct {
+    HWND window;
+    RECT screen;
+    BOOL visible, minimized, maximized, clientFailure, screenFailure;
+    DWORD cloaked;
+    LONG_PTR exStyle;
+    LONG_PTR frameStyle;
+    const WCHAR *className;
+    HMONITOR monitor;
+} ProbeWindow;
+static ProbeWindow probeWindows[8];
+static int probeCount;
+static BOOL enumerationOk;
+static BOOL dpiAvailable, rejectDpiV2;
+static int dpiCalls;
+static HANDLE dpiContext;
 #define CHECK(x) do { if (!(x)) { printf("FAIL %d: %s\n", __LINE__, #x); failures++; } } while (0)
+
+static ProbeWindow *FindProbe(HWND window)
+{
+    for (int i = 0; i < probeCount; i++)
+        if (probeWindows[i].window == window) return &probeWindows[i];
+    return NULL;
+}
+static ProbeWindow *AddProbe(HWND window, const WCHAR *className)
+{
+    CHECK(probeCount < (int)ARRAYSIZE(probeWindows));
+    ProbeWindow *probe = &probeWindows[probeCount++];
+    probe->window = window;
+    probe->screen = (RECT){0, 0, 1920, 1080};
+    probe->visible = TRUE;
+    probe->className = className;
+    probe->monitor = (HMONITOR)(UINT_PTR)1;
+    return probe;
+}
+static BOOL WINAPI MockEnumWindows(WNDENUMPROC callback, LPARAM parameter)
+{
+    if (!enumerationOk) return FALSE;
+    for (int i = 0; i < probeCount; i++)
+        if (!callback(probeWindows[i].window, parameter)) return FALSE;
+    return TRUE;
+}
+static BOOL WINAPI MockVisible(HWND window)
+{ ProbeWindow *probe = FindProbe(window); return probe && probe->visible; }
+static BOOL WINAPI MockIconic(HWND window)
+{ ProbeWindow *probe = FindProbe(window); return probe && probe->minimized; }
+static BOOL WINAPI MockZoomed(HWND window)
+{ ProbeWindow *probe = FindProbe(window); return probe && probe->maximized; }
+static LONG_PTR WINAPI MockWindowStyle(HWND window, int index)
+{
+    CHECK(index == GWL_EXSTYLE || index == GWL_STYLE);
+    ProbeWindow *probe = FindProbe(window);
+    return probe ? (index == GWL_EXSTYLE ? probe->exStyle : probe->frameStyle) : 0;
+}
+static int WINAPI MockClassName(HWND window, LPWSTR name, int capacity)
+{
+    ProbeWindow *probe = FindProbe(window);
+    if (!probe) return 0;
+    int length = (int)wcslen(probe->className);
+    CHECK(length < capacity);
+    memcpy(name, probe->className, ((size_t)length + 1) * sizeof(WCHAR));
+    return length;
+}
+static HRESULT WINAPI MockDwmAttribute(HWND window, DWORD attribute, PVOID data, DWORD size)
+{
+    CHECK(attribute == DWMWA_CLOAKED && size == sizeof(DWORD));
+    ProbeWindow *probe = FindProbe(window);
+    if (!probe) return E_FAIL;
+    *(DWORD *)data = probe->cloaked;
+    return S_OK;
+}
+static BOOL WINAPI MockClientToScreen(HWND window, LPPOINT point)
+{
+    ProbeWindow *probe = FindProbe(window);
+    if (!probe || probe->screenFailure) return FALSE;
+    point->x += probe->screen.left;
+    point->y += probe->screen.top;
+    return TRUE;
+}
+static HMONITOR WINAPI MockMonitorFromWindow(HWND window, DWORD flags)
+{
+    CHECK(flags == MONITOR_DEFAULTTONULL);
+    ProbeWindow *probe = FindProbe(window);
+    return probe ? probe->monitor : NULL;
+}
+static DWORD WINAPI MockWindowProcess(HWND window, LPDWORD process)
+{ CHECK(FindProbe(window) != NULL); *process = 1234; return 1; }
 
 static ATOM WINAPI MockRegister(const WNDCLASSEXW *window)
 {
@@ -83,10 +170,32 @@ static EXECUTION_STATE WINAPI MockPower(EXECUTION_STATE flags)
     return previous;
 }
 static HMODULE WINAPI MockModule(LPCWSTR module) { (void)module; return (HMODULE)(UINT_PTR)1; }
-static FARPROC WINAPI MockProc(HMODULE module, LPCSTR name) { (void)module; (void)name; return NULL; }
+static HANDLE WINAPI MockSetDpi(HANDLE context)
+{
+    dpiCalls++;
+    if (rejectDpiV2 && context == (HANDLE)(LONG_PTR)-4) return NULL;
+    HANDLE previous = dpiContext;
+    dpiContext = context;
+    return previous;
+}
+static FARPROC WINAPI MockProc(HMODULE module, LPCSTR name)
+{
+    (void)module;
+    if (!dpiAvailable || strcmp(name, "SetThreadDpiAwarenessContext")) return NULL;
+    union { FARPROC generic; HANDLE (WINAPI *setDpi)(HANDLE); } dpi;
+    dpi.setDpi = MockSetDpi;
+    return dpi.generic;
+}
 static HCURSOR WINAPI MockCursor(HCURSOR cursor) { CHECK(cursor == NULL); return NULL; }
 static BOOL WINAPI MockClient(HWND window, LPRECT rect)
-{ (void)window; *rect = (RECT){0, 0, 8, 8}; return TRUE; }
+{
+    ProbeWindow *probe = FindProbe(window);
+    if (probe) {
+        if (probe->clientFailure) return FALSE;
+        *rect = (RECT){0, 0, probe->screen.right - probe->screen.left, probe->screen.bottom - probe->screen.top};
+    } else *rect = (RECT){0, 0, 8, 8};
+    return TRUE;
+}
 
 #define RegisterClassExW MockRegister
 #define UnregisterClassW MockUnregister
@@ -102,6 +211,16 @@ static BOOL WINAPI MockClient(HWND window, LPRECT rect)
 #define GetProcAddress MockProc
 #define SetCursor MockCursor
 #define GetClientRect MockClient
+#define EnumWindows MockEnumWindows
+#define IsWindowVisible MockVisible
+#define IsIconic MockIconic
+#define IsZoomed MockZoomed
+#define GetWindowLongPtrW MockWindowStyle
+#define GetClassNameW MockClassName
+#define DwmGetWindowAttribute MockDwmAttribute
+#define ClientToScreen MockClientToScreen
+#define MonitorFromWindow MockMonitorFromWindow
+#define GetWindowThreadProcessId MockWindowProcess
 #include "../idle_black.c"
 #undef RegisterClassExW
 #undef UnregisterClassW
@@ -117,6 +236,16 @@ static BOOL WINAPI MockClient(HWND window, LPRECT rect)
 #undef GetProcAddress
 #undef SetCursor
 #undef GetClientRect
+#undef EnumWindows
+#undef IsWindowVisible
+#undef IsIconic
+#undef IsZoomed
+#undef GetWindowLongPtrW
+#undef GetClassNameW
+#undef DwmGetWindowAttribute
+#undef ClientToScreen
+#undef MonitorFromWindow
+#undef GetWindowThreadProcessId
 
 static MonitorList MakeView(void)
 {
@@ -144,7 +273,84 @@ static void Reset(void)
     offset = 0;
     inputTick = 100;
     mockPowerState = ES_CONTINUOUS;
+    memset(probeWindows, 0, sizeof(probeWindows));
+    probeCount = 0;
+    enumerationOk = TRUE;
+    dpiAvailable = rejectDpiV2 = FALSE;
+    dpiCalls = 0;
+    dpiContext = (HANDLE)(LONG_PTR)-1;
     IdleBlack_Init((HINSTANCE)(UINT_PTR)1, owner);
+}
+
+static void TestExternalFullscreenExcludesOwnCoverAndDesktop(void)
+{
+    Reset();
+    MonitorList view = MakeView();
+    IdleBlack_Update(&view, TRUE, TRUE);
+    CHECK(IdleBlack_Active());
+    AddProbe(g_blackWindows[0].window, L"LumosIdleBlack");
+    CHECK(!IdleBlack_HasExternalFullscreen()); /* Even with full client bounds and no style hint. */
+    AddProbe((HWND)(UINT_PTR)201, L"Progman");
+    AddProbe((HWND)(UINT_PTR)202, L"WorkerW");
+    CHECK(!IdleBlack_HasExternalFullscreen());
+    ProbeWindow *app = AddProbe((HWND)(UINT_PTR)203, L"VideoApp");
+    app->screen.bottom = 1040; /* Maximized content leaves the taskbar/work-area margin. */
+    CHECK(!IdleBlack_HasExternalFullscreen());
+    app->screen.bottom = 1080;
+    app->maximized = TRUE;
+    app->frameStyle = WS_CAPTION | WS_THICKFRAME;
+    CHECK(!IdleBlack_HasExternalFullscreen()); /* Custom title bars with an auto-hidden taskbar. */
+    app->frameStyle = 0;
+    CHECK(IdleBlack_HasExternalFullscreen()); /* A borderless fullscreen can still be maximized. */
+    app->maximized = FALSE;
+    app->visible = FALSE;
+    CHECK(!IdleBlack_HasExternalFullscreen());
+    app->visible = TRUE;
+    app->minimized = TRUE;
+    CHECK(!IdleBlack_HasExternalFullscreen());
+    app->minimized = FALSE;
+    app->cloaked = DWM_CLOAKED_SHELL;
+    CHECK(!IdleBlack_HasExternalFullscreen()); /* Another virtual desktop is not this user's content. */
+    app->cloaked = 0;
+    app->exStyle = WS_EX_TOOLWINDOW;
+    CHECK(!IdleBlack_HasExternalFullscreen());
+    app->exStyle = WS_EX_NOACTIVATE;
+    CHECK(!IdleBlack_HasExternalFullscreen());
+    app->exStyle = 0;
+    CHECK(IdleBlack_HasExternalFullscreen()); /* Detect a real app even under the topmost cover. */
+    app->monitor = (HMONITOR)(UINT_PTR)2;
+    app->screen = (RECT){-2560, -200, 0, 1240};
+    CHECK(IdleBlack_HasExternalFullscreen()); /* Secondary display and negative coordinates. */
+    app->screen.right--;
+    CHECK(!IdleBlack_HasExternalFullscreen());
+    app->screen.right++;
+    app->clientFailure = TRUE;
+    CHECK(!IdleBlack_HasExternalFullscreen());
+    app->clientFailure = FALSE;
+    app->screenFailure = TRUE;
+    CHECK(!IdleBlack_HasExternalFullscreen());
+    app->screenFailure = FALSE;
+    app->monitor = NULL;
+    CHECK(!IdleBlack_HasExternalFullscreen());
+    enumerationOk = FALSE;
+    CHECK(IdleBlack_HasExternalFullscreen()); /* Preserve the shell block if enumeration fails. */
+}
+
+static void TestFullscreenProbeRestoresDpiContext(void)
+{
+    Reset();
+    AddProbe((HWND)(UINT_PTR)203, L"VideoApp");
+    dpiAvailable = TRUE;
+    CHECK(IdleBlack_HasExternalFullscreen());
+    CHECK(dpiCalls == 2 && dpiContext == (HANDLE)(LONG_PTR)-1);
+    dpiCalls = 0;
+    enumerationOk = FALSE;
+    CHECK(IdleBlack_HasExternalFullscreen());
+    CHECK(dpiCalls == 2 && dpiContext == (HANDLE)(LONG_PTR)-1);
+    dpiCalls = 0;
+    rejectDpiV2 = TRUE;
+    CHECK(IdleBlack_HasExternalFullscreen());
+    CHECK(dpiCalls == 3 && dpiContext == (HANDLE)(LONG_PTR)-1);
 }
 
 static void TestCoverageAndWake(void)
@@ -363,6 +569,8 @@ static void TestActualBlackPixels(void)
 int main(void)
 {
     TestCoverageAndWake();
+    TestExternalFullscreenExcludesOwnCoverAndDesktop();
+    TestFullscreenProbeRestoresDpiContext();
     TestSourceScopeAndFailures();
     TestPreserveExistingPowerRequest();
     TestPowerAcquisitionFailureAndRetry();

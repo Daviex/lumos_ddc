@@ -1,9 +1,24 @@
 #include "idle_black.h"
 #include "brightness.h"
 #include "diagnostics.h"
+#include <dwmapi.h>
 
 #define BLACK_INPUT_TIMER 1
 #define BLACK_INPUT_POLL_MS 100
+
+/* Keep monitor/client coordinates physical on mixed-DPI desktops without
+   changing the awareness of Lumos's other windows. Available since Win10 1607. */
+typedef HANDLE (WINAPI *SetDpiContextProc)(HANDLE);
+
+static SetDpiContextProc EnterPhysicalDpiContext(HANDLE *previous)
+{
+    union { FARPROC generic; SetDpiContextProc setDpi; } dpi;
+    dpi.generic = GetProcAddress(GetModuleHandleW(L"user32.dll"), "SetThreadDpiAwarenessContext");
+    SetDpiContextProc setDpi = dpi.setDpi;
+    *previous = setDpi ? setDpi((HANDLE)(LONG_PTR)-4) : NULL;
+    if (setDpi && !*previous) *previous = setDpi((HANDLE)(LONG_PTR)-3);
+    return setDpi;
+}
 
 typedef struct {
     HWND window;
@@ -26,6 +41,57 @@ BOOL IdleBlack_Active(void)
     for (int i = 0; i < MAX_MONITORS; i++)
         if (g_blackWindows[i].window) return TRUE;
     return FALSE;
+}
+
+static BOOL CALLBACK FindExternalFullscreen(HWND window, LPARAM parameter)
+{
+    for (int i = 0; i < MAX_MONITORS; i++)
+        if (g_blackWindows[i].window == window) return TRUE;
+    if (!IsWindowVisible(window) || IsIconic(window)) return TRUE;
+    LONG_PTR style = GetWindowLongPtrW(window, GWL_EXSTYLE);
+    if (style & (WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE)) return TRUE;
+    LONG_PTR frame = GetWindowLongPtrW(window, GWL_STYLE);
+    if (IsZoomed(window) && (frame & WS_CAPTION) == WS_CAPTION) return TRUE;
+    WCHAR className[64] = {0};
+    GetClassNameW(window, className, ARRAYSIZE(className));
+    if (!wcscmp(className, L"Progman") || !wcscmp(className, L"WorkerW")) return TRUE;
+    DWORD cloaked = 0;
+    if (SUCCEEDED(DwmGetWindowAttribute(window, DWMWA_CLOAKED, &cloaked, sizeof(cloaked))) && cloaked)
+        return TRUE; /* Includes applications on another virtual desktop. */
+
+    RECT client;
+    if (!GetClientRect(window, &client) || client.right <= client.left || client.bottom <= client.top)
+        return TRUE;
+    POINT first = {client.left, client.top}, last = {client.right, client.bottom};
+    if (!ClientToScreen(window, &first) || !ClientToScreen(window, &last)) return TRUE;
+    HMONITOR monitor = MonitorFromWindow(window, MONITOR_DEFAULTTONULL);
+    MONITORINFO info = {0};
+    info.cbSize = sizeof(info);
+    if (!monitor || !GetMonitorInfoW(monitor, &info)) return TRUE;
+    /* Client bounds distinguish fullscreen content from a maximized window's
+       invisible frame, which can extend beyond the work area. */
+    if (first.x > info.rcMonitor.left || first.y > info.rcMonitor.top ||
+        last.x < info.rcMonitor.right || last.y < info.rcMonitor.bottom) return TRUE;
+    DWORD process = 0;
+    GetWindowThreadProcessId(window, &process);
+    Diagnostics_Log("INFO", "idle", "external fullscreen window=%p pid=%lu", (void *)window, process);
+    *(BOOL *)parameter = TRUE;
+    return FALSE;
+}
+
+BOOL IdleBlack_HasExternalFullscreen(void)
+{
+    HANDLE previous;
+    SetDpiContextProc setDpi = EnterPhysicalDpiContext(&previous);
+    BOOL found = FALSE;
+    BOOL enumerated = EnumWindows(FindExternalFullscreen, (LPARAM)&found);
+    DWORD error = !enumerated && !found ? GetLastError() : ERROR_SUCCESS;
+    if (previous) setDpi(previous);
+    if (!enumerated && !found) {
+        Diagnostics_Log("WARN", "idle", "fullscreen window enumeration FAILED error=0x%08lX", error);
+        return TRUE; /* Keep the shell exclusion if we cannot check its owner. */
+    }
+    return found;
 }
 
 BOOL IdleBlack_HoldsDisplayRequest(void)
@@ -131,10 +197,6 @@ void IdleBlack_Init(HINSTANCE instance, HWND owner)
                     g_blackRegistered, g_blackRegistered ? ERROR_SUCCESS : GetLastError());
 }
 
-/* Keep physical monitor coordinates consistent on mixed-DPI desktops without
-   changing the awareness of Lumos's other windows. Available since Win10 1607. */
-typedef HANDLE (WINAPI *SetDpiContextProc)(HANDLE);
-
 static void UpdateBlack(const MonitorList *view, BOOL enabled, BOOL idle,
                         BOOL hasDecisionInput, DWORD decisionInput)
 {
@@ -207,11 +269,8 @@ static void UpdateBlack(const MonitorList *view, BOOL enabled, BOOL idle,
     }
     if (first) g_blackLastInput = hasDecisionInput ? decisionInput : input.dwTime;
 
-    union { FARPROC generic; SetDpiContextProc setDpi; } dpi;
-    dpi.generic = GetProcAddress(GetModuleHandleW(L"user32.dll"), "SetThreadDpiAwarenessContext");
-    SetDpiContextProc setDpi = dpi.setDpi;
-    HANDLE oldDpi = setDpi ? setDpi((HANDLE)(LONG_PTR)-4) : NULL;
-    if (setDpi && !oldDpi) oldDpi = setDpi((HANDLE)(LONG_PTR)-3);
+    HANDLE oldDpi;
+    SetDpiContextProc setDpi = EnterPhysicalDpiContext(&oldDpi);
     for (int j = 0; j < count; j++) {
         MONITORINFO info = {0};
         info.cbSize = sizeof(info);

@@ -156,6 +156,9 @@ ownership, including failed restores and dim acknowledgements arriving late.
 Idle orchestration also covers retrograde input, query failure recovery,
 late presentation/capture exclusions, a full timeout after exclusions end,
 and explicit overlay wake without a changed input timestamp.
+An OLED/LCD regression reproduces the shell's generic busy state after the black
+cover appears: idle and LCD dimming remain active across subsequent ticks, while
+a real external fullscreen, presentation mode or newly started call restores them.
 Windows integration checks display-required requests before and during idle,
 query failures, system-only requests and avoiding the OLED request's own bit.
 Session events verify DWORD payload validation, display-off recovery and
@@ -178,6 +181,11 @@ GDI DIB verifies that every painted pixel is RGB 0,0,0. No screen is covered
 and no real execution-state request is made.
 Power ownership is also checked on failed acquisition/release, retries, lock
 and shutdown while preserving a previous system-required request.
+Fullscreen ownership checks exclude the black cover, desktop, tool windows,
+ordinary maximized content, minimized/hidden windows and cloaked virtual desktops.
+Real fullscreen content beneath the cover is detected on both primary and
+secondary displays. Enumeration failure preserves the shell exclusion, and the
+physical DPI context is restored on success/failure with the older-Windows fallback.
 
 ```powershell
 clang -std=c11 -Wall -Wextra -Werror -DSTRSAFE_NO_DEPRECATE -DUNICODE -D_UNICODE tests/test_idle_black.c tests/diagnostics_stub.c brightness.c brightmap.c -lgdi32 -luser32 -o build/test_idle_black.exe

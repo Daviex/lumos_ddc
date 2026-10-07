@@ -57,6 +57,7 @@ static BOOL mockNormalSucceeds;
 static int releaseRequests;
 static int blackUpdates, blackClears;
 static BOOL blackIdle, blackEnabled;
+static BOOL externalFullscreen;
 static int osdCalls, osdPercent;
 static HMONITOR osdMonitor;
 static BOOL popupVisible;
@@ -371,6 +372,15 @@ void IdleBlack_Clear(void) { blackClears++; blackIdle = FALSE; }
 void IdleBlack_SetSessionLocked(BOOL locked) { (void)locked; }
 void IdleBlack_Shutdown(void) { CHECK(FALSE); }
 BOOL IdleBlack_HoldsDisplayRequest(void) { return blackPowerHeld; }
+BOOL IdleBlack_Active(void)
+{
+    if (!blackEnabled || !blackIdle) return FALSE;
+    for (int i = 0; i < g_monitors.count; i++)
+        if (g_monitors.monitors[i].idleBlack && !g_monitors.monitors[i].excludedFromControl &&
+            Monitor_SourceAllowsControl(&g_monitors.monitors[i])) return TRUE;
+    return FALSE;
+}
+BOOL IdleBlack_HasExternalFullscreen(void) { return externalFullscreen; }
 BOOL MonitorWorker_Running(void) { return mockWorkerRunning; }
 void MonitorWorker_Cancel(BrightMonitor *monitor)
 {
@@ -494,6 +504,7 @@ static void ResetState(void)
     releaseRequests = 0;
     blackUpdates = blackClears = 0;
     blackIdle = blackEnabled = FALSE;
+    externalFullscreen = FALSE;
     osdCalls = osdPercent = 0;
     osdMonitor = NULL;
     popupVisible = FALSE;
@@ -2274,6 +2285,54 @@ static void TestLateExclusionsRestoreAndRearmOnce(void)
     CHECK(!g_idleDimmed && !blackIdle && actualWrites == 0);
 }
 
+static void TestOledCoverCannotBlockItsOwnIdle(void)
+{
+    ConfigureIdleTest();
+    g_monitors.monitors[0].idleBlack = TRUE;
+    g_monitors.count = 2;
+    g_monitors.monitors[1] = MakeMonitor(TRUE, 80);
+    blackPowerHeld = TRUE;
+    Idle_Tick();
+    CHECK(g_idleDimmed && IdleBlack_Active() && g_monitors.monitors[1].brightnessCur == 5);
+    notificationState = QUNS_BUSY; /* The full-monitor black cover changes the shell state. */
+    nowTick += 2000;
+    Idle_Tick();
+    CHECK(g_idleDimmed && IdleBlack_Active() && g_idleLastBlock == DIMBLOCK_NONE);
+    CHECK(g_monitors.monitors[1].brightnessCur == 5 && restoreRequests == 0);
+    nowTick += 120000;
+    Idle_Tick();
+    CHECK(g_idleDimmed && IdleBlack_Active() && g_idleLastBlock == DIMBLOCK_NONE);
+
+    externalFullscreen = TRUE; /* Another application starts fullscreen under the cover. */
+    Idle_Tick();
+    CHECK(!g_idleDimmed && !IdleBlack_Active() && g_idleLastBlock == DIMBLOCK_FULLSCREEN);
+    CHECK(g_monitors.monitors[1].brightnessCur == 80);
+    externalFullscreen = FALSE;
+    notificationState = QUNS_ACCEPTS_NOTIFICATIONS;
+    Idle_Tick();
+    CHECK(IdleMilliseconds() == 0);
+    nowTick += 60000;
+    Idle_Tick();
+    CHECK(g_idleDimmed && IdleBlack_Active());
+    notificationState = QUNS_BUSY;
+    captureActive = TRUE; /* The cover must not mask a newly started call. */
+    Idle_Tick();
+    CHECK(!g_idleDimmed && !IdleBlack_Active() && g_idleLastBlock == DIMBLOCK_CAPTURE);
+
+    ConfigureIdleTest();
+    g_monitors.monitors[0].idleBlack = TRUE;
+    notificationState = QUNS_BUSY; /* Before our cover exists, preserve the shell exclusion. */
+    Idle_Tick();
+    CHECK(!g_idleDimmed && g_idleLastBlock == DIMBLOCK_FULLSCREEN);
+
+    ConfigureIdleTest();
+    g_monitors.monitors[0].idleBlack = TRUE;
+    Idle_Tick();
+    notificationState = QUNS_PRESENTATION_MODE;
+    Idle_Tick();
+    CHECK(!g_idleDimmed && !IdleBlack_Active() && g_idleLastBlock == DIMBLOCK_FULLSCREEN);
+}
+
 static void TestExplicitWakeAndReadOnlyCommands(void)
 {
     ConfigureIdleTest();
@@ -2500,6 +2559,7 @@ int main(void)
     TestCliActivityRestartsIdleCountdownAndLatestRowIntent();
     TestIrregularInputRestartsIdleAndFailureRecovery();
     TestLateExclusionsRestoreAndRearmOnce();
+    TestOledCoverCannotBlockItsOwnIdle();
     TestExplicitWakeAndReadOnlyCommands();
     TestWindowsDisplayRequestsAndOwnOledRequest();
     TestSessionPowerPayloadAndPresenceTransitions();
