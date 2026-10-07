@@ -46,6 +46,7 @@ static UINT sourceTelemetryInterval;
 static BOOL pickerOpen;
 static DWORD mockPendingMask;
 static DWORD mockPendingTarget;
+static MonitorWritePurpose mockPendingPurpose;
 static BOOL acceptResult;
 static BOOL acceptStateResult;
 static int acceptCalls;
@@ -402,6 +403,7 @@ BOOL MonitorWorker_AcceptState(const MonitorResult *result)
 DWORD MonitorWorker_PendingTargets(MonitorTarget targets[MAX_MONITORS])
 {
     memset(targets, 0, sizeof(MonitorTarget) * MAX_MONITORS);
+    if (mockPendingPurpose != MONITOR_WRITE_NORMAL) return 0;
     for (int i = 0; i < g_monitors.count; i++) {
         targets[i].monitor = g_monitors.monitors[i];
         targets[i].percent = mockPendingTarget;
@@ -481,6 +483,7 @@ static void ResetState(void)
     sourceTelemetryInterval = 0;
     pickerOpen = FALSE;
     mockPendingMask = mockPendingTarget = 0;
+    mockPendingPurpose = MONITOR_WRITE_NORMAL;
     acceptResult = TRUE;
     acceptStateResult = TRUE;
     acceptCalls = 0;
@@ -1211,6 +1214,7 @@ static void TestSourceRuleEditKeepsPendingIdleWritePurpose(void)
     second->idleDimPending = TRUE;
     mockPendingMask = 1u << 1;
     mockPendingTarget = 5;
+    mockPendingPurpose = MONITOR_WRITE_IDLE;
     int normalCalls = setOneCalls;
     g_settings.monitorSelection.inputRules[0].input = 0x11;
     UpdateMonitorSelection();
@@ -1221,6 +1225,61 @@ static void TestSourceRuleEditKeepsPendingIdleWritePurpose(void)
     CHECK(second->preIdleBrightnessValid && second->preIdleBrightness == 128);
     DeliverSourceResultAt(1, MONITOR_RESULT_SOURCE, TRUE, 0x12);
     CHECK(second->brightnessCur == 128 && releaseWrites == 1 && g_idleDimmed);
+}
+
+static void TestManualRowWakeRescanNeverPromotesPendingIdleToUserIntent(void)
+{
+    ResetState();
+    ConfigureTwoReadyMonitors();
+    Monitor_SetBrightness(&g_monitors.monitors[0], 20);
+    Monitor_SetBrightness(&g_monitors.monitors[1], 80);
+    g_settings.idleDimPercent = 5;
+    mockWorkerRunning = TRUE;
+    Idle_Dim();
+    BrightMonitor original = g_monitors.monitors[1];
+    mockPendingMask = 1u << 1;
+    mockPendingTarget = 5;
+    mockPendingPurpose = MONITOR_WRITE_IDLE;
+
+    Monitor_SetBrightness(&g_monitors.monitors[0], 30);
+    SliderManualChange(0, 30); /* This replaces row0's idle work; row1's dim is still in flight. */
+    CHECK(!g_idleDimmed && g_monitors.monitors[1].desiredBrightness == 80);
+    MonitorList *fresh = (MonitorList *)calloc(1, sizeof(*fresh));
+    CHECK(fresh != NULL);
+    if (!fresh) return;
+    *fresh = g_monitors;
+    fresh->monitors[0].idleDimPending = fresh->monitors[1].idleDimPending = FALSE;
+    fresh->monitors[1].brightnessCur = 5; /* Native dim completed before its acknowledgement arrived. */
+    int writes = setOneCalls;
+    AdoptMonitorList(fresh);
+    CHECK(g_monitors.monitors[1].desiredBrightness == 80 && setOneCalls == writes);
+    CHECK(g_monitors.monitors[0].desiredBrightness == 30);
+
+    MonitorResult *result = (MonitorResult *)calloc(1, sizeof(*result));
+    CHECK(result != NULL);
+    if (!result) return;
+    result->index = 1;
+    result->kind = MONITOR_RESULT_BRIGHTNESS;
+    result->purpose = MONITOR_WRITE_IDLE;
+    result->success = result->brightnessWritten = TRUE;
+    result->idleEpoch = original.idleEpoch;
+    result->preIdleBrightnessValid = TRUE;
+    result->preIdleBrightness = 80;
+    result->minimum = 0;
+    result->maximum = 100;
+    result->current = 5;
+    result->backend = original.backend;
+    result->sourceFilter = original.sourceFilter;
+    result->expectedInput = original.expectedInput;
+    wcscpy(result->deviceInstance, original.deviceInstance);
+    acceptResult = acceptStateResult = FALSE; /* The rescan reset the old worker generation. */
+    HandleMonitorResult(testWindow, result);
+    CHECK(g_monitors.monitors[1].idleApplied && g_monitors.monitors[1].preIdleBrightness == 80);
+    CHECK(g_monitors.monitors[1].desiredBrightness == 80);
+    mockWorkerRunning = FALSE;
+    RetryIdleRestores();
+    CHECK(g_monitors.monitors[1].brightnessCur == 80 && !g_monitors.monitors[1].idleApplied);
+    CHECK(g_monitors.monitors[1].desiredBrightness == 80 && g_monitors.monitors[0].brightnessCur == 30);
 }
 
 static BrightMonitor PrepareReorderedRescanBeforeIdleAcknowledgement(void)
@@ -2425,6 +2484,7 @@ int main(void)
     TestWakePreservesPendingAlternateInputRestore();
     TestReturningIdleInputSupersedesQueuedRelease();
     TestSourceRuleEditKeepsPendingIdleWritePurpose();
+    TestManualRowWakeRescanNeverPromotesPendingIdleToUserIntent();
     TestReorderedRescanReconcilesAppliedIdleByIdentity();
     TestCrossResetIdleAcknowledgementRejectsChangedIdentityOrPolicy();
     TestSourcePollingAndRuleChanges();

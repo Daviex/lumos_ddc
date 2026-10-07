@@ -1446,6 +1446,9 @@ static void UpdateMonitorSelection(void)
     g_hwndPopup = NULL;
     MonitorTarget pending[MAX_MONITORS];
     DWORD pendingMask = MonitorWorker_PendingTargets(pending);
+    DWORD idlePendingMask = 0;
+    for (int i = 0; i < g_monitors.count; i++)
+        if (g_monitors.monitors[i].idleDimPending) idlePendingMask |= 1u << i;
     MonitorWorker_Reset();
     for (int i = 0; i < g_monitors.count; i++) {
         g_monitors.monitors[i].idleDimPending = FALSE;
@@ -1466,7 +1469,9 @@ static void UpdateMonitorSelection(void)
         for (int i = 0; i < g_monitors.count; i++) {
             BrightMonitor *monitor = &g_monitors.monitors[i];
             if (!Monitor_CanControl(monitor)) continue;
-            if (pendingMask & (1u << i)) {
+            if (g_idleDimmed && (idlePendingMask & (1u << i))) {
+                DimIdleMonitor(monitor); /* Recompute canceled idle work, never replay its old percent. */
+            } else if (pendingMask & (1u << i)) {
                 if (g_idleDimmed) DimIdleMonitor(monitor);
                 else Monitor_SetBrightness(monitor, pending[i].percent);
             }

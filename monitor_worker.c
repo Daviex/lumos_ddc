@@ -115,15 +115,15 @@ static void SnapshotRefreshLocked(RefreshRequest *request, const MonitorList *vi
     request->pending = TRUE;
 }
 
-/* Identity-only snapshots keep the latest write intent, including in-flight
-   writes, without retaining handles or treating refresh reads as user intent. */
+/* Identity-only snapshots keep requested brightness, including in-flight
+   writes. Idle levels and raw undo operations are derived policy, never user
+   intent to replay as a normal brightness request after a topology change. */
 static DWORD SnapshotTargetsLocked(MonitorTarget targets[MAX_MONITORS])
 {
     DWORD mask = 0;
     for (int i = 0; i < g_worker.view->count; i++) {
         if (!g_worker.writes[i].pending && !g_worker.inFlight[i]) continue;
-        if (g_worker.purposes[i] == MONITOR_WRITE_IDLE_RELEASE ||
-            g_worker.purposes[i] == MONITOR_WRITE_IDLE_RESTORE) continue;
+        if (g_worker.purposes[i] != MONITOR_WRITE_NORMAL) continue;
         targets[i].monitor = g_worker.view->monitors[i];
         targets[i].percent = g_worker.targets[i];
         mask |= 1u << i;

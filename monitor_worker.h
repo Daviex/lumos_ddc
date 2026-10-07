@@ -56,7 +56,8 @@ void MonitorWorker_Refresh(const MonitorList *view);
    allMonitors includes every DDC display while the chooser is open. */
 void MonitorWorker_RefreshSources(const MonitorList *view, BOOL allMonitors);
 void MonitorWorker_Reset(void);
-/* Preserve outstanding user intent before replacing the monitor topology.
+/* Preserve only outstanding normal user intent before replacing topology.
+   Derived idle dim/restore requests are reconciled through current policy.
    Bit i indicates a target populated at index i. */
 DWORD MonitorWorker_PendingTargets(MonitorTarget targets[MAX_MONITORS]);
 BOOL MonitorWorker_Accept(const MonitorResult *result);

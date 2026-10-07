@@ -333,6 +333,10 @@ Waking from idle restores each dimmed monitor's individual requested level.
 If no level was requested, it restores the saved native brightness exactly,
 without converting it through a percentage. An active schedule takes precedence
 and uses its current value, even when the idle period crossed a schedule anchor.
+Pending targets saved across a monitor rescan contain normal brightness intent;
+temporary idle writes are reconciled with the current policy instead. A dim still
+pending on one display cannot overwrite its requested level after another
+display's manual change ends idle mode.
 
 Hotkeys are stored as text. Modifiers are `Ctrl`, `Alt`, `Shift` and `Win`, and keys are letters, digits, `F1` to `F24`, the arrows, `Home`, `End`, `PageUp`, `PageDown`, `Insert`, `Delete`, `Space`, `Enter`, `Tab`, `Backspace`, `Pause` and the numeric keypad (`Num0` to `Num9`, `NumPlus`, `NumMinus`, `NumMultiply`, `NumDivide`, `NumDecimal`). `None` turns a hotkey off, and a value that cannot be read falls back to the default. A `config.ini` from version 1.1 or older has no hotkey lines, and it keeps the `Ctrl+Alt+Up` / `Ctrl+Alt+Down` brightness hotkeys those versions used.
 

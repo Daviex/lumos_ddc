@@ -599,6 +599,42 @@ static void TestSourcePollingWithoutBrightnessCapability(void)
     CHECK(ReadCounter(&writes) == 0);
 }
 
+static void TestPendingSnapshotsExportOnlyNormalUserIntent(void)
+{
+    MonitorList view = MakeView();
+    view.count = 2;
+    view.monitors[1] = view.monitors[0];
+    view.monitors[1].hPhysical = (HANDLE)(UINT_PTR)2;
+    view.monitors[1].desiredBrightnessValid = TRUE;
+    view.monitors[1].desiredBrightness = 80;
+    view.monitors[1].idleEpoch = 41;
+    StartTest(&view, TRUE, FALSE);
+    CHECK(MonitorWorker_SetIdle(&view.monitors[1], 5));
+    CHECK(WaitForSingleObject(writeEntered, TEST_TIMEOUT) == WAIT_OBJECT_0);
+    MonitorTarget pending[MAX_MONITORS];
+    CHECK(MonitorWorker_PendingTargets(pending) == 0); /* In-flight dim5 is never a requested target. */
+    CHECK(view.monitors[1].desiredBrightness == 80);
+    CHECK(MonitorWorker_Set(&view.monitors[0], 30));
+    CHECK(MonitorWorker_PendingTargets(pending) == 1u && pending[0].percent == 30);
+    CHECK(MonitorWorker_SetIdle(&view.monitors[0], 5)); /* A derived policy can replace queued normal work. */
+    CHECK(MonitorWorker_PendingTargets(pending) == 0);
+    CHECK(MonitorWorker_Set(&view.monitors[0], 45));
+    CHECK(MonitorWorker_PendingTargets(pending) == 1u && pending[0].percent == 45);
+    MonitorWorker_Reset();
+    CHECK(MonitorWorker_PendingTargets(pending) == 0);
+    SetEvent(allowWrite);
+    MonitorResult *result = WaitResult();
+    if (result) {
+        CHECK(result->purpose == MONITOR_WRITE_IDLE && result->brightnessWritten);
+        CHECK(result->idleEpoch == 41 && result->preIdleBrightnessValid);
+        CHECK(!MonitorWorker_Accept(result) && !MonitorWorker_AcceptState(result));
+    }
+    free(result);
+    CHECK(ReadCounter(&writes) == 1 && writtenValues[0] == 5);
+    CHECK(view.monitors[1].desiredBrightness == 80);
+    FinishTest();
+}
+
 static void TestIdleReleasePurposeAndTelemetry(void)
 {
     MonitorList view = MakeView();
@@ -772,6 +808,7 @@ int main(void)
     TestSourcePollingScope();
     TestSourcePollingWithoutBrightnessCapability();
     TestIdleReleasePurposeAndTelemetry();
+    TestPendingSnapshotsExportOnlyNormalUserIntent();
     TestRawIdleRestoreIsNotPercentIntentAndCanBeSuperseded();
     TestIdleReleaseRechecksSourceAndCancelsPerMonitor();
     TestAppliedIdleIdentitySurvivesReset();

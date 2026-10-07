@@ -45,7 +45,9 @@ distinct results, and brightness refreshes cannot overwrite source telemetry.
 Typed idle writes and alternate-input restores retain their purpose, idle cycle
 and stable identity across queue replacement and reset. Only actual hardware
 writes report applied ownership; refresh reads never do. Idle restores are not
-saved as pending user targets.
+saved as pending user targets. Idle dim writes are also excluded from those
+snapshots, including queued and in-flight writes, so a temporary low level
+cannot become a new normal brightness request after a manual wake and rescan.
 
 ```powershell
 clang -std=c11 -Wall -Wextra -Werror -DSTRSAFE_NO_DEPRECATE -DUNICODE -D_UNICODE tests/test_monitor_worker.c tests/diagnostics_stub.c -o build/test_monitor_worker.exe
