@@ -41,7 +41,7 @@ static DWORD mockPendingTarget;
 static BOOL acceptResult;
 static BOOL acceptStateResult;
 static int acceptCalls;
-static int idleWrites, releaseWrites, cancelCalls;
+static int idleWrites, releaseWrites, restoreRequests, cancelCalls;
 static BOOL mockWorkerRunning;
 static BOOL mockReleaseSucceeds;
 static BOOL mockNormalSucceeds;
@@ -64,6 +64,7 @@ static BOOL WINAPI MockDestroyWindow(HWND);
 static HRESULT WINAPI MockNotificationState(QUERY_USER_NOTIFICATION_STATE *state);
 static BOOL WINAPI MockGetCursorPos(LPPOINT point);
 static HMONITOR WINAPI MockMonitorFromPoint(POINT point, DWORD flags);
+static void ConfigureTwoReadyMonitors(void);
 
 #define GetLocalTime MockGetLocalTime
 #define GetTickCount MockGetTickCount
@@ -259,6 +260,21 @@ BOOL Monitor_SetIdleBrightness(BrightMonitor *monitor, DWORD percent)
     return TRUE;
 }
 
+BOOL Monitor_RestoreIdleBrightness(BrightMonitor *monitor)
+{
+    restoreRequests++;
+    CHECK(Monitor_CanControl(monitor) && monitor->idleApplied && monitor->preIdleBrightnessValid);
+    if (!Monitor_SourceAllowsControl(monitor) || !mockNormalSucceeds) return FALSE;
+    if (mockWorkerRunning) return TRUE;
+    monitor->brightnessCur = monitor->preIdleBrightness;
+    monitor->idleApplied = FALSE;
+    monitor->idleDimPending = FALSE;
+    monitor->idleReleasePending = FALSE;
+    monitor->preIdleBrightnessValid = FALSE;
+    actualWrites++;
+    return TRUE;
+}
+
 BOOL Monitor_ReleaseIdleBrightness(BrightMonitor *monitor, DWORD raw, DWORD otherInput)
 {
     releaseRequests++;
@@ -405,6 +421,7 @@ static void ResetState(void)
     g_scheduleLastApplied = -1;
     g_masterTarget = 0;
     g_masterTargetValid = FALSE;
+    g_masterTargetExplicit = FALSE;
     g_idleDimmed = FALSE;
     g_idleEpoch = 0;
     g_awaitRetry = 0;
@@ -428,7 +445,7 @@ static void ResetState(void)
     acceptResult = TRUE;
     acceptStateResult = TRUE;
     acceptCalls = 0;
-    idleWrites = releaseWrites = cancelCalls = 0;
+    idleWrites = releaseWrites = restoreRequests = cancelCalls = 0;
     mockWorkerRunning = FALSE;
     mockReleaseSucceeds = TRUE;
     mockNormalSucceeds = TRUE;
@@ -1328,6 +1345,7 @@ static void TestSourcePollingAndRuleChanges(void)
     rule->input = 0x0f;
     g_masterTarget = 61;
     g_masterTargetValid = TRUE;
+    g_masterTargetExplicit = TRUE;
     UpdateMonitorSelection();
     CHECK(workerResets == 1 && sourceRefreshCalls == 2);
     CHECK(g_masterTarget == 61 && !g_monitors.monitors[0].sourceKnown);
@@ -1516,14 +1534,328 @@ static void TestOledBlackIdleKeepsPanelBrightness(void)
     CHECK(!g_monitors.monitors[1].preIdleBrightnessValid && !g_monitors.monitors[1].idleApplied);
     ReapplyBrightness();
     CHECK(g_monitors.monitors[1].brightnessCur == 62);
-    int before = setOneCalls;
+    int before = restoreRequests;
     Idle_Restore();
     CHECK(!g_idleDimmed && !blackIdle && blackClears > 0);
-    CHECK(setOneCalls == before + 1 && g_monitors.monitors[0].brightnessCur == 73);
+    CHECK(restoreRequests == before + 1 && g_monitors.monitors[0].brightnessCur == 73);
     CHECK(g_monitors.monitors[1].brightnessCur == 62);
     Idle_Dim();
     ManualChange();
     CHECK(!g_idleDimmed && !blackIdle);
+}
+
+static void TestIdleWakePreservesIndividualTargetsAndSchedulePrecedence(void)
+{
+    ResetState();
+    ConfigureTwoReadyMonitors();
+    Monitor_SetBrightness(&g_monitors.monitors[0], 20);
+    Monitor_SetBrightness(&g_monitors.monitors[1], 80);
+    g_masterTarget = 50;
+    g_masterTargetValid = TRUE;
+    g_settings.idleDimPercent = 5;
+    Idle_Dim();
+    CHECK(g_monitors.monitors[0].brightnessCur == 5 && g_monitors.monitors[1].brightnessCur == 5);
+    Idle_Restore();
+    CHECK(g_monitors.monitors[0].brightnessCur == 20 && g_monitors.monitors[1].brightnessCur == 80);
+    CHECK(g_monitors.monitors[0].desiredBrightness == 20 && g_monitors.monitors[1].desiredBrightness == 80);
+    CHECK(g_masterTarget == 50 && lastUiTarget == 50 && restoreRequests == 0);
+
+    MonitorList *fresh = (MonitorList *)calloc(1, sizeof(*fresh));
+    CHECK(fresh != NULL);
+    if (!fresh) return;
+    *fresh = g_monitors;
+    fresh->monitors[0].brightnessCur = fresh->monitors[1].brightnessCur = 100;
+    g_rescan.reapplyBrightness = TRUE; /* A delayed wake rescan must preserve20/80 too. */
+    AdoptMonitorList(fresh);
+    CHECK(g_monitors.monitors[0].brightnessCur == 20 && g_monitors.monitors[1].brightnessCur == 80);
+    CHECK(g_monitors.monitors[0].desiredBrightness == 20 && g_monitors.monitors[1].desiredBrightness == 80);
+
+    ConfigureSchedule();
+    Idle_Dim();
+    nowMinute = 720; /* The current schedule wins over pre-idle individual levels. */
+    Idle_Restore();
+    CHECK(g_scheduleLastApplied == 20 && g_masterTarget == 20);
+    CHECK(g_monitors.monitors[0].brightnessCur == 20 && g_monitors.monitors[1].brightnessCur == 20);
+}
+
+static void TestIdleWakeRestoresNativeBaselinesWithoutCreatingIntent(void)
+{
+    ResetState();
+    ConfigureTwoReadyMonitors();
+    g_monitors.monitors[0].brightnessMax = 255;
+    g_monitors.monitors[0].brightnessCur = 73;
+    g_monitors.monitors[1].brightnessMin = 10;
+    g_monitors.monitors[1].brightnessMax = 255;
+    g_monitors.monitors[1].brightnessCur = 213;
+    g_settings.idleDimPercent = 5;
+    Idle_Dim();
+    CHECK(g_monitors.monitors[0].brightnessCur != 73 && g_monitors.monitors[1].brightnessCur != 213);
+    Idle_Restore();
+    CHECK(g_monitors.monitors[0].brightnessCur == 73 && g_monitors.monitors[1].brightnessCur == 213);
+    CHECK(!g_monitors.monitors[0].desiredBrightnessValid && !g_monitors.monitors[1].desiredBrightnessValid);
+    CHECK(!g_monitors.monitors[0].idleApplied && !g_monitors.monitors[1].idleApplied);
+    CHECK(!g_monitors.monitors[0].preIdleBrightnessValid && !g_monitors.monitors[1].preIdleBrightnessValid);
+    CHECK(restoreRequests == 2 && setOneCalls == 0 && setAllCalls == 0);
+    CHECK(!g_masterTargetValid && !g_masterTargetExplicit); /* The displayed average is not a group request. */
+    g_rescan.reapplyBrightness = TRUE;
+    MonitorList *fresh = (MonitorList *)calloc(1, sizeof(*fresh));
+    CHECK(fresh != NULL);
+    if (!fresh) return;
+    *fresh = g_monitors;
+    AdoptMonitorList(fresh);
+    CHECK(g_monitors.monitors[0].brightnessCur == 73 && g_monitors.monitors[1].brightnessCur == 213);
+    CHECK(restoreRequests == 2 && setOneCalls == 0 && setAllCalls == 0);
+}
+
+static void TestDerivedRowAverageDoesNotBecomeOtherMonitorIntent(void)
+{
+    ResetState();
+    ConfigureTwoReadyMonitors();
+    g_monitors.monitors[1].brightnessCur = 80;
+    Monitor_SetBrightness(&g_monitors.monitors[0], 20);
+    SliderManualChange(0, 20);
+    CHECK(g_masterTarget == 50 && g_masterTargetValid && !g_masterTargetExplicit);
+    CHECK(!g_monitors.monitors[1].desiredBrightnessValid);
+    g_settings.idleDimPercent = 5;
+    Idle_Dim();
+    Idle_Restore();
+    CHECK(g_monitors.monitors[0].brightnessCur == 20 && g_monitors.monitors[1].brightnessCur == 80);
+    g_monitors.monitors[0].brightnessCur = 100;
+    ReapplyBrightness(); /* Reapply changed row0, leave untouched row1's confirmed80 alone. */
+    CHECK(g_monitors.monitors[0].brightnessCur == 20 && g_monitors.monitors[1].brightnessCur == 80);
+    CHECK(!g_monitors.monitors[1].desiredBrightnessValid);
+    ResumeSourceMonitor(&g_monitors.monitors[1]);
+    CHECK(g_monitors.monitors[1].brightnessCur == 80 && !g_monitors.monitors[1].desiredBrightnessValid);
+
+    AppSetMaster(65); /* A deliberate group request still provides a fallback. */
+    CHECK(g_masterTargetExplicit);
+    g_monitors.monitors[1].desiredBrightnessValid = FALSE;
+    g_monitors.monitors[1].brightnessCur = 100;
+    ReapplyBrightness();
+    CHECK(g_monitors.monitors[1].brightnessCur == 65 && g_monitors.monitors[1].desiredBrightnessValid);
+}
+
+static void TestGroupStepAfterIdleUsesPreDimAverage(void)
+{
+    ResetState();
+    ConfigureTwoReadyMonitors();
+    g_monitors.monitors[0].brightnessCur = 20;
+    g_monitors.monitors[1].brightnessCur = 80;
+    g_settings.idleDimPercent = 5;
+    Idle_Dim();
+    CHECK(g_masterTarget == 50 && !g_masterTargetValid && !g_masterTargetExplicit);
+    StepMaster(5); /* The user's group step deliberately replaces individual levels. */
+    CHECK(g_masterTarget == 55 && g_masterTargetExplicit && !g_idleDimmed);
+    CHECK(g_monitors.monitors[0].brightnessCur == 55 && g_monitors.monitors[1].brightnessCur == 55);
+}
+
+static void TestIdleScopeChangeRestoresIndividualIntentOnRetainedRows(void)
+{
+    ResetState();
+    ConfigureTwoReadyMonitors();
+    Monitor_SetBrightness(&g_monitors.monitors[0], 20);
+    Monitor_SetBrightness(&g_monitors.monitors[1], 80);
+    SliderManualChange(0, 20);
+    g_settings.idleDimPercent = 5;
+    Idle_Dim();
+    g_settings.monitorSelection.selectedOnly = TRUE;
+    g_settings.monitorSelection.count = 1;
+    CHECK(Settings_MonitorKey(&g_monitors.monitors[0], g_settings.monitorSelection.keys[0]));
+    UpdateMonitorSelection();
+    CHECK(!g_idleDimmed && g_monitors.monitors[0].brightnessCur == 20);
+    CHECK(g_monitors.monitors[0].desiredBrightnessValid && g_monitors.monitors[0].desiredBrightness == 20);
+    CHECK(g_monitors.monitors[1].excludedFromControl && g_monitors.monitors[1].brightnessCur == 5);
+    CHECK(!g_masterTargetExplicit);
+}
+
+static void TestChangingDimToBlackRestoresOwnedPanelAndRetries(void)
+{
+    for (int fail = 0; fail < 2; fail++) {
+        ResetState();
+        AddReadyMonitor();
+        BrightMonitor *monitor = &g_monitors.monitors[0];
+        monitor->brightnessMax = 255;
+        monitor->brightnessCur = 73;
+        g_settings.idleDimEnabled = TRUE;
+        g_settings.idleDimPercent = 5;
+        Idle_Dim();
+        CHECK(monitor->idleApplied && monitor->preIdleBrightness == 73);
+        g_settings.monitorSelection.idleBlackCount = 1;
+        CHECK(Settings_MonitorKey(monitor, g_settings.monitorSelection.idleBlackKeys[0]));
+        mockNormalSucceeds = !fail;
+        UpdateMonitorSelection();
+        CHECK(monitor->idleBlack && !g_idleDimmed && !monitor->desiredBrightnessValid);
+        CHECK(restoreRequests == 1);
+        if (fail) {
+            CHECK(monitor->idleApplied && monitor->preIdleBrightnessValid);
+            CHECK(monitor->brightnessCur == 12);
+            RetryIdleRestores();
+            CHECK(restoreRequests == 2 && monitor->idleApplied);
+            mockNormalSucceeds = TRUE;
+            RetryIdleRestores();
+        }
+        CHECK(monitor->brightnessCur == 73 && !monitor->idleApplied && !monitor->preIdleBrightnessValid);
+        int requests = restoreRequests;
+        Idle_Dim();
+        Idle_Restore();
+        CHECK(restoreRequests == requests && idleWrites == 1 && monitor->brightnessCur == 73);
+    }
+}
+
+static void TestLateLcdDimAcknowledgementIsRestoredUnderBlackOverlay(void)
+{
+    ResetState();
+    ConfigureTwoReadyMonitors();
+    BrightMonitor *monitor = &g_monitors.monitors[0];
+    monitor->brightnessMax = 255;
+    monitor->brightnessCur = 73;
+    g_settings.idleDimEnabled = TRUE;
+    g_settings.idleDimPercent = 5;
+    mockWorkerRunning = TRUE;
+    Idle_Dim();
+    DWORD epoch = monitor->idleEpoch;
+    g_settings.monitorSelection.idleBlackCount = 1;
+    CHECK(Settings_MonitorKey(monitor, g_settings.monitorSelection.idleBlackKeys[0]));
+    UpdateMonitorSelection();
+    CHECK(monitor->idleBlack && !g_idleDimmed && !monitor->idleApplied);
+    mockWorkerRunning = FALSE;
+    Idle_Dim(); /* Black overlay now owns row0; row1 stays an ordinary dimmed LCD. */
+    CHECK(g_idleDimmed && blackIdle && g_monitors.monitors[1].idleApplied);
+    CHECK(monitor->idleEpoch == epoch); /* Black-only entry keeps the retained old LCD association. */
+    acceptResult = FALSE;
+    DeliverIdleWriteResult(0, epoch, 73);
+    CHECK(monitor->idleApplied && monitor->preIdleBrightnessValid);
+    mockNormalSucceeds = FALSE;
+    RetryIdleRestores();
+    CHECK(monitor->idleApplied && restoreRequests == 1 && g_idleDimmed && blackIdle);
+    mockNormalSucceeds = TRUE;
+    RetryIdleRestores();
+    CHECK(monitor->brightnessCur == 73 && !monitor->idleApplied && restoreRequests == 2);
+    CHECK(g_monitors.monitors[1].idleApplied && g_monitors.monitors[1].brightnessCur == 5);
+    CHECK(g_idleDimmed && blackIdle); /* Cleaning old LCD ownership must not wake the other LCD. */
+}
+
+static void TestIdleWakeUsesLatestPendingIndividualTarget(void)
+{
+    ResetState();
+    AddReadyMonitor();
+    g_settings.idleDimPercent = 5;
+    Monitor_SetBrightness(&g_monitors.monitors[0], 20);
+    Idle_Dim();
+    mockWorkerRunning = TRUE;
+    Monitor_SetBrightness(&g_monitors.monitors[0], 80); /* New intent is queued after the old dim. */
+    mockPendingMask = 1;
+    mockPendingTarget = 80;
+    Idle_Restore();
+    CHECK(g_monitors.monitors[0].desiredBrightness == 80);
+    CHECK(restoreRequests == 0 && g_monitors.monitors[0].idleApplied);
+    int requests = setOneCalls;
+    RetryIdleRestores();
+    CHECK(setOneCalls == requests); /* Do not replace the queued normal restore. */
+    mockPendingMask = 0;
+    mockWorkerRunning = FALSE;
+    RetryIdleRestores();
+    CHECK(g_monitors.monitors[0].brightnessCur == 80 && !g_monitors.monitors[0].idleApplied);
+}
+
+static MonitorResult *MakeRawRestoreResult(BOOL success)
+{
+    MonitorResult *result = (MonitorResult *)calloc(1, sizeof(*result));
+    CHECK(result != NULL);
+    if (!result) return NULL;
+    result->kind = MONITOR_RESULT_BRIGHTNESS;
+    result->purpose = MONITOR_WRITE_IDLE_RESTORE;
+    result->idleEpoch = g_monitors.monitors[0].idleEpoch;
+    result->success = result->brightnessWritten = success;
+    result->current = g_monitors.monitors[0].preIdleBrightness;
+    result->maximum = g_monitors.monitors[0].brightnessMax;
+    return result;
+}
+
+static void TestAsyncRawRestoreRetainsOwnershipAndRetriesFailure(void)
+{
+    ResetState();
+    AddReadyMonitor();
+    BrightMonitor *monitor = &g_monitors.monitors[0];
+    monitor->brightnessMax = 255;
+    monitor->brightnessCur = 73;
+    g_settings.idleDimPercent = 5;
+    Idle_Dim();
+    mockWorkerRunning = TRUE;
+    Idle_Restore();
+    CHECK(monitor->idleApplied && monitor->idleReleasePending && monitor->preIdleBrightness == 73);
+    CHECK(restoreRequests == 1 && !monitor->desiredBrightnessValid);
+    RetryIdleRestores();
+    CHECK(restoreRequests == 1); /* A raw pending value cannot be treated as percent intent. */
+    HandleMonitorResult(testWindow, MakeRawRestoreResult(FALSE));
+    CHECK(monitor->idleApplied && !monitor->idleReleasePending && monitor->preIdleBrightnessValid);
+    CHECK(!g_rescan.reapplyBrightness && timerCalls == 0 && refreshCalls == 0);
+    RetryIdleRestores();
+    CHECK(restoreRequests == 2 && monitor->idleReleasePending);
+    HandleMonitorResult(testWindow, MakeRawRestoreResult(TRUE));
+    CHECK(monitor->brightnessCur == 73 && !monitor->idleApplied && !monitor->idleReleasePending);
+    CHECK(!monitor->preIdleBrightnessValid && !monitor->desiredBrightnessValid);
+    RetryIdleRestores();
+    CHECK(restoreRequests == 2);
+}
+
+static void TestWakeCancelsBaselineLessDimAndRestoresLateAcknowledgement(void)
+{
+    ResetState();
+    AddReadyMonitor();
+    BrightMonitor *monitor = &g_monitors.monitors[0];
+    monitor->brightnessMax = 255;
+    monitor->brightnessCur = 73;
+    g_settings.idleDimPercent = 5;
+    mockWorkerRunning = TRUE;
+    Idle_Dim();
+    DWORD epoch = monitor->idleEpoch;
+    CHECK(monitor->idleDimPending && !monitor->preIdleBrightnessValid);
+    Idle_Restore();
+    CHECK(cancelCalls == 1 && !monitor->idleDimPending && restoreRequests == 0 && setOneCalls == 0);
+    acceptResult = FALSE; /* Native I/O completed just before cancellation. */
+    DeliverIdleWriteResult(0, epoch, 73);
+    CHECK(monitor->idleApplied && monitor->preIdleBrightnessValid && monitor->preIdleBrightness == 73);
+    mockWorkerRunning = FALSE;
+    RetryIdleRestores();
+    CHECK(monitor->brightnessCur == 73 && !monitor->idleApplied && !monitor->desiredBrightnessValid);
+}
+
+static void TestRescanKeepsPendingRawRestoreNativeAndLateTelemetryStale(void)
+{
+    ResetState();
+    AddReadyMonitor();
+    BrightMonitor *monitor = &g_monitors.monitors[0];
+    monitor->brightnessMax = 255;
+    monitor->brightnessCur = 73;
+    g_settings.idleDimPercent = 5;
+    Idle_Dim();
+    mockWorkerRunning = TRUE;
+    Idle_Restore();
+    CHECK(restoreRequests == 1 && monitor->idleReleasePending && !monitor->desiredBrightnessValid);
+    MonitorList *fresh = (MonitorList *)calloc(1, sizeof(*fresh));
+    CHECK(fresh != NULL);
+    if (!fresh) return;
+    *fresh = g_monitors;
+    fresh->monitors[0].brightnessCur = 255;
+    fresh->monitors[0].idleReleasePending = FALSE; /* Enumeration carries no canceled worker queue. */
+    g_rescan.reapplyBrightness = TRUE;
+    AdoptMonitorList(fresh);
+    monitor = &g_monitors.monitors[0];
+    CHECK(restoreRequests == 2 && monitor->idleReleasePending);
+    CHECK(monitor->preIdleBrightness == 73 && !monitor->desiredBrightnessValid && setOneCalls == 0);
+
+    acceptResult = FALSE; /* An earlier success can release ownership, never overwrite newer telemetry. */
+    MonitorResult *result = MakeRawRestoreResult(TRUE);
+    if (!result) return;
+    result->sourceUpdated = result->sourceKnown = TRUE;
+    result->currentInput = 0x12;
+    monitor->sourceKnown = TRUE;
+    monitor->currentInput = 0x0f;
+    HandleMonitorResult(testWindow, result);
+    CHECK(!monitor->idleApplied && !monitor->preIdleBrightnessValid);
+    CHECK(monitor->sourceKnown && monitor->currentInput == 0x0f && monitor->brightnessCur == 255);
+    CHECK(!monitor->desiredBrightnessValid);
 }
 
 static void TestMixedOledWakeRetriesOnlyUnrestoredMonitor(void)
@@ -1545,34 +1877,36 @@ static void TestMixedOledWakeRetriesOnlyUnrestoredMonitor(void)
     Idle_Restore();
     CHECK(!blackIdle && !g_idleDimmed && lcd->brightnessCur == 5);
     CHECK(lcd->idleApplied && lcd->preIdleBrightnessValid);
-    int before = setOneCalls;
+    int before = restoreRequests;
     RetryIdleRestores();
-    CHECK(setOneCalls == before + 1 && lcd->idleApplied); /* A failed retry keeps the restore intent. */
+    CHECK(restoreRequests == before + 1 && lcd->idleApplied); /* A failed retry keeps the restore intent. */
 
-    before = setOneCalls;
+    before = restoreRequests;
     mockPendingMask = 1u << 1;
     RetryIdleRestores();
-    CHECK(setOneCalls == before); /* Do not replace an in-flight/queued restore. */
+    CHECK(restoreRequests == before); /* Do not replace an in-flight/queued restore. */
     mockPendingMask = 0;
     lcd->excludedFromControl = TRUE;
     RetryIdleRestores();
-    CHECK(setOneCalls == before);
+    CHECK(restoreRequests == before);
     lcd->excludedFromControl = FALSE;
     lcd->sourceKnown = FALSE;
     RetryIdleRestores();
-    CHECK(setOneCalls == before);
+    CHECK(restoreRequests == before);
     lcd->sourceKnown = TRUE;
     lcd->currentInput = 0x12;
     RetryIdleRestores();
-    CHECK(setOneCalls == before); /* Another input uses the guarded handoff path. */
+    CHECK(restoreRequests == before); /* Another input uses the guarded handoff path. */
     lcd->currentInput = 0x0F;
     g_idleDimmed = TRUE;
     RetryIdleRestores();
-    CHECK(setOneCalls == before);
+    CHECK(restoreRequests == before);
     g_idleDimmed = FALSE;
 
     lcd->desiredBrightness = 48; /* A newer request wins over the old 60% restore. */
+    lcd->desiredBrightnessValid = TRUE;
     mockNormalSucceeds = TRUE;
+    before = setOneCalls;
     RetryIdleRestores();
     CHECK(setOneCalls == before + 1 && lcd->brightnessCur == 48 && !lcd->idleApplied);
     CHECK(oled->brightnessCur == 73 && !blackIdle && !g_idleDimmed);
@@ -1804,6 +2138,17 @@ int main(void)
     TestCliActivityRestartsIdleCountdownAndLatestRowIntent();
     TestCliRangeAndRescanPreserveLatestMaster();
     TestMixedOledWakeRetriesOnlyUnrestoredMonitor();
+    TestIdleWakePreservesIndividualTargetsAndSchedulePrecedence();
+    TestIdleWakeRestoresNativeBaselinesWithoutCreatingIntent();
+    TestIdleWakeUsesLatestPendingIndividualTarget();
+    TestAsyncRawRestoreRetainsOwnershipAndRetriesFailure();
+    TestWakeCancelsBaselineLessDimAndRestoresLateAcknowledgement();
+    TestRescanKeepsPendingRawRestoreNativeAndLateTelemetryStale();
+    TestDerivedRowAverageDoesNotBecomeOtherMonitorIntent();
+    TestGroupStepAfterIdleUsesPreDimAverage();
+    TestIdleScopeChangeRestoresIndividualIntentOnRetainedRows();
+    TestChangingDimToBlackRestoresOwnedPanelAndRetries();
+    TestLateLcdDimAcknowledgementIsRestoredUnderBlackOverlay();
     if (failures) {
         printf("startup: %d failure(s)\n", failures);
         return 1;

@@ -145,6 +145,12 @@ The mixed OLED/LCD wake regression verifies that a failed LCD restore stays
 pending after the cover is removed. Recovery retries only the dimmed LCD, uses
 the newest intent, respects source/selection, avoids duplicating in-flight work
 and stops after success.
+Manual idle wake preserves different per-monitor requests and exact native
+baselines when no request exists. Queued raw restores remain separate from user
+targets; failed writes and late dim acknowledgements retain ownership until
+the correct latest target or native baseline has been restored.
+Changing an already dimmed display to black idle restores the old brightness
+ownership, including failed restores and dim acknowledgements arriving late.
 
 `test_idle_black.c` exercises the overlay with mocked windows, monitor geometry,
 last-input timestamps, source selection and power requests. It verifies an

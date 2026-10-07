@@ -149,6 +149,10 @@ BOOL MonitorWorker_SetIdle(BrightMonitor *monitor, DWORD percent)
 {
     return MonitorWorker_Set(monitor, percent);
 }
+BOOL MonitorWorker_RestoreIdle(BrightMonitor *monitor, DWORD rawBrightness)
+{
+    return MonitorWorker_Set(monitor, rawBrightness);
+}
 BOOL MonitorWorker_ReleaseIdle(BrightMonitor *monitor, DWORD rawBrightness, DWORD otherInput)
 {
     (void)otherInput;
@@ -602,6 +606,51 @@ static void TestIdleRestoresExactRawBrightness(void)
     CHECK(monitor.desiredBrightness == 77);
 }
 
+static void TestNativeIdleWakeRestorePreservesRawAndSourcePolicy(void)
+{
+    BrightMonitor monitor = MakeDdc(0);
+    ResetMocks();
+    monitor.brightnessMax = 255;
+    monitor.brightnessCur = 12;
+    monitor.sourceFilter = TRUE;
+    monitor.expectedInput = 0x0F;
+    monitor.preIdleBrightness = 73;
+    monitor.preIdleBrightnessValid = TRUE;
+    CHECK(!Monitor_RestoreIdleBrightness(&monitor)); /* No acknowledged write is owned. */
+    CHECK(setCalls == 0 && sourceCalls == 0);
+    monitor.idleApplied = TRUE;
+    sourceInput = 0x12;
+    CHECK(!Monitor_RestoreIdleBrightness(&monitor)); /* A fresh input check is mandatory. */
+    CHECK(setCalls == 0 && sourceCalls == 1 && monitor.idleApplied);
+    sourceInput = 0x0F;
+    setSuccess = FALSE;
+    CHECK(!Monitor_RestoreIdleBrightness(&monitor));
+    CHECK(monitor.idleApplied && monitor.preIdleBrightnessValid && !monitor.desiredBrightnessValid);
+    setSuccess = TRUE;
+    CHECK(Monitor_RestoreIdleBrightness(&monitor));
+    CHECK(lastWrite == 73 && monitor.brightnessCur == 73); /* 28 percent would round down to71. */
+    CHECK(!monitor.idleApplied && !monitor.preIdleBrightnessValid && !monitor.desiredBrightnessValid);
+
+    monitor.idleApplied = monitor.preIdleBrightnessValid = TRUE;
+    monitor.desiredBrightnessValid = TRUE;
+    monitor.desiredBrightness = 82;
+    monitor.preIdleBrightness = 256;
+    CHECK(!Monitor_RestoreIdleBrightness(&monitor)); /* An invalid baseline must not be clipped. */
+    monitor.preIdleBrightness = 73;
+    monitor.excludedFromControl = TRUE;
+    int calls = setCalls;
+    CHECK(!Monitor_RestoreIdleBrightness(&monitor) && setCalls == calls);
+    monitor.excludedFromControl = FALSE;
+    CHECK(Monitor_RestoreIdleBrightness(&monitor));
+    CHECK(monitor.desiredBrightnessValid && monitor.desiredBrightness == 82);
+
+    monitor.backend = BACKEND_WMI;
+    monitor.preIdleBrightness = 67;
+    monitor.idleApplied = monitor.preIdleBrightnessValid = TRUE;
+    CHECK(Monitor_RestoreIdleBrightness(&monitor) && lastWrite == 67);
+    CHECK(!monitor.idleApplied && !monitor.preIdleBrightnessValid);
+}
+
 static void TestIdleReleaseNeverBypassesUnknownOrChangedSource(void)
 {
     BrightMonitor monitor = MakeDdc(0);
@@ -846,6 +895,7 @@ int main(void)
     TestUnansweredRecoveryUsesStableIdentity();
     TestSourceFilterChecksBeforeEveryWrite();
     TestIdleRestoresExactRawBrightness();
+    TestNativeIdleWakeRestorePreservesRawAndSourcePolicy();
     TestIdleReleaseNeverBypassesUnknownOrChangedSource();
     TestIdleRequiresValidatedBaselineAndAppliedWrite();
     TestNormalSyncWriteClearsIdleOwnershipOnlyWhenApplied();

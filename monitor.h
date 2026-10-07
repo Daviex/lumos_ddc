@@ -71,6 +71,9 @@ int Monitor_GetPercent(const BrightMonitor *mon);
 /* Set brightness for a single monitor (0-100 percentage) */
 BOOL Monitor_SetBrightness(BrightMonitor *mon, DWORD percent);
 BOOL Monitor_SetIdleBrightness(BrightMonitor *mon, DWORD percent);
+/* Restore an acknowledged idle dim to its exact native baseline on the normal
+   permitted input, without inventing a new requested percentage. */
+BOOL Monitor_RestoreIdleBrightness(BrightMonitor *mon);
 /* The sole source-filter exception: release an acknowledged idle dimming on
    exactly the other input observed by the caller, after a fresh source read. */
 BOOL Monitor_ReleaseIdleBrightness(BrightMonitor *mon, DWORD rawBrightness, DWORD otherInput);
@@ -125,7 +128,8 @@ typedef BOOL (*MonitorWriteGuard)(void *context);
 typedef enum {
     MONITOR_WRITE_NORMAL = 0,
     MONITOR_WRITE_IDLE,
-    MONITOR_WRITE_IDLE_RELEASE
+    MONITOR_WRITE_IDLE_RELEASE,
+    MONITOR_WRITE_IDLE_RESTORE
 } MonitorWritePurpose;
 MonitorWriteOutcome Monitor_SetBrightnessGuardedSync(BrightMonitor *mon, DWORD percent,
                                                       MonitorWriteGuard guard, void *context);

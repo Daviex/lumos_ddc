@@ -635,6 +635,41 @@ static void TestIdleReleasePurposeAndTelemetry(void)
     FinishTest();
 }
 
+static void TestRawIdleRestoreIsNotPercentIntentAndCanBeSuperseded(void)
+{
+    MonitorList view = MakeView();
+    MonitorTarget pending[MAX_MONITORS];
+    view.monitors[0].brightnessMax = 255;
+    view.monitors[0].sourceFilter = TRUE;
+    view.monitors[0].expectedInput = 0x0F;
+    view.monitors[0].idleEpoch = 19;
+    view.monitors[0].idleApplied = view.monitors[0].preIdleBrightnessValid = TRUE;
+    view.monitors[0].preIdleBrightness = 73;
+    StartTest(&view, FALSE, FALSE);
+    ResetEvent(allowSource);
+    CHECK(MonitorWorker_RestoreIdle(&view.monitors[0], 73));
+    CHECK(WaitForSingleObject(sourceEntered, TEST_TIMEOUT) == WAIT_OBJECT_0);
+    CHECK(MonitorWorker_PendingTargets(pending) == 0);
+    CHECK(MonitorWorker_Set(&view.monitors[0], 82)); /* A newer user request replaces raw restore. */
+    CHECK(MonitorWorker_PendingTargets(pending) == 1u && pending[0].percent == 82);
+    SetEvent(allowSource);
+    MonitorResult *result = WaitResult();
+    if (result) {
+        CHECK(result->purpose == MONITOR_WRITE_IDLE_RESTORE && result->idleEpoch == 19);
+        CHECK(result->kind == MONITOR_RESULT_CANCELLED && !result->brightnessWritten);
+        CHECK(!MonitorWorker_Accept(result) && MonitorWorker_AcceptState(result));
+    }
+    free(result);
+    result = WaitResult();
+    if (result) {
+        CHECK(result->purpose == MONITOR_WRITE_NORMAL && result->success && result->brightnessWritten);
+        CHECK(result->current == 82 && MonitorWorker_Accept(result));
+    }
+    free(result);
+    CHECK(ReadCounter(&writes) == 1 && writtenValues[0] == 82);
+    FinishTest();
+}
+
 static void TestIdleReleaseRechecksSourceAndCancelsPerMonitor(void)
 {
     /* Release must never brighten an input that changed while its check was blocked.
@@ -680,7 +715,7 @@ static void TestIdleReleaseRechecksSourceAndCancelsPerMonitor(void)
 
 static void TestAppliedIdleIdentitySurvivesReset(void)
 {
-    for (int release = 0; release < 2; release++) {
+    for (int purpose = 0; purpose < 3; purpose++) {
         MonitorList view = MakeView();
         MonitorResult *result;
         view.monitors[0].sourceFilter = TRUE;
@@ -688,9 +723,13 @@ static void TestAppliedIdleIdentitySurvivesReset(void)
         view.monitors[0].idleEpoch = 31;
         wcscpy(view.monitors[0].deviceInstance, L"DISPLAY\\MOCK\\ORIGINAL");
         StartTest(&view, TRUE, FALSE);
-        if (release) {
+        if (purpose == 1) {
             InterlockedExchange(&sourceInput, 0x12);
             CHECK(MonitorWorker_ReleaseIdle(&view.monitors[0], 80, 0x12));
+        } else if (purpose == 2) {
+            view.monitors[0].idleApplied = view.monitors[0].preIdleBrightnessValid = TRUE;
+            view.monitors[0].preIdleBrightness = 80;
+            CHECK(MonitorWorker_RestoreIdle(&view.monitors[0], 80));
         } else {
             CHECK(MonitorWorker_SetIdle(&view.monitors[0], 10));
         }
@@ -707,7 +746,8 @@ static void TestAppliedIdleIdentitySurvivesReset(void)
         result = WaitResult();
         if (result) {
             CHECK(result->success && result->brightnessWritten);
-            CHECK(result->purpose == (release ? MONITOR_WRITE_IDLE_RELEASE : MONITOR_WRITE_IDLE));
+            CHECK(result->purpose == (purpose == 1 ? MONITOR_WRITE_IDLE_RELEASE :
+                                     purpose == 2 ? MONITOR_WRITE_IDLE_RESTORE : MONITOR_WRITE_IDLE));
             CHECK(result->idleEpoch == 31);
             CHECK(wcscmp(result->deviceInstance, L"DISPLAY\\MOCK\\ORIGINAL") == 0);
             CHECK(result->backend == BACKEND_DDC && result->sourceFilter);
@@ -732,6 +772,7 @@ int main(void)
     TestSourcePollingScope();
     TestSourcePollingWithoutBrightnessCapability();
     TestIdleReleasePurposeAndTelemetry();
+    TestRawIdleRestoreIsNotPercentIntentAndCanBeSuperseded();
     TestIdleReleaseRechecksSourceAndCancelsPerMonitor();
     TestAppliedIdleIdentitySurvivesReset();
     if (ReadCounter(&failures)) {

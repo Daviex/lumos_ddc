@@ -200,6 +200,7 @@ const char *Diagnostics_InputName(DWORD input)
 const char *Diagnostics_WritePurpose(MonitorWritePurpose purpose)
 {
     return purpose == MONITOR_WRITE_IDLE ? "idle-dim" :
+           purpose == MONITOR_WRITE_IDLE_RESTORE ? "restore-idle-baseline" :
            purpose == MONITOR_WRITE_IDLE_RELEASE ? "restore-on-other-input" : "normal";
 }
 

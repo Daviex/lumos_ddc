@@ -323,8 +323,15 @@ that reject consecutive DDC commands can accept the change. Transient I2C
 transmit/receive errors allow up to three write attempts, each rechecking the
 source and whether the request is still current. When activity ends idle mode,
 a failed brightness restore remains pending and is retried on the 2-second idle
-timer, using the latest requested brightness. Already restored and black-idle
-displays are left alone; queued/in-flight restores are not duplicated.
+timer, using the latest requested brightness. Already restored displays and
+displays which only used a black cover are left alone; queued/in-flight restores
+are not duplicated. Switching a dimmed display to black idle first releases its
+previous brightness dim, including writes which finish after the mode change.
+
+Waking from idle restores each dimmed monitor's individual requested level.
+If no level was requested, it restores the saved native brightness exactly,
+without converting it through a percentage. An active schedule takes precedence
+and uses its current value, even when the idle period crossed a schedule anchor.
 
 Hotkeys are stored as text. Modifiers are `Ctrl`, `Alt`, `Shift` and `Win`, and keys are letters, digits, `F1` to `F24`, the arrows, `Home`, `End`, `PageUp`, `PageDown`, `Insert`, `Delete`, `Space`, `Enter`, `Tab`, `Backspace`, `Pause` and the numeric keypad (`Num0` to `Num9`, `NumPlus`, `NumMinus`, `NumMultiply`, `NumDivide`, `NumDecimal`). `None` turns a hotkey off, and a value that cannot be read falls back to the default. A `config.ini` from version 1.1 or older has no hotkey lines, and it keeps the `Ctrl+Alt+Up` / `Ctrl+Alt+Down` brightness hotkeys those versions used.
 

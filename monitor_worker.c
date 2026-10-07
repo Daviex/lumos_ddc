@@ -122,7 +122,8 @@ static DWORD SnapshotTargetsLocked(MonitorTarget targets[MAX_MONITORS])
     DWORD mask = 0;
     for (int i = 0; i < g_worker.view->count; i++) {
         if (!g_worker.writes[i].pending && !g_worker.inFlight[i]) continue;
-        if (g_worker.purposes[i] == MONITOR_WRITE_IDLE_RELEASE) continue;
+        if (g_worker.purposes[i] == MONITOR_WRITE_IDLE_RELEASE ||
+            g_worker.purposes[i] == MONITOR_WRITE_IDLE_RESTORE) continue;
         targets[i].monitor = g_worker.view->monitors[i];
         targets[i].percent = g_worker.targets[i];
         mask |= 1u << i;
@@ -369,6 +370,11 @@ BOOL MonitorWorker_Set(BrightMonitor *monitor, DWORD percent)
 BOOL MonitorWorker_SetIdle(BrightMonitor *monitor, DWORD percent)
 {
     return QueueWrite(monitor, percent, MONITOR_WRITE_IDLE, 0);
+}
+
+BOOL MonitorWorker_RestoreIdle(BrightMonitor *monitor, DWORD rawBrightness)
+{
+    return QueueWrite(monitor, rawBrightness, MONITOR_WRITE_IDLE_RESTORE, 0);
 }
 
 BOOL MonitorWorker_ReleaseIdle(BrightMonitor *monitor, DWORD rawBrightness, DWORD otherInput)

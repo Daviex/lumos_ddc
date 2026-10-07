@@ -46,6 +46,7 @@ void MonitorWorker_Stop(void);
 BOOL MonitorWorker_Running(void);
 BOOL MonitorWorker_Set(BrightMonitor *monitor, DWORD percent);
 BOOL MonitorWorker_SetIdle(BrightMonitor *monitor, DWORD percent);
+BOOL MonitorWorker_RestoreIdle(BrightMonitor *monitor, DWORD rawBrightness);
 BOOL MonitorWorker_ReleaseIdle(BrightMonitor *monitor, DWORD rawBrightness, DWORD otherInput);
 /* Invalidates this monitor's pending/in-flight work without disturbing others. */
 void MonitorWorker_Cancel(BrightMonitor *monitor);

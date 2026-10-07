@@ -105,6 +105,7 @@ static ULONGLONG    g_scheduleResumeLocalMinute;   /* dated local-time deadline 
 static int          g_scheduleLastApplied = -1;    /* last brightness pushed by the schedule */
 static int          g_masterTarget;          /* intended base percent, mapped through per-monitor ranges */
 static BOOL         g_masterTargetValid;
+static BOOL         g_masterTargetExplicit; /* A requested group level, rather than an inferred UI average. */
 static BOOL         g_idleDimmed = FALSE;     /* TRUE while the idle level is on the monitors */
 static DWORD        g_idleEpoch;
 
@@ -171,6 +172,7 @@ static void SliderManualChange(int row, int target);
 static int MasterTargetFromMonitors(void);
 static void Idle_Tick(void);
 static void Idle_Restore(void);
+static void RestoreIdleMonitor(BrightMonitor *monitor);
 static void ResumeSourceMonitor(BrightMonitor *monitor);
 static void RestartSourcePolling(void);
 static void TryIdleHandoff(BrightMonitor *monitor);
@@ -221,6 +223,7 @@ static void RangeChanged(int masterLevel)
     if (!g_masterTargetValid)
         g_masterTarget = masterLevel;
     g_masterTargetValid = TRUE;
+    g_masterTargetExplicit = TRUE;
     UI_SetMasterTarget(g_masterTarget);
     Monitor_SetAllBrightness(&g_monitors, g_masterTarget);
 }
@@ -615,9 +618,10 @@ static int MasterTargetFromMonitors(void)
 static BOOL StepMaster(int delta)
 {
     /* Initialize target from current state if needed */
-    if (!g_masterTargetValid)
+    if (!g_masterTargetValid && !g_idleDimmed)
         g_masterTarget = MasterTargetFromMonitors();
     g_masterTargetValid = TRUE;
+    g_masterTargetExplicit = TRUE;
 
     g_masterTarget += delta;
     if (g_masterTarget < 0) g_masterTarget = 0;
@@ -715,6 +719,7 @@ static BOOL ApplyPresetBrightness(DWORD brightness)
 {
     g_masterTarget = (int)brightness;
     g_masterTargetValid = TRUE;
+    g_masterTargetExplicit = TRUE;
     UI_SetMasterTarget(g_masterTarget);
     BOOL ok = Monitor_SetAllBrightness(&g_monitors, g_masterTarget);
     Monitor_RefreshBrightness(&g_monitors);
@@ -777,6 +782,7 @@ static BOOL AppSetMaster(int percent)
     RemoteActivity();
     g_masterTarget = percent;
     g_masterTargetValid = TRUE;
+    g_masterTargetExplicit = TRUE;
     UI_SetMasterTarget(g_masterTarget);
     BOOL ok = Monitor_SetAllBrightness(&g_monitors, percent);
     Monitor_RefreshBrightness(&g_monitors);
@@ -970,6 +976,7 @@ static void Schedule_ApplyNow(void)
     Diagnostics_Log("INFO", "schedule", "APPLY minute=%d basePercent=%d", now, value);
     g_masterTarget = value;
     g_masterTargetValid = TRUE;
+    g_masterTargetExplicit = TRUE;
     UI_SetMasterTarget(value);
     TIMED("schedule: SetAllBrightness", Monitor_SetAllBrightness(&g_monitors, value));
     UI_RefreshPopup(g_hwndPopup, &g_monitors);  /* no-op if popup hidden */
@@ -980,7 +987,8 @@ static void Schedule_ApplyNow(void)
    their brightness to a default (often 100%) across sleep or DPMS off, and a
    plain re-enumeration only reads that reset value back, it does not restore
    ours. When a schedule is active we force its current value (bypassing the
-   "unchanged" guard); otherwise we re-apply the last master target. */
+   "unchanged" guard); otherwise each retained monitor intent wins over the
+   master fallback. An acknowledged idle baseline remains native raw state. */
 static void ReapplyBrightness(void)
 {
     Diagnostics_Log("INFO", "policy", "reapply idle=%d masterValid=%d masterTarget=%d scheduleSuspended=%d",
@@ -997,12 +1005,22 @@ static void ReapplyBrightness(void)
         Schedule_ApplyNow();
         return;
     }
-    if (g_masterTargetValid) {        /* skip if the user never set a level yet */
-        UI_SetMasterTarget(g_masterTarget);
-        TIMED("reapply(master): SetAllBrightness",
-              Monitor_SetAllBrightness(&g_monitors, g_masterTarget));
-        UI_RefreshPopup(g_hwndPopup, &g_monitors);
+    if (g_masterTargetValid) UI_SetMasterTarget(g_masterTarget);
+    for (int i = 0; i < g_monitors.count; i++) {
+        BrightMonitor *monitor = &g_monitors.monitors[i];
+        if (!Monitor_CanControl(monitor)) continue;
+        if (monitor->desiredBrightnessValid) {
+            Monitor_SetBrightness(monitor, monitor->desiredBrightness);
+        } else if (monitor->idleApplied && monitor->preIdleBrightnessValid) {
+            if (!monitor->idleReleasePending) RestoreIdleMonitor(monitor);
+        } else if (g_masterTargetValid && g_masterTargetExplicit) {
+            int percent = BrightMap_Level(g_masterTarget, monitor->rangeLo, monitor->rangeHi);
+            if (percent < 0) percent = 0;
+            if (percent > 100) percent = 100;
+            Monitor_SetBrightness(monitor, (DWORD)percent);
+        }
     }
+    UI_RefreshPopup(g_hwndPopup, &g_monitors);
 }
 
 /* Put the monitors in mask (bit i = monitor i) on the current All Monitors
@@ -1065,6 +1083,7 @@ static void SliderManualChange(int row, int target)
         intended.monitors[row].brightnessCur = Brightness_ToRaw(&intended.monitors[row], (DWORD)target);
     g_masterTarget = row < 0 ? target : Brightness_MasterTarget(&intended);
     g_masterTargetValid = TRUE;
+    g_masterTargetExplicit = row < 0;
     UI_SetMasterTarget(g_masterTarget);
     ManualChange();
 }
@@ -1114,7 +1133,13 @@ static int Idle_DimBlocked(void)
    recover it from the monitors first, otherwise there is nothing to restore. */
 static void DimIdleMonitor(BrightMonitor *monitor)
 {
-    if (!Monitor_CanControl(monitor) || monitor->idleBlack || monitor->idleDimPending) {
+    if (monitor->idleBlack) {
+        /* Changing to black mode cannot leave an earlier acknowledged LCD
+           dim on the panel, including an acknowledgement which arrives late. */
+        if (!monitor->idleReleasePending) RestoreIdleMonitor(monitor);
+        return;
+    }
+    if (!Monitor_CanControl(monitor) || monitor->idleDimPending) {
         Diagnostics_Monitor(monitor, "INFO", "idle-dim", "SKIP reason=%s sourcePolicy=%s",
             monitor->excludedFromControl ? "monitor-excluded" : monitor->idleBlack ? "true-black-overlay" :
             !monitor->controllable ? "brightness-unavailable" : "dim-already-pending",
@@ -1203,15 +1228,16 @@ static void Idle_Dim(void)
     for (int i = 0; i < g_monitors.count; i++) {
         BrightMonitor *monitor = &g_monitors.monitors[i];
         /* An outstanding old dim/release still owns its original baseline. */
+        /* Black-only cycles issue no panel dim. Retain the prior LCD epoch so
+           a canceled in-flight dim can still acknowledge its exact baseline. */
+        if (monitor->idleBlack) continue;
         if (!monitor->idleApplied && !monitor->idleDimPending && !monitor->idleReleasePending) {
             monitor->preIdleBrightnessValid = FALSE;
             monitor->idleEpoch = 0;
         }
     }
-    if (!g_masterTargetValid) {
+    if (!g_masterTargetValid)
         g_masterTarget = Brightness_MasterTarget(&g_monitors);
-        g_masterTargetValid = TRUE;
-    }
     g_idleDimmed = TRUE;
     UI_SetMasterTarget(g_settings.idleDimPercent);
     DbgLog("Idle dim -> %d%% (restore target %d)", g_settings.idleDimPercent, g_masterTarget);
@@ -1219,8 +1245,33 @@ static void Idle_Dim(void)
     UI_RefreshPopup(g_hwndPopup, &g_monitors);   /* no-op if the popup is hidden */
 }
 
-/* Back to the pre-dim level. Reuses ReapplyBrightness so an active schedule
-   recomputes its value for the current time: an idle stretch can span hours. */
+/* Manual wake restores individual intent, or the exact native baseline when
+   no brightness has been requested. The inferred master is only a UI value. */
+static void RestoreIdleMonitor(BrightMonitor *monitor)
+{
+    if (!Monitor_CanControl(monitor) ||
+        (!monitor->idleApplied && !monitor->idleDimPending && !monitor->idleReleasePending))
+        return;
+    if (monitor->desiredBrightnessValid) {
+        monitor->idleReleasePending = FALSE;
+        Monitor_SetBrightness(monitor, monitor->desiredBrightness);
+    } else if (Monitor_SourceAllowsControl(monitor)) {
+        if (monitor->idleApplied && monitor->preIdleBrightnessValid) {
+            monitor->idleReleasePending = TRUE;
+            monitor->idleDimPending = FALSE;
+            if (!Monitor_RestoreIdleBrightness(monitor)) monitor->idleReleasePending = FALSE;
+        } else if (monitor->idleDimPending) {
+            /* No baseline is known until the pending dim acknowledges. Cancel
+               it; any write already completed still delivers its owned raw
+               baseline and is restored by RetryIdleRestores on the next tick. */
+            MonitorWorker_Cancel(monitor);
+            monitor->idleDimPending = FALSE;
+        }
+    }
+}
+
+/* An active schedule recomputes its current value: idle can span hours.
+   Otherwise, wake must not flatten individual monitor targets to the master. */
 static void Idle_Restore(void)
 {
     if (!g_idleDimmed)
@@ -1228,29 +1279,23 @@ static void Idle_Restore(void)
     g_idleDimmed = FALSE;   /* cleared first: ReapplyBrightness holds the idle level while set */
     IdleBlack_Clear();
     DbgLog("Idle restore -> target %d", g_masterTarget);
-    BOOL hasBlack = FALSE;
-    for (int i = 0; i < g_monitors.count; i++)
-        if (Monitor_CanControl(&g_monitors.monitors[i]) && g_monitors.monitors[i].idleBlack)
-            hasBlack = TRUE;
-    if (!hasBlack || (g_settings.scheduleEnabled && g_settings.scheduleCount > 0 && !g_scheduleSuspended)) {
+    if (g_settings.scheduleEnabled && g_settings.scheduleCount > 0 && !g_scheduleSuspended) {
+        for (int i = 0; i < g_monitors.count; i++)
+            g_monitors.monitors[i].idleReleasePending = FALSE;
         TIMED("idle restore: ReapplyBrightness", ReapplyBrightness());
-    } else if (g_masterTargetValid) {
+    } else {
         /* Black idle never changed panel brightness; removing its window is
            sufficient. Only restore brightness on displays which used dimming. */
         UI_SetMasterTarget(g_masterTarget);
-        for (int i = 0; i < g_monitors.count; i++) {
-            BrightMonitor *monitor = &g_monitors.monitors[i];
-            if (!Monitor_CanControl(monitor) || monitor->idleBlack) continue;
-            int target = BrightMap_Level(g_masterTarget, monitor->rangeLo, monitor->rangeHi);
-            if (target < 0) target = 0;
-            if (target > 100) target = 100;
-            Monitor_SetBrightness(monitor, (DWORD)target);
-        }
+        for (int i = 0; i < g_monitors.count; i++)
+            RestoreIdleMonitor(&g_monitors.monitors[i]);
         UI_RefreshPopup(g_hwndPopup, &g_monitors);
     }
     for (int i = 0; i < g_monitors.count; i++) {
-        /* A normal restore may have superseded a queued alternate-input undo. */
-        g_monitors.monitors[i].idleReleasePending = FALSE;
+        /* Requeue an alternate-input undo after waking; a normal raw restore
+           must keep its pending flag until its own acknowledgement arrives. */
+        if (!Monitor_SourceAllowsControl(&g_monitors.monitors[i]))
+            g_monitors.monitors[i].idleReleasePending = FALSE;
         TryIdleHandoff(&g_monitors.monitors[i]);
     }
     IdleBlack_Update(&g_monitors, g_settings.idleDimEnabled, FALSE);
@@ -1261,17 +1306,18 @@ static void Idle_Restore(void)
    retry the latest policy without touching displays which already recovered. */
 static void RetryIdleRestores(void)
 {
-    if (g_idleDimmed) return;
     MonitorTarget pending[MAX_MONITORS];
     DWORD pendingMask = MonitorWorker_PendingTargets(pending);
     for (int i = 0; i < g_monitors.count; i++) {
         BrightMonitor *monitor = &g_monitors.monitors[i];
-        if (!monitor->idleApplied || monitor->idleBlack ||
+        if (!monitor->idleApplied || (g_idleDimmed && !monitor->idleBlack) ||
+            monitor->idleReleasePending ||
             !Monitor_CanControl(monitor) || !Monitor_SourceAllowsControl(monitor) ||
             (pendingMask & (1u << i))) continue;
         Diagnostics_Monitor(monitor, "WARN", "idle-restore",
             "RETRY acknowledged dim still applied; resume latest brightness policy");
-        ResumeSourceMonitor(monitor);
+        if (monitor->idleBlack) RestoreIdleMonitor(monitor);
+        else ResumeSourceMonitor(monitor);
     }
 }
 
@@ -1384,23 +1430,27 @@ static void UpdateMonitorSelection(void)
         if ((retained & (1u << i)) && monitor->sourceFilter && monitor->desiredBrightnessValid)
             monitor->brightnessCur = Brightness_ToRaw(monitor, monitor->desiredBrightness);
     }
-    if (g_idleDimmed && g_masterTargetValid) {
+    if (g_idleDimmed) {
         for (int i = 0; i < g_monitors.count; i++) {
             if (!(retained & (1u << i))) continue;
-            int target = BrightMap_Level(g_masterTarget, g_monitors.monitors[i].rangeLo, g_monitors.monitors[i].rangeHi);
-            if (target < 0) target = 0;
-            if (target > 100) target = 100;
-            Monitor_SetBrightness(&g_monitors.monitors[i], (DWORD)target);
-            intended.monitors[i].brightnessCur = Brightness_ToRaw(&intended.monitors[i], (DWORD)target);
+            BrightMonitor *monitor = &g_monitors.monitors[i];
+            BOOL owned = monitor->idleApplied && monitor->preIdleBrightnessValid;
+            DWORD original = monitor->preIdleBrightness;
+            RestoreIdleMonitor(monitor);
+            if (monitor->desiredBrightnessValid)
+                intended.monitors[i].brightnessCur = Brightness_ToRaw(monitor, monitor->desiredBrightness);
+            else if (owned)
+                intended.monitors[i].brightnessCur = original;
         }
     }
     g_idleDimmed = FALSE;
     for (int i = 0; i < g_monitors.count; i++) {
-        if (!(retained & (1u << i)) || !g_monitors.monitors[i].sourceFilter)
+        if (!(retained & (1u << i)))
             g_monitors.monitors[i].desiredBrightnessValid = FALSE;
     }
     g_masterTarget = Brightness_MasterTarget(&intended);
     g_masterTargetValid = Monitor_HasSelected(&g_monitors);
+    g_masterTargetExplicit = FALSE;
     UI_SetMasterTarget(g_masterTarget);
     g_hwndPopup = UI_CreatePopup(g_hInst, &g_monitors);
     Monitor_RefreshBrightness(&g_monitors);
@@ -1458,6 +1508,7 @@ static void HandleCommand(HWND hwnd, int cmd)
         if (minChanged && !g_idleDimmed) {
             g_masterTarget = level;
             g_masterTargetValid = TRUE;
+            g_masterTargetExplicit = TRUE;
             UI_SetMasterTarget(g_masterTarget);
             Monitor_SetAllBrightness(&g_monitors, g_masterTarget);
             UI_RefreshPopup(g_hwndPopup, &g_monitors);
@@ -1556,7 +1607,10 @@ static void ResumeSourceMonitor(BrightMonitor *monitor)
         } else if (monitor->desiredBrightnessValid) {
             Monitor_SetBrightness(monitor, monitor->desiredBrightness);
             return;
-        } else if (g_masterTargetValid) {
+        } else if (monitor->idleApplied && monitor->preIdleBrightnessValid) {
+            RestoreIdleMonitor(monitor);
+            return;
+        } else if (g_masterTargetValid && g_masterTargetExplicit) {
             base = g_masterTarget;
         } else {
             return; /* Manual launch without a requested brightness. */
@@ -1576,7 +1630,8 @@ static int MonitorResultStateIndex(const MonitorResult *result)
     if (!result) return -1;
     if (MonitorWorker_AcceptState(result)) return result->index;
     if (!result->brightnessWritten || !result->idleEpoch ||
-        (result->purpose != MONITOR_WRITE_IDLE && result->purpose != MONITOR_WRITE_IDLE_RELEASE) ||
+        (result->purpose != MONITOR_WRITE_IDLE && result->purpose != MONITOR_WRITE_IDLE_RELEASE &&
+         result->purpose != MONITOR_WRITE_IDLE_RESTORE) ||
         result->backend != BACKEND_DDC || !result->deviceInstance[0]) return -1;
     BrightMonitor identity = {0};
     identity.backend = result->backend;
@@ -1630,7 +1685,7 @@ static void HandleMonitorResult(HWND hwnd, MonitorResult *result)
         BOOL wasControllable = monitor->controllable;
         if (result->kind != MONITOR_RESULT_SOURCE) {
             if (result->purpose == MONITOR_WRITE_IDLE) monitor->idleDimPending = FALSE;
-            if (result->purpose == MONITOR_WRITE_IDLE_RELEASE) {
+            if (result->purpose == MONITOR_WRITE_IDLE_RELEASE || result->purpose == MONITOR_WRITE_IDLE_RESTORE) {
                 monitor->idleReleasePending = FALSE;
                 monitor->idleDimPending = FALSE;
             }
@@ -1673,14 +1728,14 @@ static void HandleMonitorResult(HWND hwnd, MonitorResult *result)
                 monitor->brightnessCur = result->current;
                 monitor->brightnessMax = result->maximum;
             }
-        } else if (result->purpose != MONITOR_WRITE_IDLE_RELEASE) {
+        } else if (result->purpose != MONITOR_WRITE_IDLE_RELEASE && result->purpose != MONITOR_WRITE_IDLE_RESTORE) {
             /* Failed results are writes. A display can answer reads at login
                before accepting writes; retry the current intent after recovery. */
             g_rescan.reapplyBrightness = TRUE;
             Monitor_RefreshBrightness(&g_monitors);
             ScheduleRescanThrottled(hwnd);
         }
-        /* A failed release waits for the next poll; never spin or rescan. */
+        /* Failed raw restores wait for a later tick/poll; never spin or rescan. */
         if (result->kind == MONITOR_RESULT_SOURCE || result->purpose != MONITOR_WRITE_IDLE_RELEASE)
             TryIdleHandoff(monitor);
         UI_RefreshPopup(g_hwndPopup, &g_monitors);

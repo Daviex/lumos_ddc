@@ -599,9 +599,16 @@ MonitorWriteOutcome Monitor_SetBrightnessForPurposeGuardedSync(
         return MONITOR_WRITE_SKIPPED;
     }
 
+    BOOL rawRestore = purpose == MONITOR_WRITE_IDLE_RELEASE || purpose == MONITOR_WRITE_IDLE_RESTORE;
+    if (purpose == MONITOR_WRITE_IDLE_RESTORE &&
+        (!mon->idleApplied || !mon->preIdleBrightnessValid || value != mon->preIdleBrightness)) {
+        Diagnostics_Monitor(mon, "WARN", "brightness-write", "SKIP reason=no-owned-idle-baseline");
+        return MONITOR_WRITE_SKIPPED;
+    }
     DWORD percent = value > 100 ? 100 : value;
 
     if (mon->backend == BACKEND_WMI) {
+        if (rawRestore && value > 100) return MONITOR_WRITE_FAILED;
         if (captureBaseline && (!Wmi_GetBrightness(mon->wmiInstance, &baseline) || baseline > 100)) {
             Diagnostics_Monitor(mon, "ERROR", "brightness-write", "FAILED reason=WMI-baseline-unavailable");
             return MONITOR_WRITE_FAILED;
@@ -666,7 +673,7 @@ MonitorWriteOutcome Monitor_SetBrightnessForPurposeGuardedSync(
             return MONITOR_WRITE_SKIPPED;
         }
 
-        if (purpose == MONITOR_WRITE_IDLE_RELEASE) {
+        if (rawRestore) {
             if (value < mon->brightnessMin || value > mon->brightnessMax) {
                 Diagnostics_Monitor(mon, "ERROR", "brightness-write", "FAILED reason=restore-outside-range");
                 return MONITOR_WRITE_FAILED;
@@ -767,6 +774,23 @@ BOOL Monitor_SetIdleBrightness(BrightMonitor *mon, DWORD percent)
     if (!MonitorWorker_SetIdle(mon, percent)) return FALSE;
     Monitor_PreviewBrightness(mon, percent);
     return TRUE;
+}
+
+BOOL Monitor_RestoreIdleBrightness(BrightMonitor *mon)
+{
+    if (!Monitor_CanControl(mon) || !mon->idleApplied || !mon->preIdleBrightnessValid)
+        return FALSE;
+    if (MonitorWorker_Running())
+        return MonitorWorker_RestoreIdle(mon, mon->preIdleBrightness);
+    BOOL applied = Monitor_SetBrightnessForPurposeGuardedSync(mon, mon->preIdleBrightness,
+        MONITOR_WRITE_IDLE_RESTORE, 0, NULL, NULL, NULL) == MONITOR_WRITE_APPLIED;
+    if (applied) {
+        mon->idleApplied = FALSE;
+        mon->idleDimPending = FALSE;
+        mon->idleReleasePending = FALSE;
+        mon->preIdleBrightnessValid = FALSE;
+    }
+    return applied;
 }
 
 BOOL Monitor_ReleaseIdleBrightness(BrightMonitor *mon, DWORD rawBrightness, DWORD otherInput)
