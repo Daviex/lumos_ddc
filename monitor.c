@@ -315,6 +315,8 @@ static BOOL CALLBACK MonitorEnumProc(HMONITOR hMon, HDC hdcMon, LPRECT lpRect, L
             bm->hPhysical = phys[i].hPhysicalMonitor;
             bm->hasHandle = TRUE;
             bm->hMonitor = hMon;
+            bm->rangeLo = 0;     /* until Settings_ApplyRanges finds a saved one */
+            bm->rangeHi = 100;
 
             /* Try to get friendly name from EnumDisplayDevices */
             WCHAR friendly[128] = { 0 };
@@ -388,6 +390,8 @@ void Monitor_Enumerate(MonitorList *ml)
         bm->hasHandle = FALSE;
         bm->hMonitor = NULL;
         wcscpy(bm->name, L"No DDC/CI monitors found");
+        bm->rangeLo = 0;
+        bm->rangeHi = 100;
         bm->brightnessMin = 0;
         bm->brightnessCur = 0;
         bm->brightnessMax = 100;
@@ -549,7 +553,7 @@ BOOL Monitor_SetAllBrightness(MonitorList *ml, int percent)
 {
     BOOL allOk = TRUE;
     for (int i = 0; i < ml->count; i++) {
-        int adj = BrightMap_Level(percent, ml->monitors[i].delta);
+        int adj = BrightMap_Level(percent, ml->monitors[i].rangeLo, ml->monitors[i].rangeHi);
         if (!Monitor_SetBrightness(&ml->monitors[i], (DWORD)adj) && ml->monitors[i].controllable)
             allOk = FALSE;
     }

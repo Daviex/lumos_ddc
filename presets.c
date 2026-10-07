@@ -1,4 +1,5 @@
 #include "presets.h"
+#include "brightmap.h"
 #include <shlobj.h>
 #include <stdio.h>
 
@@ -60,6 +61,45 @@ void Settings_CreateDefaults(Settings *s)
         textW[k] = L'\0';
         WritePrivateProfileStringW(L"Settings", kHotkeyKeys[i], textW, s->iniPath);
     }
+}
+
+/* Read [Ranges] ("Name=lo,hi"). Without it, convert the [Deltas] offsets of
+   older versions, so an upgrade keeps the monitors matched as they were. The
+   result reaches the file on the next save. */
+static void LoadRanges(Settings *s)
+{
+    WCHAR buf[4096], val[32];
+    s->rangeCount = 0;
+    DWORD len = GetPrivateProfileStringW(L"Ranges", NULL, L"", buf, 4096, s->iniPath);
+    for (WCHAR *key = buf; len > 0 && *key && s->rangeCount < MAX_MONITORS;
+         key += wcslen(key) + 1) {
+        int lo = 0, hi = 100;
+        GetPrivateProfileStringW(L"Ranges", key, L"0,100", val, 32, s->iniPath);
+        if (swscanf(val, L"%d,%d", &lo, &hi) != 2)
+            continue;
+        BrightMap_Normalize(&lo, &hi);
+        int i = s->rangeCount++;
+        wcsncpy(s->rangeNames[i], key, 127);
+        s->rangeNames[i][127] = L'\0';
+        s->rangeLo[i] = lo;
+        s->rangeHi[i] = hi;
+        s->rangeConnected[i] = FALSE;
+    }
+    if (s->rangeCount > 0)
+        return;
+
+    int offsets[MAX_MONITORS];
+    len = GetPrivateProfileStringW(L"Deltas", NULL, L"", buf, 4096, s->iniPath);
+    for (WCHAR *key = buf; len > 0 && *key && s->rangeCount < MAX_MONITORS;
+         key += wcslen(key) + 1) {
+        GetPrivateProfileStringW(L"Deltas", key, L"0", val, 32, s->iniPath);
+        int i = s->rangeCount++;
+        wcsncpy(s->rangeNames[i], key, 127);
+        s->rangeNames[i][127] = L'\0';
+        offsets[i] = _wtoi(val);
+        s->rangeConnected[i] = FALSE;
+    }
+    BrightMap_FromOffsets(offsets, s->rangeCount, s->rangeLo, s->rangeHi);
 }
 
 void Settings_Load(Settings *s)
@@ -127,23 +167,7 @@ void Settings_Load(Settings *s)
             s->hotkeys[i] = hk;
     }
 
-    /* Load deltas */
-    s->deltaCount = 0;
-    len = GetPrivateProfileStringW(L"Deltas", NULL, L"", buf, 4096, s->iniPath);
-    if (len > 0) {
-        WCHAR *key = buf;
-        while (*key && s->deltaCount < MAX_MONITORS) {
-            GetPrivateProfileStringW(L"Deltas", key, L"0", val, 16, s->iniPath);
-            int idx = s->deltaCount;
-            wcsncpy(s->deltaNames[idx], key, 127);
-            s->deltaNames[idx][127] = L'\0';
-            s->deltaValues[idx] = _wtoi(val);
-            if (s->deltaValues[idx] < -40) s->deltaValues[idx] = -40;
-            if (s->deltaValues[idx] > 40) s->deltaValues[idx] = 40;
-            s->deltaCount++;
-            key += wcslen(key) + 1;
-        }
-    }
+    LoadRanges(s);
 
     /* Load schedule enabled flag */
     s->scheduleEnabled = (BOOL)GetPrivateProfileIntW(L"Settings", L"ScheduleEnabled", 0, s->iniPath);
@@ -209,13 +233,12 @@ void Settings_Save(Settings *s)
         WritePrivateProfileStringW(L"Settings", kHotkeyKeys[i], textW, s->iniPath);
     }
 
-    /* Save deltas */
-    WritePrivateProfileSectionW(L"Deltas", L"", s->iniPath);
-    for (int i = 0; i < s->deltaCount; i++) {
-        if (s->deltaValues[i] != 0) {
-            wsprintfW(val, L"%d", s->deltaValues[i]);
-            WritePrivateProfileStringW(L"Deltas", s->deltaNames[i], val, s->iniPath);
-        }
+    /* Rewrite [Ranges]. [Deltas] from older versions is left as it was, so
+       going back to an older build still finds its offsets. */
+    WritePrivateProfileSectionW(L"Ranges", L"", s->iniPath);
+    for (int i = 0; i < s->rangeCount; i++) {
+        wsprintfW(val, L"%d,%d", s->rangeLo[i], s->rangeHi[i]);
+        WritePrivateProfileStringW(L"Ranges", s->rangeNames[i], val, s->iniPath);
     }
 
     /* Save schedule enabled flag */
@@ -266,27 +289,56 @@ BOOL Settings_GetAutostart(void)
     return result;
 }
 
-void Settings_LoadDeltas(Settings *s, MonitorList *ml)
+/* The entry for this monitor name, added with the full range when missing.
+   Returns -1 when the table is full. */
+static int RangeEntry(Settings *s, const WCHAR *name)
 {
+    for (int i = 0; i < s->rangeCount; i++)
+        if (wcscmp(s->rangeNames[i], name) == 0)
+            return i;
+    if (s->rangeCount >= MAX_MONITORS)
+        return -1;
+    int i = s->rangeCount++;
+    wcsncpy(s->rangeNames[i], name, 127);
+    s->rangeNames[i][127] = L'\0';
+    s->rangeLo[i] = 0;
+    s->rangeHi[i] = 100;
+    s->rangeConnected[i] = FALSE;
+    return i;
+}
+
+/* Only a monitor that can be set, or is expected to answer again, has a range
+   worth keeping; the "No DDC/CI monitors found" stand-in does not. */
+static BOOL HasRange(const BrightMonitor *mon)
+{
+    return mon->controllable || mon->awaitingAnswer;
+}
+
+void Settings_ApplyRanges(Settings *s, MonitorList *ml)
+{
+    for (int i = 0; i < s->rangeCount; i++)
+        s->rangeConnected[i] = FALSE;
     for (int i = 0; i < ml->count; i++) {
-        ml->monitors[i].delta = 0;
-        for (int j = 0; j < s->deltaCount; j++) {
-            if (wcscmp(ml->monitors[i].name, s->deltaNames[j]) == 0) {
-                ml->monitors[i].delta = s->deltaValues[j];
-                break;
-            }
-        }
+        BrightMonitor *mon = &ml->monitors[i];
+        mon->rangeLo = 0;
+        mon->rangeHi = 100;
+        int e = HasRange(mon) ? RangeEntry(s, mon->name) : -1;
+        if (e < 0)
+            continue;
+        mon->rangeLo = s->rangeLo[e];
+        mon->rangeHi = s->rangeHi[e];
+        s->rangeConnected[e] = TRUE;
     }
 }
 
-void Settings_SaveDeltas(Settings *s, MonitorList *ml)
+void Settings_StoreRanges(Settings *s, const MonitorList *ml)
 {
-    s->deltaCount = 0;
-    for (int i = 0; i < ml->count && s->deltaCount < MAX_MONITORS; i++) {
-        int idx = s->deltaCount;
-        wcsncpy(s->deltaNames[idx], ml->monitors[i].name, 127);
-        s->deltaNames[idx][127] = L'\0';
-        s->deltaValues[idx] = ml->monitors[i].delta;
-        s->deltaCount++;
+    for (int i = 0; i < ml->count; i++) {
+        const BrightMonitor *mon = &ml->monitors[i];
+        int e = HasRange(mon) ? RangeEntry(s, mon->name) : -1;
+        if (e < 0)
+            continue;
+        s->rangeLo[e] = mon->rangeLo;
+        s->rangeHi[e] = mon->rangeHi;
     }
 }

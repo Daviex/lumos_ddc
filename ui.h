@@ -54,9 +54,10 @@ void UI_RefreshPopup(HWND hwnd, MonitorList *ml);
    already reports the change. */
 void UI_ShowOSD(HINSTANCE hInst, HMONITOR hMon, int percent, BOOL announce);
 
-/* Set callback invoked when delta buttons are clicked (for saving to INI) */
-typedef void (*DeltaSaveCallback)(void);
-void UI_SetDeltaSaveCallback(DeltaSaveCallback cb);
+/* Called when the -/+ buttons of a monitor change its range (the level at
+   All Monitors 100%), with the popup's All Monitors level. */
+typedef void (*RangeChangeCallback)(int masterLevel);
+void UI_SetRangeChangeCallback(RangeChangeCallback cb);
 
 /* Called when the user manually changes brightness via the popup slider,
    so the schedule can suspend itself. masterLevel is the All Monitors level

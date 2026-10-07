@@ -20,9 +20,13 @@ typedef struct {
     int    presetCount;
     int    step;       /* brightness step for hotkeys and mouse wheel (default 5) */
     BOOL   autostart;
-    int    deltaCount;
-    WCHAR  deltaNames[MAX_MONITORS][128];
-    int    deltaValues[MAX_MONITORS];
+    /* Per-monitor ranges by monitor name, from [Ranges]. rangeConnected marks
+       the entries whose monitor is in the current list (Settings_ApplyRanges). */
+    int    rangeCount;
+    WCHAR  rangeNames[MAX_MONITORS][128];
+    int    rangeLo[MAX_MONITORS];
+    int    rangeHi[MAX_MONITORS];
+    BOOL   rangeConnected[MAX_MONITORS];
     SchedulePoint schedule[MAX_SCHEDULE];
     int           scheduleCount;
     BOOL          scheduleEnabled;
@@ -48,10 +52,12 @@ void Settings_CreateDefaults(Settings *s);
 void Settings_SetAutostart(BOOL enable);
 BOOL Settings_GetAutostart(void);
 
-/* Load delta values from settings into monitors (match by name) */
-void Settings_LoadDeltas(Settings *s, MonitorList *ml);
+/* Give every monitor its saved range (matched by name). A monitor without one
+   gets the full range and an entry, so the Settings window can list it. */
+void Settings_ApplyRanges(Settings *s, MonitorList *ml);
 
-/* Copy current monitor deltas into settings for saving */
-void Settings_SaveDeltas(Settings *s, MonitorList *ml);
+/* Copy the monitors' ranges into the settings for saving. Entries of monitors
+   that are not connected are kept. */
+void Settings_StoreRanges(Settings *s, const MonitorList *ml);
 
 #endif /* PRESETS_H */

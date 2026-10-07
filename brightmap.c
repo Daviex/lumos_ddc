@@ -5,33 +5,42 @@ static int Clamp(int v, int lo, int hi)
     return v < lo ? lo : (v > hi ? hi : v);
 }
 
-/* The level of the middle point of the curve. The offset bound keeps it inside
-   10..90, so neither segment is flat and the inverse never divides by zero. */
-static int MidLevel(int offset)
-{
-    return 50 + Clamp(offset, -BRIGHTMAP_OFFSET_MAX, BRIGHTMAP_OFFSET_MAX);
-}
-
 /* a * b / c rounded to the nearest integer, for non-negative a, b and positive c. */
 static int MulDivRound(int a, int b, int c)
 {
     return (a * b + c / 2) / c;
 }
 
-int BrightMap_Level(int master, int offset)
+void BrightMap_Normalize(int *lo, int *hi)
 {
-    int m = Clamp(master, 0, 100);
-    int mid = MidLevel(offset);
-    if (m <= 50)
-        return MulDivRound(m, mid, 50);
-    return mid + MulDivRound(m - 50, 100 - mid, 50);
+    *hi = Clamp(*hi, BRIGHTMAP_MIN_SPAN, 100);
+    *lo = Clamp(*lo, 0, *hi - BRIGHTMAP_MIN_SPAN);
 }
 
-int BrightMap_Master(int level, int offset)
+int BrightMap_Level(int master, int lo, int hi)
 {
-    int l = Clamp(level, 0, 100);
-    int mid = MidLevel(offset);
-    if (l <= mid)
-        return MulDivRound(l, 50, mid);
-    return 50 + MulDivRound(l - mid, 50, 100 - mid);
+    BrightMap_Normalize(&lo, &hi);
+    return lo + MulDivRound(Clamp(master, 0, 100), hi - lo, 100);
+}
+
+int BrightMap_Master(int level, int lo, int hi)
+{
+    BrightMap_Normalize(&lo, &hi);
+    return MulDivRound(Clamp(level, lo, hi) - lo, 100, hi - lo);
+}
+
+void BrightMap_FromOffsets(const int *offsets, int count, int *lo, int *hi)
+{
+    int minOff = 0, maxOff = 0;
+    for (int i = 0; i < count; i++) {
+        int d = Clamp(offsets[i], -40, 40);
+        if (d < minOff) minOff = d;
+        if (d > maxOff) maxOff = d;
+    }
+    /* Offsets span at most 80 points, so the width never drops below 20. */
+    int span = 100 - (maxOff - minOff);
+    for (int i = 0; i < count; i++) {
+        lo[i] = Clamp(offsets[i], -40, 40) - minOff;
+        hi[i] = lo[i] + span;
+    }
 }

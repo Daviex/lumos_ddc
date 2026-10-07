@@ -155,10 +155,19 @@ static int  MasterTargetFromMonitors(void);
 static void Idle_Tick(void);
 static void Idle_Restore(void);
 
-static void SaveDeltasCallback(void)
+/* A monitor's range changed in the popup. Save it, then put every monitor
+   back on the current master level so the change shows at once: matching two
+   monitors means adjusting one while looking at both. masterLevel is the
+   popup's All Monitors level, used when no level has been set yet. */
+static void RangeChanged(int masterLevel)
 {
-    Settings_SaveDeltas(&g_settings, &g_monitors);
+    Settings_StoreRanges(&g_settings, &g_monitors);
     Settings_Save(&g_settings);
+    if (g_idleDimmed)
+        return;   /* the idle level owns the monitors; the restore uses the new range */
+    if (g_masterTarget < 0)
+        g_masterTarget = masterLevel;
+    Monitor_SetAllBrightness(&g_monitors, g_masterTarget);
 }
 
 /* ---- Entry Point ---- */
@@ -199,7 +208,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdLineA, int showCmd
     memset(&g_monitors, 0, sizeof(g_monitors));
     Monitor_Enumerate(&g_monitors);
     Settings_Init(&g_settings);
-    Settings_LoadDeltas(&g_settings, &g_monitors);
+    Settings_ApplyRanges(&g_settings, &g_monitors);
 
     if (!UI_Init(hInst)) {
         MessageBoxW(NULL, L"Failed to initialize UI", APP_NAME, MB_ICONERROR);
@@ -230,7 +239,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdLineA, int showCmd
 
     /* Create popup (hidden) */
     g_hwndPopup = UI_CreatePopup(hInst, &g_monitors);
-    UI_SetDeltaSaveCallback(SaveDeltasCallback);
+    UI_SetRangeChangeCallback(RangeChanged);
     static const HotkeyHost hotkeyHost = { ApplyHotkeys, SuspendHotkeys, FirstFailedHotkey };
     UI_SetHotkeyHost(&hotkeyHost);
     Remote_Init(&kAppControl);
@@ -524,7 +533,7 @@ static int MasterTargetFromMonitors(void)
     for (int i = 0; i < g_monitors.count; i++) {
         BrightMonitor *mon = &g_monitors.monitors[i];
         if (!mon->controllable) continue;
-        sum += BrightMap_Master(Monitor_GetPercent(mon), mon->delta);
+        sum += BrightMap_Master(Monitor_GetPercent(mon), mon->rangeLo, mon->rangeHi);
         cnt++;
     }
     return cnt > 0 ? sum / cnt : 50;
@@ -562,19 +571,13 @@ static void StepWithOsd(int delta)
 {
     StepMaster(delta);
 
-    /* Show OSD on primary monitor (where cursor is) */
+    /* The OSD shows the All Monitors level, the value the step just moved.
+       The level of the monitor under the cursor stops at the ends of that
+       monitor's range (50% for a range of 50-100) and looks stuck there. */
     POINT curPos;
     GetCursorPos(&curPos);
     HMONITOR hCurMon = MonitorFromPoint(curPos, MONITOR_DEFAULTTOPRIMARY);
-    /* Find matching monitor for percentage display, fallback to first */
-    int pct = 50;
-    for (int i = 0; i < g_monitors.count; i++) {
-        if (g_monitors.monitors[i].hMonitor == hCurMon && g_monitors.monitors[i].controllable) {
-            pct = Monitor_GetPercent(&g_monitors.monitors[i]);
-            break;
-        }
-    }
-    UI_ShowOSD(g_hInst, hCurMon, pct, !UI_IsPopupVisible(g_hwndPopup));
+    UI_ShowOSD(g_hInst, hCurMon, g_masterTarget, !UI_IsPopupVisible(g_hwndPopup));
 }
 
 static void HandleHotkey(int id)
@@ -1084,6 +1087,11 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
             if (Settings_GetAutostart() != g_settings.autostart)
                 Settings_SetAutostart(g_settings.autostart);
             Settings_Save(&g_settings);
+            /* A changed low end takes effect at the current level now. */
+            Settings_ApplyRanges(&g_settings, &g_monitors);
+            if (!g_idleDimmed && g_masterTarget >= 0)
+                Monitor_SetAllBrightness(&g_monitors, g_masterTarget);
+            UI_RefreshPopup(g_hwndPopup, &g_monitors);
             if (!g_settings.idleDimEnabled)
                 Idle_Restore();           /* undo an active dim right away */
             g_scheduleSuspended = FALSE;  /* a schedule toggle takes effect now */
@@ -1242,7 +1250,7 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
                   Monitor_CleanupExcept(&g_monitors, fresh));
             g_monitors = *fresh;            /* adopt fresh list (plain struct copy) */
             free(fresh);
-            Settings_LoadDeltas(&g_settings, &g_monitors);
+            Settings_ApplyRanges(&g_settings, &g_monitors);
             g_hwndPopup = UI_CreatePopup(g_hInst, &g_monitors);
             /* g_idleDimmed is included so a monitor plugged in during an idle
                stretch gets the idle level too, instead of staying bright. */

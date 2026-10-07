@@ -23,7 +23,8 @@ typedef struct {
     DWORD    brightnessMax;
     BOOL     controllable; /* TRUE if brightness is settable via any backend */
     BOOL     hasHandle;    /* TRUE if hPhysical is valid (can be 0!) */
-    int      delta;        /* per-monitor brightness offset, -40..+40 */
+    int      rangeLo;      /* level at All Monitors 0% (see brightmap.h) */
+    int      rangeHi;      /* level at All Monitors 100% */
     MonitorBackend backend;
     WCHAR    wmiInstance[256]; /* WMI InstanceName when backend == BACKEND_WMI */
     BOOL     awaitingAnswer;   /* was controllable on an earlier scan, does not answer now */
@@ -70,7 +71,7 @@ BOOL Monitor_HasControllable(const MonitorList *ml);
    *recovered when a monitor that was waiting answers again. */
 int Monitor_TrackUnanswered(MonitorList *fresh, const MonitorList *prev, BOOL *recovered);
 
-/* Set all monitors from an All Monitors level (0-100), each through its offset
+/* Set all monitors from an All Monitors level (0-100), each through its range
    (see brightmap.h). Returns FALSE when a controllable monitor refused the write (a stale DDC
    handle after sleep, for example). */
 BOOL Monitor_SetAllBrightness(MonitorList *ml, int percent);

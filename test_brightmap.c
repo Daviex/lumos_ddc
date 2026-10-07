@@ -9,51 +9,78 @@ int main(void)
 {
     char msg[128];
 
-    /* The example from the design: laptop +10, Dell -30 */
-    CHECK(BrightMap_Level(100, 10) == 100 && BrightMap_Level(100, -30) == 100, "both reach 100");
-    CHECK(BrightMap_Level(95, 10) == 96 && BrightMap_Level(95, -30) == 92, "first step down moves both");
-    CHECK(BrightMap_Level(90, 10) == 92 && BrightMap_Level(90, -30) == 84, "master 90");
-    CHECK(BrightMap_Level(50, 10) == 60 && BrightMap_Level(50, -30) == 20, "full offset at 50");
-    CHECK(BrightMap_Level(0, 10) == 0 && BrightMap_Level(0, -30) == 0, "both reach 0");
+    /* The example from the design: laptop 40-100, Dell 0-60 */
+    CHECK(BrightMap_Level(100, 40, 100) == 100 && BrightMap_Level(100, 0, 60) == 60, "top");
+    CHECK(BrightMap_Level(75, 40, 100) == 85 && BrightMap_Level(75, 0, 60) == 45, "75");
+    CHECK(BrightMap_Level(50, 40, 100) == 70 && BrightMap_Level(50, 0, 60) == 30, "50");
+    CHECK(BrightMap_Level(0, 40, 100) == 40 && BrightMap_Level(0, 0, 60) == 0, "bottom");
 
-    /* No offset is the identity in both directions */
+    /* The default range is the identity in both directions */
     for (int m = 0; m <= 100; m++) {
         snprintf(msg, sizeof(msg), "identity at %d", m);
-        CHECK(BrightMap_Level(m, 0) == m && BrightMap_Master(m, 0) == m, msg);
+        CHECK(BrightMap_Level(m, 0, 100) == m && BrightMap_Master(m, 0, 100) == m, msg);
     }
 
     /* Out-of-range input is clamped */
-    CHECK(BrightMap_Level(130, -30) == 100 && BrightMap_Level(-10, 10) == 0, "master clamped");
-    CHECK(BrightMap_Level(50, 90) == 90 && BrightMap_Level(50, -90) == 10, "offset clamped to 40");
-    CHECK(BrightMap_Master(120, 10) == 100 && BrightMap_Master(-5, 10) == 0, "level clamped");
+    CHECK(BrightMap_Level(130, 0, 60) == 60 && BrightMap_Level(-10, 40, 100) == 40, "master clamped");
+    CHECK(BrightMap_Master(80, 0, 60) == 100 && BrightMap_Master(10, 40, 100) == 0, "level outside the range");
 
-    for (int off = -BRIGHTMAP_OFFSET_MAX; off <= BRIGHTMAP_OFFSET_MAX; off++) {
-        /* Ends are fixed, the curve never goes down, and it rises on every
-           master step of 5 (the default step), so no step is dead. */
-        snprintf(msg, sizeof(msg), "ends fixed, offset %d", off);
-        CHECK(BrightMap_Level(0, off) == 0 && BrightMap_Level(100, off) == 100, msg);
-        for (int m = 1; m <= 100; m++) {
-            snprintf(msg, sizeof(msg), "monotonic, offset %d master %d", off, m);
-            CHECK(BrightMap_Level(m, off) >= BrightMap_Level(m - 1, off), msg);
-        }
-        for (int m = 5; m <= 100; m += 5) {
-            snprintf(msg, sizeof(msg), "step of 5 moves, offset %d master %d", off, m);
-            CHECK(BrightMap_Level(m, off) > BrightMap_Level(m - 5, off), msg);
-        }
+    /* Normalize keeps the range inside 0-100 and at least the minimum width */
+    int lo, hi;
+    lo = 70; hi = 80;  BrightMap_Normalize(&lo, &hi);
+    CHECK(lo == 60 && hi == 80, "narrow range: low end gives way");
+    lo = 0; hi = 5;    BrightMap_Normalize(&lo, &hi);
+    CHECK(lo == 0 && hi == BRIGHTMAP_MIN_SPAN, "high end below the minimum width");
+    lo = -10; hi = 140; BrightMap_Normalize(&lo, &hi);
+    CHECK(lo == 0 && hi == 100, "range clamped to 0-100");
 
-        /* The inverse lands on a master level that maps back to the same
-           monitor level, give or take one for rounding. */
-        for (int l = 0; l <= 100; l++) {
-            int back = BrightMap_Level(BrightMap_Master(l, off), off);
-            snprintf(msg, sizeof(msg), "inverse, offset %d level %d -> %d", off, l, back);
-            CHECK(abs(back - l) <= 1, msg);
-        }
-        for (int m = 0; m <= 100; m++) {
-            int back = BrightMap_Master(BrightMap_Level(m, off), off);
-            /* A flat segment (slope 1/5 at offset -40) maps up to 3 master
-               levels onto one monitor level, so the round trip can be off by 2. */
-            snprintf(msg, sizeof(msg), "round trip, offset %d master %d -> %d", off, m, back);
-            CHECK(abs(back - m) <= 2, msg);
+    /* Old offsets: laptop +10 and Dell -30 become 40-100 and 0-60 */
+    int offs[3] = { 10, -30, 0 }, los[3], his[3];
+    BrightMap_FromOffsets(offs, 3, los, his);
+    CHECK(los[0] == 40 && his[0] == 100, "laptop from +10");
+    CHECK(los[1] == 0 && his[1] == 60, "Dell from -30");
+    CHECK(los[2] == 30 && his[2] == 90, "offset 0 in between");
+    /* The relation between the monitors is kept at every master level */
+    for (int m = 0; m <= 100; m += 5) {
+        snprintf(msg, sizeof(msg), "matched like the offsets at %d", m);
+        CHECK(BrightMap_Level(m, los[0], his[0]) - BrightMap_Level(m, los[1], his[1]) == 40, msg);
+    }
+    /* A lone negative offset still counts against the implicit 0 */
+    int one = -30;
+    BrightMap_FromOffsets(&one, 1, los, his);
+    CHECK(los[0] == 0 && his[0] == 70, "lone offset -30");
+    /* The widest spread still leaves the minimum width */
+    int wide[2] = { 40, -40 };
+    BrightMap_FromOffsets(wide, 2, los, his);
+    CHECK(his[0] - los[0] == BRIGHTMAP_MIN_SPAN && his[1] == BRIGHTMAP_MIN_SPAN, "widest spread");
+
+    for (lo = 0; lo <= 100 - BRIGHTMAP_MIN_SPAN; lo += 5) {
+        for (hi = lo + BRIGHTMAP_MIN_SPAN; hi <= 100; hi += 5) {
+            /* Ends are fixed, every master step of 5 moves the monitor, and
+               the curve never goes down. */
+            snprintf(msg, sizeof(msg), "ends, range %d-%d", lo, hi);
+            CHECK(BrightMap_Level(0, lo, hi) == lo && BrightMap_Level(100, lo, hi) == hi, msg);
+            for (int m = 5; m <= 100; m += 5) {
+                snprintf(msg, sizeof(msg), "step of 5 moves, range %d-%d master %d", lo, hi, m);
+                CHECK(BrightMap_Level(m, lo, hi) > BrightMap_Level(m - 5, lo, hi), msg);
+            }
+            for (int m = 1; m <= 100; m++) {
+                snprintf(msg, sizeof(msg), "monotonic, range %d-%d master %d", lo, hi, m);
+                CHECK(BrightMap_Level(m, lo, hi) >= BrightMap_Level(m - 1, lo, hi), msg);
+            }
+            /* Reading a level back gives a master level that maps to it again,
+               and a master level survives the round trip within rounding (a
+               range of 20 maps 5 master levels onto one monitor level). */
+            for (int l = lo; l <= hi; l++) {
+                int back = BrightMap_Level(BrightMap_Master(l, lo, hi), lo, hi);
+                snprintf(msg, sizeof(msg), "inverse, range %d-%d level %d -> %d", lo, hi, l, back);
+                CHECK(back == l, msg);
+            }
+            for (int m = 0; m <= 100; m++) {
+                int back = BrightMap_Master(BrightMap_Level(m, lo, hi), lo, hi);
+                snprintf(msg, sizeof(msg), "round trip, range %d-%d master %d -> %d", lo, hi, m, back);
+                CHECK(abs(back - m) <= 3, msg);
+            }
         }
     }
 

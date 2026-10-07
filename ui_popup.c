@@ -36,11 +36,12 @@ static int GetMonPercent(BrightMonitor *mon)
 
 static int GetMasterPercent(MonitorList *ml)
 {
-    /* Map each reading back through its offset and average the results */
+    /* Map each reading back through its range and average the results */
     int sum = 0, cnt = 0;
     for (int i = 0; i < ml->count; i++) {
         if (ml->monitors[i].controllable) {
-            sum += BrightMap_Master(GetMonPercent(&ml->monitors[i]), ml->monitors[i].delta);
+            BrightMonitor *mon = &ml->monitors[i];
+            sum += BrightMap_Master(GetMonPercent(mon), mon->rangeLo, mon->rangeHi);
             cnt++;
         }
     }
@@ -50,14 +51,13 @@ static int GetMasterPercent(MonitorList *ml)
 /* Forward declarations for layout helpers */
 static void GetSliderRect(int row, RECT *rc);
 
-/* ---- Callback for saving deltas from UI ---- */
+/* ---- Callback for range changes from the UI ---- */
 
-typedef void (*DeltaSaveCallback)(void);
-static DeltaSaveCallback g_deltaSaveCb = NULL;
+static RangeChangeCallback g_rangeChangeCb = NULL;
 
-void UI_SetDeltaSaveCallback(DeltaSaveCallback cb)
+void UI_SetRangeChangeCallback(RangeChangeCallback cb)
 {
-    g_deltaSaveCb = cb;
+    g_rangeChangeCb = cb;
 }
 
 static ManualChangeCallback g_manualChangeCb = NULL;
@@ -213,8 +213,8 @@ static void PopupA11yDescribe(void *ctx, int index, A11yItem *out)
 
     if (ItemIsOffset(pd, index)) {
         out->role = ROLE_SYSTEM_SPINBUTTON;
-        _snwprintf(out->name, 159, L"%s offset", mon->name);
-        _snwprintf(out->value, 63, L"%+d", mon->delta);
+        _snwprintf(out->name, 159, L"%s maximum", mon->name);
+        _snwprintf(out->value, 63, L"%d%%", mon->rangeHi);
     } else {
         out->role = ROLE_SYSTEM_SLIDER;
         if (isMaster)
@@ -361,17 +361,11 @@ static void RenderPopup(HWND hwnd, PopupData *pd)
             DrawTextW(dc, L"\x2013", -1, &rcMinus, DT_CENTER | DT_VCENTER | DT_SINGLELINE); /* en dash as minus */
             DrawTextW(dc, L"+", -1, &rcPlus, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
 
-            /* Delta value */
-            WCHAR deltaStr[16];
-            int d = ml->monitors[row].delta;
-            if (d > 0)
-                wsprintfW(deltaStr, L"\x25B3+%d", d);
-            else if (d < 0)
-                wsprintfW(deltaStr, L"\x25B3%d", d);
-            else
-                wsprintfW(deltaStr, L"\x25B3 0");
+            /* The monitor's level at All Monitors 100% */
+            WCHAR maxStr[16];
+            wsprintfW(maxStr, L"Max %d%%", ml->monitors[row].rangeHi);
             SetTextColor(dc, HexToColorRef(CLR_SUBTEXT));
-            DrawTextW(dc, deltaStr, -1, &rcValue, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+            DrawTextW(dc, maxStr, -1, &rcValue, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
         }
     }
 
@@ -484,15 +478,18 @@ static void EndKeyDrag(HWND hwnd, PopupData *pd)
     RenderPopup(hwnd, pd);
 }
 
-static void AdjustOffset(HWND hwnd, PopupData *pd, int row, int value)
+/* Set a monitor's level at All Monitors 100%. The low end comes from
+   Settings, and the range keeps its minimum width. */
+static void AdjustMax(HWND hwnd, PopupData *pd, int row, int value)
 {
     BrightMonitor *mon = &pd->ml->monitors[row];
-    if (value < -40) value = -40;
-    if (value > 40) value = 40;
-    if (value == mon->delta)
+    int lo = mon->rangeLo;
+    if (value < lo + BRIGHTMAP_MIN_SPAN) value = lo + BRIGHTMAP_MIN_SPAN;
+    if (value > 100) value = 100;
+    if (value == mon->rangeHi)
         return;
-    mon->delta = value;
-    if (g_deltaSaveCb) g_deltaSaveCb();
+    mon->rangeHi = value;
+    if (g_rangeChangeCb) g_rangeChangeCb(pd->masterPercent);
     RenderPopup(hwnd, pd);
     A11y_NotifyValue(hwnd, pd->focusItem);
 }
@@ -532,12 +529,12 @@ static void PopupKeyDown(HWND hwnd, PopupData *pd, WPARAM vk)
     }
 
     if (ItemIsOffset(pd, item)) {
-        int d = pd->ml->monitors[row].delta;
+        int v = pd->ml->monitors[row].rangeHi;
         if (limit)
-            d = (limit > 0) ? 40 : -40;
+            v = (limit > 0) ? 100 : 0;   /* AdjustMax raises 0 to the lowest allowed */
         else
-            d += dir + page * 5;
-        AdjustOffset(hwnd, pd, row, d);
+            v += dir + page * 5;
+        AdjustMax(hwnd, pd, row, v);
         return;
     }
 
@@ -618,12 +615,7 @@ static LRESULT CALLBACK PopupWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
         if (deltaDir != 0 && deltaRow >= 0) {
             EndKeyDrag(hwnd, pd);
             pd->focusItem = deltaRow * 2 + 1;
-            BrightMonitor *mon = &pd->ml->monitors[deltaRow];
-            mon->delta += deltaDir;
-            if (mon->delta < -40) mon->delta = -40;
-            if (mon->delta > 40) mon->delta = 40;
-            if (g_deltaSaveCb) g_deltaSaveCb();
-            RenderPopup(hwnd, pd);
+            AdjustMax(hwnd, pd, deltaRow, pd->ml->monitors[deltaRow].rangeHi + deltaDir);
             return 0;
         }
 

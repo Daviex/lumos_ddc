@@ -48,7 +48,7 @@ Windows can dim a laptop panel, but it will not touch the brightness of external
 | Global hotkeys | No | Yes, configurable |
 | Keyboard and screen reader access | n/a | Yes |
 | Mouse-wheel over tray icon | No | Yes |
-| Per-monitor offset (delta) | No | Yes |
+| Per-monitor brightness range | No | Yes |
 | Time-of-day brightness schedule | No | Yes |
 | Presets | No | Yes |
 | Footprint | n/a | One ~480 KB exe, no deps |
@@ -56,7 +56,7 @@ Windows can dim a laptop panel, but it will not touch the brightness of external
 ## Screenshots
 
 <p align="center">
-  <img src="screenshots/01-popup.png" width="320" alt="Brightness popup: per-monitor slider, delta buttons, and All Monitors master" />
+  <img src="screenshots/01-popup.png" width="320" alt="Brightness popup: per-monitor slider, range buttons, and All Monitors master" />
   &nbsp;&nbsp;
   <img src="screenshots/02-context-menu.png" width="250" alt="Dark context menu: presets, schedule, autostart, About" />
 </p>
@@ -71,7 +71,7 @@ Windows can dim a laptop panel, but it will not touch the brightness of external
 - **Global hotkeys** - `Ctrl+Win+Up` / `Ctrl+Win+Down` change brightness on all screens, and `Ctrl+Win+B` opens the popup. All three can be changed in the Settings window. An existing installation that is upgraded keeps `Ctrl+Alt+Up` / `Ctrl+Alt+Down`.
 - **Keyboard and screen reader access** - The tray icon, the popup, the menu, Settings and About work entirely from the keyboard, and screen readers such as NVDA and Narrator read every control. With NVDA, a hotkey or tray-wheel change is spoken ("Brightness 45%") even while another application has the focus.
 - **Mouse wheel on the tray icon** - Scroll over the tray icon to nudge brightness up or down.
-- **Per-monitor delta** - Offset an individual monitor (-40..+40) so mismatched panels line up under the master slider. The offset applies in full at mid brightness and tapers off towards 0% and 100%, so every monitor still reaches both ends and every step moves every monitor.
+- **Per-monitor range** - Each monitor has a minimum and a maximum: its level when All Monitors is at 0% and at 100%. All Monitors moves every monitor linearly across its own range, so two monitors matched at both ends stay matched in between and every step moves every monitor. Set the maximum with the `-` / `+` on the monitor's row in the popup and the minimum in Settings. Offsets from older versions are converted on the first start.
 - **Brightness schedule** - Optional time-of-day schedule that smoothly ramps brightness across the day (piecewise-linear, wraps around midnight). A manual change suspends it until the next anchor.
 - **Idle auto-dim** - Optional. After a configurable idle period (default 5 minutes) the brightness drops to a configurable low level (default 5%), and it returns to the previous level as soon as you touch the keyboard or the mouse. Fullscreen video, presentation mode and live calls are skipped, so a movie you are watching or a Teams call you are sitting through without touching anything is not dimmed. Calls are detected by the microphone or the camera being in use, not by the name of the application, so any conferencing tool counts.
 - **Presets** - Night, Day, and Presentation, with editable brightness values.
@@ -132,7 +132,7 @@ build.bat debug      :: debug build, logs to %APPDATA%\Lumos\lumos-*.log
 | `Ctrl+Win+Up` / `Ctrl+Win+Down` | Brightness up / down on all monitors |
 | `Ctrl+Win+B` | Open the brightness popup with keyboard focus |
 | Drag a slider in the popup | Set that monitor; drag the master slider for all at once |
-| Click the `-` / `+` on a monitor row | Adjust that monitor's delta offset |
+| Click the `-` / `+` on a monitor row | Adjust that monitor's maximum (its level at All Monitors 100%) |
 
 ## Keyboard and screen readers
 
@@ -142,7 +142,7 @@ To reach the tray icon, press `Win+B` and move to the Lumos icon with the arrow 
 
 | Window | Keys |
 |---|---|
-| Popup | `Tab` / `Shift+Tab` move between sliders and offsets. The arrow keys change the value by 1 (`Up` and `Right` raise it), `Page Up` / `Page Down` by 10, and `Home` / `End` jump to the limits. `Esc` closes. |
+| Popup | `Tab` / `Shift+Tab` move between sliders and monitor maximums. The arrow keys change the value by 1 (`Up` and `Right` raise it), `Page Up` / `Page Down` by 10, and `Home` / `End` jump to the limits. `Esc` closes. |
 | Context menu | `Up` / `Down` move, `Home` / `End` jump to the first or last item, a letter jumps to the next item that starts with it, `Enter` or `Space` chooses, and `Esc` closes. |
 | Settings | `Tab`, `Shift+Tab`, `Up` and `Down` move between rows and the Save button. `Left` / `Right` change a number or flip a switch, and `Space` flips a switch. `Enter` on a hotkey row starts recording a new combination, and anywhere else it saves. `Esc` closes without saving. |
 | About | `Enter` opens the project page and `Esc` closes. |
@@ -156,7 +156,7 @@ When a hotkey or the mouse wheel changes the brightness, the on-screen display a
 `lumosctl.exe` controls the running Lumos from a terminal, a script or a shortcut. Put it next to `lumos.exe` or anywhere on your `PATH`. It talks to Lumos, so Lumos has to be running.
 
 ```
-lumosctl --set 40                 all monitors to 40%, each keeping its offset
+lumosctl --set 40                 all monitors to 40%, each within its range
 lumosctl --up                     one brightness step up (--down for down)
 lumosctl --down 10                10% down
 lumosctl --get                    print the current levels

@@ -57,9 +57,9 @@ static void SayList(Reply *r, MonitorList *ml)
             Say(r, L"%d. %ls (unavailable)\n", i + 1, mon->name);
             continue;
         }
-        Say(r, L"%d. %ls (%ls, %d%%, offset %+d)\n", i + 1, mon->name,
+        Say(r, L"%d. %ls (%ls, %d%%, range %d-%d%%)\n", i + 1, mon->name,
             mon->backend == BACKEND_WMI ? L"WMI" : L"DDC/CI",
-            Monitor_GetPercent(mon), mon->delta);
+            Monitor_GetPercent(mon), mon->rangeLo, mon->rangeHi);
     }
 }
 
