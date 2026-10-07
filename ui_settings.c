@@ -40,7 +40,7 @@ typedef struct {
     int   idleDimMinutes;
     int   presetValues[MAX_PRESETS];
     int   presetCount;
-    int   rangeLo[MAX_MONITORS];   /* per Settings range entry */
+    int   rangeLo[MAX_RANGES];     /* per Settings range entry */
     int   rangeCount;              /* entries when the window opened; a rescan may add more */
     Hotkey hotkeys[HOTKEY_COUNT];
 

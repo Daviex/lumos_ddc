@@ -856,6 +856,21 @@ static void ReapplyBrightness(void)
     }
 }
 
+/* Put the monitors in mask (bit i = monitor i) on the current All Monitors
+   level, leaving the others alone. Skipped when no level has been set yet. */
+static void ApplyMasterTo(unsigned mask)
+{
+    if (g_masterTarget < 0)
+        return;
+    for (int i = 0; i < g_monitors.count; i++) {
+        BrightMonitor *mon = &g_monitors.monitors[i];
+        if (mask & (1u << i))
+            Monitor_SetBrightness(mon, (DWORD)BrightMap_Level(g_masterTarget,
+                                                               mon->rangeLo, mon->rangeHi));
+    }
+    UI_RefreshPopup(g_hwndPopup, &g_monitors);
+}
+
 /* A manual brightness change: hand control back to the user until the next anchor. */
 static void Schedule_Suspend(void)
 {
@@ -1087,11 +1102,24 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
             if (Settings_GetAutostart() != g_settings.autostart)
                 Settings_SetAutostart(g_settings.autostart);
             Settings_Save(&g_settings);
-            /* A changed low end takes effect at the current level now. */
+            /* A changed minimum takes effect at the current level now. Only
+               then: re-applying on every Save would also undo a level the user
+               set on one monitor alone, when all they changed was a hotkey.
+               The level is read through the old ranges, before they change. */
+            int oldLo[MAX_MONITORS];
+            for (int i = 0; i < g_monitors.count; i++)
+                oldLo[i] = g_monitors.monitors[i].rangeLo;
+            int level = (g_masterTarget >= 0) ? g_masterTarget : MasterTargetFromMonitors();
             Settings_ApplyRanges(&g_settings, &g_monitors);
-            if (!g_idleDimmed && g_masterTarget >= 0)
+            BOOL minChanged = FALSE;
+            for (int i = 0; i < g_monitors.count; i++)
+                if (g_monitors.monitors[i].rangeLo != oldLo[i])
+                    minChanged = TRUE;
+            if (minChanged && !g_idleDimmed) {
+                g_masterTarget = level;
                 Monitor_SetAllBrightness(&g_monitors, g_masterTarget);
-            UI_RefreshPopup(g_hwndPopup, &g_monitors);
+                UI_RefreshPopup(g_hwndPopup, &g_monitors);
+            }
             if (!g_settings.idleDimEnabled)
                 Idle_Restore();           /* undo an active dim right away */
             g_scheduleSuspended = FALSE;  /* a schedule toggle takes effect now */
@@ -1234,7 +1262,7 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
         g_rescanRetry = 0;
 
         if (fresh) {
-            BOOL recovered;
+            unsigned recovered;
             int waiting = Monitor_TrackUnanswered(fresh, &g_monitors, &recovered);
 
             /* Release the handles we are replacing, except any the fresh list
@@ -1254,12 +1282,15 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
             g_hwndPopup = UI_CreatePopup(g_hInst, &g_monitors);
             /* g_idleDimmed is included so a monitor plugged in during an idle
                stretch gets the idle level too, instead of staying bright. */
-            /* A monitor that answers again after a wake missed the restore
-               that ran without it, so it gets the level now. */
-            if (g_reapplyOnRescan || g_idleDimmed || recovered) {
+            if (g_reapplyOnRescan || g_idleDimmed) {
                 g_reapplyOnRescan = FALSE;
                 /* restore our level after wake/unlock/display-on */
                 TIMED("rescan done: ReapplyBrightness", ReapplyBrightness());
+            } else if (recovered) {
+                /* A monitor that answers again missed the restore that ran
+                   without it. Only that monitor gets the level, so a level the
+                   user set on another monitor alone is left as it is. */
+                ApplyMasterTo(recovered);
             }
 
             if (waiting > 0) {

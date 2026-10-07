@@ -7,6 +7,10 @@
 #include "hotkey.h"
 
 #define MAX_PRESETS 10
+
+/* Range entries outlive the monitors they belong to (a dock at work, a TV at
+   home), so the table holds more names than can be connected at once. */
+#define MAX_RANGES  32
 #define MAX_PRESET_NAME 64
 
 typedef struct {
@@ -20,13 +24,16 @@ typedef struct {
     int    presetCount;
     int    step;       /* brightness step for hotkeys and mouse wheel (default 5) */
     BOOL   autostart;
-    /* Per-monitor ranges by monitor name, from [Ranges]. rangeConnected marks
-       the entries whose monitor is in the current list (Settings_ApplyRanges). */
+    /* Per-monitor ranges from [Ranges], keyed by monitor name (a second
+       monitor with the same name gets " #2", and so on). rangeConnected marks
+       the entries whose monitor is in the current list (Settings_ApplyRanges).
+       rangeNewLo/Hi is the range a monitor without an entry starts with. */
     int    rangeCount;
-    WCHAR  rangeNames[MAX_MONITORS][128];
-    int    rangeLo[MAX_MONITORS];
-    int    rangeHi[MAX_MONITORS];
-    BOOL   rangeConnected[MAX_MONITORS];
+    WCHAR  rangeNames[MAX_RANGES][136];
+    int    rangeLo[MAX_RANGES];
+    int    rangeHi[MAX_RANGES];
+    BOOL   rangeConnected[MAX_RANGES];
+    int    rangeNewLo, rangeNewHi;
     SchedulePoint schedule[MAX_SCHEDULE];
     int           scheduleCount;
     BOOL          scheduleEnabled;

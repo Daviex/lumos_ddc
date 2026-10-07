@@ -529,19 +529,47 @@ static const BrightMonitor *FindPrevious(const MonitorList *prev,
     return NULL;
 }
 
-int Monitor_TrackUnanswered(MonitorList *fresh, const MonitorList *prev, BOOL *recovered)
+int Monitor_TrackUnanswered(MonitorList *fresh, const MonitorList *prev, unsigned *recovered)
 {
+    const BrightMonitor *match[MAX_MONITORS];
+    BOOL prevMatched[MAX_MONITORS] = { FALSE };
+    for (int i = 0; i < fresh->count; i++) {
+        match[i] = FindPrevious(prev, fresh, i);
+        if (match[i])
+            prevMatched[match[i] - prev->monitors] = TRUE;
+    }
+
+    /* A monitor can come back from sleep under another name for a moment
+       (Windows reports a "Digital Flat Panel" stand-in while the link trains).
+       Count the monitors of *prev that worked, or were waiting, and have no
+       namesake now, so an unknown monitor in their place is paired with them
+       instead of being taken for a new one that never answered. */
+    int lostWorking = 0, lostWaiting = 0;
+    for (int j = 0; j < prev->count; j++) {
+        if (prevMatched[j]) continue;
+        if (prev->monitors[j].awaitingAnswer) lostWaiting++;
+        else if (prev->monitors[j].controllable) lostWorking++;
+    }
+
     int waiting = 0;
-    *recovered = FALSE;
+    *recovered = 0;
     for (int i = 0; i < fresh->count; i++) {
         BrightMonitor *mon = &fresh->monitors[i];
-        const BrightMonitor *old = FindPrevious(prev, fresh, i);
-        if (!old)
-            continue;   /* newly plugged in: nothing to compare against */
-        if (mon->controllable) {
-            if (old->awaitingAnswer)
-                *recovered = TRUE;
-        } else if (old->controllable || old->awaitingAnswer) {
+        const BrightMonitor *old = match[i];
+        BOOL answeredAgain = FALSE, stillAwaited = FALSE;
+        if (old) {
+            answeredAgain = mon->controllable && old->awaitingAnswer;
+            stillAwaited = !mon->controllable && (old->controllable || old->awaitingAnswer);
+        } else if (mon->controllable) {
+            if (lostWaiting > 0) { lostWaiting--; answeredAgain = TRUE; }
+        } else if (lostWorking > 0) {
+            lostWorking--; stillAwaited = TRUE;
+        } else if (lostWaiting > 0) {
+            lostWaiting--; stillAwaited = TRUE;
+        }
+        if (answeredAgain)
+            *recovered |= 1u << i;
+        if (stillAwaited) {
             mon->awaitingAnswer = TRUE;
             waiting++;
         }

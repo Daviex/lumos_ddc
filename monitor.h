@@ -67,9 +67,11 @@ BOOL Monitor_HasControllable(const MonitorList *ml);
 /* Mark the monitors of *fresh that were controllable in *prev (or were already
    waiting) but did not answer this scan. A monitor is matched by its EDID name,
    which comes from the registry and survives a display that has not woken up
-   enough to answer DDC/CI. Returns how many monitors are waiting, and sets
-   *recovered when a monitor that was waiting answers again. */
-int Monitor_TrackUnanswered(MonitorList *fresh, const MonitorList *prev, BOOL *recovered);
+   enough to answer DDC/CI. An unknown monitor that does not answer, in the
+   place of a known one that is gone, counts as that monitor under a stand-in
+   name. Returns how many monitors are waiting, and sets bit i of *recovered
+   for each monitor i of *fresh that was waiting and answers again. */
+int Monitor_TrackUnanswered(MonitorList *fresh, const MonitorList *prev, unsigned *recovered);
 
 /* Set all monitors from an All Monitors level (0-100), each through its range
    (see brightmap.h). Returns FALSE when a controllable monitor refused the write (a stale DDC

@@ -63,6 +63,23 @@ void Settings_CreateDefaults(Settings *s)
     }
 }
 
+/* Parse "lo,hi". wcstol rather than swscanf, because a hand-edited number
+   too large for an int is undefined behaviour in scanf. */
+static BOOL ParseRange(const WCHAR *text, int *lo, int *hi)
+{
+    WCHAR *end;
+    long a = wcstol(text, &end, 10);
+    if (end == text || *end != L',')
+        return FALSE;
+    const WCHAR *second = end + 1;
+    long b = wcstol(second, &end, 10);
+    if (end == second || a < 0 || a > 100 || b < 0 || b > 100)
+        return FALSE;
+    *lo = (int)a;
+    *hi = (int)b;
+    return TRUE;
+}
+
 /* Read [Ranges] ("Name=lo,hi"). Without it, convert the [Deltas] offsets of
    older versions, so an upgrade keeps the monitors matched as they were. The
    result reaches the file on the next save. */
@@ -70,17 +87,19 @@ static void LoadRanges(Settings *s)
 {
     WCHAR buf[4096], val[32];
     s->rangeCount = 0;
+    s->rangeNewLo = 0;
+    s->rangeNewHi = 100;
     DWORD len = GetPrivateProfileStringW(L"Ranges", NULL, L"", buf, 4096, s->iniPath);
-    for (WCHAR *key = buf; len > 0 && *key && s->rangeCount < MAX_MONITORS;
+    for (WCHAR *key = buf; len > 0 && *key && s->rangeCount < MAX_RANGES;
          key += wcslen(key) + 1) {
-        int lo = 0, hi = 100;
-        GetPrivateProfileStringW(L"Ranges", key, L"0,100", val, 32, s->iniPath);
-        if (swscanf(val, L"%d,%d", &lo, &hi) != 2)
+        int lo, hi;
+        GetPrivateProfileStringW(L"Ranges", key, L"", val, 32, s->iniPath);
+        if (!ParseRange(val, &lo, &hi))
             continue;
         BrightMap_Normalize(&lo, &hi);
         int i = s->rangeCount++;
-        wcsncpy(s->rangeNames[i], key, 127);
-        s->rangeNames[i][127] = L'\0';
+        wcsncpy(s->rangeNames[i], key, 135);
+        s->rangeNames[i][135] = L'\0';
         s->rangeLo[i] = lo;
         s->rangeHi[i] = hi;
         s->rangeConnected[i] = FALSE;
@@ -88,18 +107,30 @@ static void LoadRanges(Settings *s)
     if (s->rangeCount > 0)
         return;
 
-    int offsets[MAX_MONITORS];
+    /* The last slot is an implicit offset 0. Older versions wrote only the
+       non-zero offsets, so a monitor missing from [Deltas] had offset 0 and
+       must start from that range, not from 0-100. */
+    int offsets[MAX_RANGES + 1], los[MAX_RANGES + 1], his[MAX_RANGES + 1];
+    int n = 0;
     len = GetPrivateProfileStringW(L"Deltas", NULL, L"", buf, 4096, s->iniPath);
-    for (WCHAR *key = buf; len > 0 && *key && s->rangeCount < MAX_MONITORS;
-         key += wcslen(key) + 1) {
+    for (WCHAR *key = buf; len > 0 && *key && n < MAX_RANGES; key += wcslen(key) + 1) {
         GetPrivateProfileStringW(L"Deltas", key, L"0", val, 32, s->iniPath);
-        int i = s->rangeCount++;
-        wcsncpy(s->rangeNames[i], key, 127);
-        s->rangeNames[i][127] = L'\0';
-        offsets[i] = _wtoi(val);
-        s->rangeConnected[i] = FALSE;
+        wcsncpy(s->rangeNames[n], key, 135);
+        s->rangeNames[n][135] = L'\0';
+        s->rangeConnected[n] = FALSE;
+        offsets[n++] = (int)wcstol(val, NULL, 10);
     }
-    BrightMap_FromOffsets(offsets, s->rangeCount, s->rangeLo, s->rangeHi);
+    if (n == 0)
+        return;
+    offsets[n] = 0;
+    BrightMap_FromOffsets(offsets, n + 1, los, his);
+    for (int i = 0; i < n; i++) {
+        s->rangeLo[i] = los[i];
+        s->rangeHi[i] = his[i];
+    }
+    s->rangeCount = n;
+    s->rangeNewLo = los[n];
+    s->rangeNewHi = his[n];
 }
 
 void Settings_Load(Settings *s)
@@ -289,20 +320,47 @@ BOOL Settings_GetAutostart(void)
     return result;
 }
 
-/* The entry for this monitor name, added with the full range when missing.
-   Returns -1 when the table is full. */
-static int RangeEntry(Settings *s, const WCHAR *name)
+/* The entry key of monitor i: its name, plus " #2", " #3" and so on for a
+   second or third monitor of the same name, so two identical models keep
+   separate ranges instead of overwriting one shared entry. */
+static void RangeKey(const MonitorList *ml, int i, WCHAR *key, int cch)
+{
+    int nth = 1;
+    for (int j = 0; j < i; j++)
+        if (wcscmp(ml->monitors[j].name, ml->monitors[i].name) == 0)
+            nth++;
+    if (nth == 1)
+        _snwprintf(key, cch - 1, L"%s", ml->monitors[i].name);
+    else
+        _snwprintf(key, cch - 1, L"%s #%d", ml->monitors[i].name, nth);
+    key[cch - 1] = L'\0';
+}
+
+static int RangeFind(const Settings *s, const WCHAR *key)
 {
     for (int i = 0; i < s->rangeCount; i++)
-        if (wcscmp(s->rangeNames[i], name) == 0)
+        if (wcscmp(s->rangeNames[i], key) == 0)
             return i;
-    if (s->rangeCount >= MAX_MONITORS)
+    return -1;
+}
+
+/* The entry for this key. A monitor that answers gets one with the starting
+   range when it has none; a monitor that does not answer only uses an
+   existing entry, so a stand-in name Windows reports during a wake never
+   gets a line in [Ranges] or a row in Settings. Returns -1 when there is no
+   entry, or when the table is full. */
+static int RangeEntry(Settings *s, const WCHAR *key, BOOL create)
+{
+    int found = RangeFind(s, key);
+    if (found >= 0 || !create)
+        return found;
+    if (s->rangeCount >= MAX_RANGES)
         return -1;
     int i = s->rangeCount++;
-    wcsncpy(s->rangeNames[i], name, 127);
-    s->rangeNames[i][127] = L'\0';
-    s->rangeLo[i] = 0;
-    s->rangeHi[i] = 100;
+    wcsncpy(s->rangeNames[i], key, 135);
+    s->rangeNames[i][135] = L'\0';
+    s->rangeLo[i] = s->rangeNewLo;
+    s->rangeHi[i] = s->rangeNewHi;
     s->rangeConnected[i] = FALSE;
     return i;
 }
@@ -318,13 +376,18 @@ void Settings_ApplyRanges(Settings *s, MonitorList *ml)
 {
     for (int i = 0; i < s->rangeCount; i++)
         s->rangeConnected[i] = FALSE;
+    WCHAR key[136];
     for (int i = 0; i < ml->count; i++) {
         BrightMonitor *mon = &ml->monitors[i];
         mon->rangeLo = 0;
         mon->rangeHi = 100;
-        int e = HasRange(mon) ? RangeEntry(s, mon->name) : -1;
+        if (!HasRange(mon))
+            continue;
+        RangeKey(ml, i, key, 136);
+        int e = RangeEntry(s, key, mon->controllable);
         if (e < 0)
             continue;
+        BrightMap_Normalize(&s->rangeLo[e], &s->rangeHi[e]);
         mon->rangeLo = s->rangeLo[e];
         mon->rangeHi = s->rangeHi[e];
         s->rangeConnected[e] = TRUE;
@@ -333,9 +396,13 @@ void Settings_ApplyRanges(Settings *s, MonitorList *ml)
 
 void Settings_StoreRanges(Settings *s, const MonitorList *ml)
 {
+    WCHAR key[136];
     for (int i = 0; i < ml->count; i++) {
         const BrightMonitor *mon = &ml->monitors[i];
-        int e = HasRange(mon) ? RangeEntry(s, mon->name) : -1;
+        if (!HasRange(mon))
+            continue;
+        RangeKey(ml, i, key, 136);
+        int e = RangeEntry(s, key, mon->controllable);
         if (e < 0)
             continue;
         s->rangeLo[e] = mon->rangeLo;
