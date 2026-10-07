@@ -8,12 +8,11 @@
 int Brightness_GetPercent(const BrightMonitor *monitor);
 DWORD Brightness_ToRaw(const BrightMonitor *monitor, DWORD percent);
 
-/* Recover the base target by averaging selected, controllable monitors after subtracting
-   their deltas. Empty/uncontrollable lists use the existing 50% fallback. */
+/* Recover the master by inverting each selected controllable monitor's range.
+   Suspended source filters retain their intent; empty lists use 50%. */
 int Brightness_MasterTarget(const MonitorList *view);
 
-/* Deltas extend the master target range so every monitor can reach both ends.
-   The range always includes 0-100; monitor deltas are the configured -40..40. */
+/* Master and slider levels both use 0-100. These pure helpers clamp input. */
 void Brightness_TargetRange(const MonitorList *view, int *minimum, int *maximum);
 int Brightness_SliderToTarget(const MonitorList *view, int sliderPercent);
 int Brightness_TargetToSlider(const MonitorList *view, int target);

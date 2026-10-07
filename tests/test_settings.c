@@ -31,6 +31,13 @@ static struct {
     DWORD queryType, queryBytes;
     BOOL sourcePollPresent;
     WCHAR sourcePollValue[24];
+    BOOL hotkeyPresent[HOTKEY_COUNT];
+    WCHAR hotkeyValues[HOTKEY_COUNT][HOTKEY_TEXT_MAX];
+    struct {
+        WCHAR field[136];
+        WCHAR value[64];
+    } rangeValues[MAX_RANGES + 4], deltaValues[MAX_RANGES + 4];
+    int rangeValueCount, deltaValueCount;
     struct {
         WCHAR field[24];
         WCHAR value[MONITOR_SELECTION_KEY_LEN + 32];
@@ -127,9 +134,54 @@ static void PutInputIni(const WCHAR *field, const WCHAR *value)
                                    ARRAYSIZE(mock.inputValues[index].value), value)));
 }
 
+static int HotkeyIniIndex(const WCHAR *key)
+{
+    const WCHAR *keys[] = { L"HotkeyBrighten", L"HotkeyDim", L"HotkeyPopup" };
+    for (int i = 0; i < HOTKEY_COUNT; i++)
+        if (_wcsicmp(key, keys[i]) == 0) return i;
+    return -1;
+}
+
+static const WCHAR *RangeIniValue(const WCHAR *field, BOOL legacy)
+{
+    int count = legacy ? mock.deltaValueCount : mock.rangeValueCount;
+    for (int i = 0; i < count; i++) {
+        const WCHAR *key = legacy ? mock.deltaValues[i].field : mock.rangeValues[i].field;
+        if (_wcsicmp(key, field) == 0)
+            return legacy ? mock.deltaValues[i].value : mock.rangeValues[i].value;
+    }
+    return NULL;
+}
+
+static void PutRangeIni(const WCHAR *field, const WCHAR *value, BOOL legacy)
+{
+    int *count = legacy ? &mock.deltaValueCount : &mock.rangeValueCount;
+    int index = 0;
+    for (; index < *count; index++) {
+        const WCHAR *key = legacy ? mock.deltaValues[index].field : mock.rangeValues[index].field;
+        if (_wcsicmp(key, field) == 0) break;
+    }
+    CHECK(index < (int)ARRAYSIZE(mock.rangeValues));
+    if (index >= (int)ARRAYSIZE(mock.rangeValues)) return;
+    if (index == *count) (*count)++;
+    WCHAR *key = legacy ? mock.deltaValues[index].field : mock.rangeValues[index].field;
+    WCHAR *entry = legacy ? mock.deltaValues[index].value : mock.rangeValues[index].value;
+    CHECK(SUCCEEDED(StringCchCopyW(key, ARRAYSIZE(mock.rangeValues[index].field), field)));
+    CHECK(SUCCEEDED(StringCchCopyW(entry, ARRAYSIZE(mock.rangeValues[index].value), value)));
+}
+
 static BOOL WINAPI MockWritePrivateProfileStringW(LPCWSTR section, LPCWSTR key,
                                                  LPCWSTR value, LPCWSTR path)
 {
+    if (section && key && value && wcscmp(section, L"Settings") == 0) {
+        int index = HotkeyIniIndex(key);
+        if (index >= 0) {
+            mock.hotkeyPresent[index] = TRUE;
+            StringCchCopyW(mock.hotkeyValues[index], HOTKEY_TEXT_MAX, value);
+        }
+    }
+    if (section && key && value && wcscmp(section, L"Ranges") == 0)
+        PutRangeIni(key, value, FALSE);
     if (section && key && value && wcscmp(section, L"Settings") == 0 &&
         wcscmp(key, L"SourcePollSeconds") == 0) {
         mock.sourcePollPresent = TRUE;
@@ -173,6 +225,10 @@ static BOOL WINAPI MockWritePrivateProfileSectionW(LPCWSTR section, LPCWSTR valu
         CHECK(values[0] == L'\0');
         mock.blackValueCount = 0;
     }
+    if (wcscmp(section, L"Ranges") == 0) {
+        CHECK(values[0] == L'\0');
+        mock.rangeValueCount = 0;
+    }
     return TRUE;
 }
 
@@ -182,8 +238,31 @@ static DWORD WINAPI MockGetPrivateProfileStringW(LPCWSTR section, LPCWSTR key,
 {
     (void)path;
     if (!capacity) return 0;
-    if (!key) { buffer[0] = L'\0'; return 0; }
+    if (!key) {
+        if (wcscmp(section, L"Ranges") == 0 || wcscmp(section, L"Deltas") == 0) {
+            BOOL legacy = wcscmp(section, L"Deltas") == 0;
+            int count = legacy ? mock.deltaValueCount : mock.rangeValueCount;
+            DWORD used = 0;
+            for (int i = 0; i < count; i++) {
+                const WCHAR *field = legacy ? mock.deltaValues[i].field : mock.rangeValues[i].field;
+                size_t length = wcslen(field) + 1;
+                CHECK(used + length + 1 <= capacity);
+                if (used + length + 1 > capacity) break;
+                memcpy(buffer + used, field, length * sizeof(WCHAR));
+                used += (DWORD)length;
+            }
+            buffer[used] = L'\0';
+            return used;
+        }
+        buffer[0] = L'\0'; return 0;
+    }
     const WCHAR *value = wcscmp(section, L"MonitorSelection") == 0 ? SelectionIniValue(key) : NULL;
+    if (wcscmp(section, L"Settings") == 0) {
+        int index = HotkeyIniIndex(key);
+        if (index >= 0 && mock.hotkeyPresent[index]) value = mock.hotkeyValues[index];
+    }
+    if (wcscmp(section, L"Ranges") == 0) value = RangeIniValue(key, FALSE);
+    if (wcscmp(section, L"Deltas") == 0) value = RangeIniValue(key, TRUE);
     if (wcscmp(section, L"MonitorInputs") == 0) value = InputIniValue(key);
     if (wcscmp(section, L"MonitorIdleBlack") == 0)
         for (int i = 0; i < mock.blackValueCount; i++)
@@ -1069,6 +1148,124 @@ static void TestSourcePollingSetting(void)
     }
 }
 
+static void TestHotkeySettingsVersionsAndRoundtrip(void)
+{
+    Settings saved = {0}, loaded = {0};
+    ResetMocks();
+    Settings_Load(&loaded);
+    for (int i = 0; i < HOTKEY_COUNT; i++)
+        CHECK(Hotkey_Equal(loaded.hotkeys[i], Hotkey_LegacyDefault(i)));
+
+    Settings_CreateDefaults(&saved);
+    Settings_Load(&loaded);
+    for (int i = 0; i < HOTKEY_COUNT; i++) {
+        CHECK(mock.hotkeyPresent[i]);
+        CHECK(Hotkey_Equal(loaded.hotkeys[i], Hotkey_Default(i)));
+    }
+
+    CHECK(Hotkey_Parse("Ctrl+Shift+F12", &saved.hotkeys[HOTKEY_BRIGHTEN]));
+    CHECK(Hotkey_Parse("Alt+Win+Down", &saved.hotkeys[HOTKEY_DIM]));
+    CHECK(Hotkey_Parse("None", &saved.hotkeys[HOTKEY_POPUP]));
+    saved.sourcePollSeconds = 37;
+    Settings_Save(&saved);
+    Settings_Load(&loaded);
+    CHECK(loaded.sourcePollSeconds == 37);
+    for (int i = 0; i < HOTKEY_COUNT; i++)
+        CHECK(Hotkey_Equal(saved.hotkeys[i], loaded.hotkeys[i]));
+
+    StringCchCopyW(mock.hotkeyValues[HOTKEY_BRIGHTEN], HOTKEY_TEXT_MAX, L"not a hotkey");
+    Settings_Load(&loaded);
+    CHECK(Hotkey_Equal(loaded.hotkeys[HOTKEY_BRIGHTEN], Hotkey_Default(HOTKEY_BRIGHTEN)));
+    CHECK(loaded.hotkeys[HOTKEY_POPUP].vk == 0); /* An explicit None stays disabled. */
+}
+
+static void TestRangeMigrationKeepsMonitorPolicies(void)
+{
+    ResetMocks();
+    PutRangeIni(L"Dim panel", L"-10", TRUE);
+    PutRangeIni(L"Bright panel offline", L"20", TRUE);
+    PutSelectionIni(L"Mode", L"Selected");
+    PutSelectionIni(L"Count", L"1");
+    PutSelectionIni(L"Key0", L"DDC:DISPLAY\\PC");
+    PutInputIni(L"Count", L"1");
+    PutInputIni(L"Key0", L"DDC:DISPLAY\\PC");
+    PutInputIni(L"Enabled0", L"1");
+    PutInputIni(L"Input0", L"15");
+    Settings settings = {0}, loaded = {0};
+    Settings_Load(&settings);
+    CHECK(settings.rangeCount == 2);
+    CHECK(settings.rangeLo[0] == 0 && settings.rangeHi[0] == 70);
+    CHECK(settings.rangeLo[1] == 30 && settings.rangeHi[1] == 100);
+    CHECK(settings.rangeNewLo == 10 && settings.rangeNewHi == 80);
+    CHECK(settings.monitorSelection.selectedOnly && settings.monitorSelection.count == 1);
+    CHECK(settings.monitorSelection.inputRuleCount == 1);
+    settings.sourcePollSeconds = 19;
+    settings.monitorSelection.idleBlackCount = 1;
+    StringCchCopyW(settings.monitorSelection.idleBlackKeys[0], MONITOR_SELECTION_KEY_LEN,
+                   L"DDC:DISPLAY\\PC");
+    for (int i = 0; i < HOTKEY_COUNT; i++) settings.hotkeys[i] = Hotkey_Default(i);
+
+    MonitorList view = {0};
+    view.count = 2;
+    view.monitors[0] = SelectionMonitor(BACKEND_DDC, L"DISPLAY\\PC");
+    view.monitors[1] = SelectionMonitor(BACKEND_DDC, L"DISPLAY\\OTHER");
+    StringCchCopyW(view.monitors[0].name, 128, L"Dim panel");
+    StringCchCopyW(view.monitors[1].name, 128, L"New panel");
+    Settings_ApplyRanges(&settings, &view);
+    Settings_ApplyMonitorSelection(&settings, &view);
+    CHECK(view.monitors[0].rangeLo == 0 && view.monitors[0].rangeHi == 70);
+    CHECK(view.monitors[1].rangeLo == 10 && view.monitors[1].rangeHi == 80);
+    CHECK(view.monitors[0].sourceFilter && view.monitors[0].expectedInput == 15);
+    CHECK(view.monitors[0].idleBlack && !view.monitors[0].excludedFromControl);
+    CHECK(view.monitors[1].excludedFromControl);
+    CHECK(settings.rangeCount == 3 && !settings.rangeConnected[1]);
+
+    view.monitors[0].rangeLo = 12;
+    view.monitors[0].rangeHi = 88;
+    Settings_StoreRanges(&settings, &view);
+    Settings_Save(&settings);
+    CHECK(mock.deltaValueCount == 2); /* Preserve the original offsets for rollback. */
+    CHECK(wcscmp(RangeIniValue(L"Dim panel", TRUE), L"-10") == 0);
+    Settings_Load(&loaded);
+    CHECK(loaded.rangeCount == 3 && loaded.rangeLo[0] == 12 && loaded.rangeHi[0] == 88);
+    CHECK(loaded.rangeLo[1] == 30 && loaded.rangeHi[1] == 100); /* Offline range survives. */
+    CHECK(loaded.sourcePollSeconds == 19 && loaded.monitorSelection.selectedOnly);
+    CHECK(loaded.monitorSelection.inputRules[0].enabled &&
+          loaded.monitorSelection.inputRules[0].input == 15);
+    CHECK(loaded.monitorSelection.idleBlackCount == 1);
+    CHECK(Hotkey_Equal(loaded.hotkeys[HOTKEY_BRIGHTEN], Hotkey_Default(HOTKEY_BRIGHTEN)));
+    CHECK(loaded.rangeNewLo == 0 && loaded.rangeNewHi == 100); /* Saved ranges take precedence. */
+}
+
+static void TestRangesDuplicateModelsAndUnansweredPanels(void)
+{
+    ResetMocks();
+    PutRangeIni(L"Twin", L"10,75", FALSE);
+    PutRangeIni(L"Twin #2", L"25,90", FALSE);
+    PutRangeIni(L"Offline", L"20,80", FALSE);
+    PutRangeIni(L"Invalid", L"-1,100", FALSE);
+    Settings settings = {0};
+    Settings_Load(&settings);
+    CHECK(settings.rangeCount == 3);
+    MonitorList view = {0};
+    view.count = 3;
+    for (int i = 0; i < 2; i++) {
+        view.monitors[i].controllable = TRUE;
+        StringCchCopyW(view.monitors[i].name, 128, L"Twin");
+    }
+    view.monitors[2].awaitingAnswer = TRUE;
+    StringCchCopyW(view.monitors[2].name, 128, L"Offline");
+    Settings_ApplyRanges(&settings, &view);
+    CHECK(view.monitors[0].rangeLo == 10 && view.monitors[0].rangeHi == 75);
+    CHECK(view.monitors[1].rangeLo == 25 && view.monitors[1].rangeHi == 90);
+    CHECK(view.monitors[2].rangeLo == 20 && view.monitors[2].rangeHi == 80);
+    CHECK(settings.rangeCount == 3);
+    StringCchCopyW(view.monitors[2].name, 128, L"Windows stand-in");
+    Settings_ApplyRanges(&settings, &view);
+    CHECK(settings.rangeCount == 3 && !settings.rangeConnected[2]);
+    CHECK(view.monitors[2].rangeLo == 0 && view.monitors[2].rangeHi == 100);
+}
+
 int main(void)
 {
     TestSettingsPaths();
@@ -1089,10 +1286,13 @@ int main(void)
     TestMonitorInputsIdentityBounds();
     TestBlackIdlePersistenceAndUniqueSelection();
     TestSourcePollingSetting();
+    TestHotkeySettingsVersionsAndRoundtrip();
+    TestRangeMigrationKeepsMonitorPolicies();
+    TestRangesDuplicateModelsAndUnansweredPanels();
     if (failures) {
         printf("%d settings checks failed\n", failures);
         return 1;
     }
-    puts("ALL PASS: settings paths, autostart, daytime preset, monitor selection and input rules (mocked I/O)");
+    puts("ALL PASS: settings paths, autostart, daytime preset, monitor policies, hotkeys and range migration (mocked I/O)");
     return 0;
 }

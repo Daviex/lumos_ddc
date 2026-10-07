@@ -146,6 +146,7 @@ static BrightMonitor MakeDdc(UINT_PTR handle)
     monitor.backend = BACKEND_DDC;
     monitor.brightnessCur = 50;
     monitor.brightnessMax = 100;
+    monitor.rangeHi = 100;
     return monitor;
 }
 
@@ -329,7 +330,7 @@ static void TestExcludedMonitorsAreNeverWritten(void)
     for (int i = 0; i < view.count; i++) view.monitors[i] = MakeDdc((UINT_PTR)i);
     view.monitors[0].excludedFromControl = TRUE;
     view.monitors[0].brightnessCur = 87;
-    view.monitors[1].delta = 10;
+    view.monitors[1].rangeLo = 10;
     view.monitors[2].excludedFromControl = TRUE;
     view.monitors[2].backend = BACKEND_WMI;
     view.monitors[2].brightnessCur = 65;
@@ -339,8 +340,8 @@ static void TestExcludedMonitorsAreNeverWritten(void)
     Monitor_PreviewBrightness(&view.monitors[0], 5);
     Monitor_AdjustActive(&view, -20);
     CHECK(setCalls == 0 && view.monitors[0].brightnessCur == 87);
-    Monitor_SetAllBrightness(&view, 20);
-    CHECK(setCalls == 1 && lastWrite == 30 && view.monitors[1].brightnessCur == 30);
+    CHECK(Monitor_SetAllBrightness(&view, 20));
+    CHECK(setCalls == 1 && lastWrite == 28 && view.monitors[1].brightnessCur == 28);
     CHECK(view.monitors[0].brightnessCur == 87 && view.monitors[2].brightnessCur == 65);
     Monitor_CycleActive(&view, 1);
     CHECK(view.active == 1);
@@ -350,6 +351,129 @@ static void TestExcludedMonitorsAreNeverWritten(void)
     CHECK(Monitor_HasControllable(&view) && !Monitor_HasSelected(&view));
     Monitor_SetAllBrightness(&view, 80);
     CHECK(setCalls == 1);
+}
+
+static void TestRangeMasterMappingAndWriteFailures(void)
+{
+    MonitorList view = { 0 };
+    ResetMocks();
+    view.count = 2;
+    view.monitors[0] = MakeDdc(0);
+    view.monitors[0].brightnessMin = 20;
+    view.monitors[0].rangeLo = 40;
+    view.monitors[1] = MakeDdc(1);
+    view.monitors[1].backend = BACKEND_WMI;
+    view.monitors[1].hasHandle = FALSE;
+    view.monitors[1].rangeHi = 60;
+    CHECK(Monitor_SetAllBrightness(&view, 50));
+    CHECK(setCalls == 2 && lastWrite == 30);
+    CHECK(view.monitors[0].brightnessCur == 76 && view.monitors[1].brightnessCur == 30);
+    CHECK(view.monitors[0].desiredBrightness == 70 && view.monitors[1].desiredBrightness == 30);
+    CHECK(Monitor_MasterFromSnapshot(&view) == 50);
+    CHECK(Monitor_StepAllBrightness(&view, 25));
+    CHECK(view.monitors[0].desiredBrightness == 85 && view.monitors[1].desiredBrightness == 45);
+    CHECK(Monitor_StepAllBrightness(&view, 1000));
+    CHECK(view.monitors[0].desiredBrightness == 100 && view.monitors[1].desiredBrightness == 60);
+    CHECK(Monitor_StepAllBrightness(&view, -1000));
+    CHECK(view.monitors[0].desiredBrightness == 40 && view.monitors[1].desiredBrightness == 0);
+
+    setSuccess = FALSE;
+    CHECK(!Monitor_SetAllBrightness(&view, 50));
+    CHECK(view.monitors[0].desiredBrightness == 70 && view.monitors[1].desiredBrightness == 30);
+    setSuccess = TRUE;
+    view.monitors[0].sourceFilter = TRUE;
+    view.monitors[0].expectedInput = 0x0F;
+    sourceInput = 0x12;
+    int before = setCalls;
+    CHECK(!Monitor_SetAllBrightness(&view, 75));
+    CHECK(setCalls == before + 1); /* Other source is skipped, WMI still progresses. */
+    CHECK(view.monitors[0].desiredBrightness == 85 && view.monitors[1].desiredBrightness == 45);
+    CHECK(!Monitor_SourceAllowsControl(&view.monitors[0]));
+}
+
+static void TestUnavailableMonitorsRetainNewestMasterIntent(void)
+{
+    MonitorList view = { 0 };
+    ResetMocks();
+    view.count = 4;
+    for (int i = 0; i < view.count; i++) view.monitors[i] = MakeDdc((UINT_PTR)i);
+    view.monitors[1].controllable = FALSE;
+    view.monitors[1].awaitingAnswer = TRUE;
+    view.monitors[1].rangeLo = 40;
+    view.monitors[1].desiredBrightnessValid = TRUE;
+    view.monitors[1].desiredBrightness = 90;
+    view.monitors[2].controllable = FALSE;
+    view.monitors[2].rangeHi = 60; /* Initial read failed; source identity remains. */
+    view.monitors[3].excludedFromControl = TRUE;
+    view.monitors[3].controllable = FALSE;
+    view.monitors[3].awaitingAnswer = TRUE;
+    view.monitors[3].desiredBrightnessValid = TRUE;
+    view.monitors[3].desiredBrightness = 91;
+    CHECK(Monitor_SetAllBrightness(&view, 44));
+    CHECK(setCalls == 1 && lastWrite == 44);
+    CHECK(view.monitors[1].desiredBrightness == 66 && view.monitors[1].brightnessCur == 50);
+    CHECK(view.monitors[2].desiredBrightnessValid && view.monitors[2].desiredBrightness == 26);
+    CHECK(view.monitors[3].desiredBrightness == 91); /* Excluded intent is untouched. */
+}
+
+static void TestUnansweredRecoveryUsesStableIdentity(void)
+{
+    MonitorList previous = { 0 }, fresh = { 0 };
+    unsigned recovered = 99;
+    previous.count = fresh.count = 2;
+    for (int i = 0; i < 2; i++) {
+        previous.monitors[i] = fresh.monitors[i] = MakeDdc((UINT_PTR)i);
+        wcscpy(previous.monitors[i].name, L"Identical model");
+        wcscpy(fresh.monitors[i].name, L"Identical model");
+    }
+    wcscpy(previous.monitors[0].deviceInstance, L"DISPLAY\\A");
+    wcscpy(previous.monitors[1].deviceInstance, L"DISPLAY\\B");
+    previous.monitors[1].controllable = FALSE;
+    previous.monitors[1].awaitingAnswer = TRUE;
+    wcscpy(fresh.monitors[0].deviceInstance, L"display\\b");
+    wcscpy(fresh.monitors[1].deviceInstance, L"DISPLAY\\A");
+    fresh.monitors[1].controllable = FALSE;
+    CHECK(Monitor_TrackUnanswered(&fresh, &previous, &recovered) == 1);
+    CHECK(recovered == 1u && !fresh.monitors[0].awaitingAnswer && fresh.monitors[1].awaitingAnswer);
+
+    previous = fresh;
+    fresh.monitors[1].controllable = TRUE;
+    CHECK(Monitor_TrackUnanswered(&fresh, &previous, &recovered) == 0);
+    CHECK(recovered == 2u && !fresh.monitors[1].awaitingAnswer);
+
+    previous.count = fresh.count = 1;
+    previous.monitors[0].controllable = FALSE;
+    previous.monitors[0].awaitingAnswer = TRUE;
+    wcscpy(fresh.monitors[0].deviceInstance, L"DISPLAY\\REPLACEMENT");
+    fresh.monitors[0].controllable = TRUE;
+    CHECK(Monitor_TrackUnanswered(&fresh, &previous, &recovered) == 0);
+    CHECK(recovered == 0); /* Matching friendly names cannot replace a stable key. */
+
+    previous.monitors[0].controllable = TRUE;
+    previous.monitors[0].awaitingAnswer = FALSE;
+    fresh.monitors[0].deviceInstance[0] = L'\0';
+    wcscpy(fresh.monitors[0].name, L"Digital Flat Panel");
+    fresh.monitors[0].controllable = FALSE;
+    CHECK(Monitor_TrackUnanswered(&fresh, &previous, &recovered) == 1);
+    CHECK(fresh.monitors[0].awaitingAnswer && recovered == 0);
+    previous = fresh;
+    fresh.monitors[0].controllable = TRUE;
+    CHECK(Monitor_TrackUnanswered(&fresh, &previous, &recovered) == 0);
+    CHECK(recovered == 1u && !fresh.monitors[0].awaitingAnswer);
+
+    previous.monitors[0].awaitingAnswer = TRUE;
+    previous.monitors[0].controllable = FALSE;
+    fresh.monitors[0].controllable = FALSE;
+    fresh.monitors[0].excludedFromControl = TRUE;
+    CHECK(Monitor_TrackUnanswered(&fresh, &previous, &recovered) == 0);
+    CHECK(!fresh.monitors[0].awaitingAnswer && recovered == 0);
+
+    BrightMonitor monitor = MakeDdc(0);
+    ResetMocks();
+    monitor.awaitingAnswer = TRUE;
+    monitor.controllable = FALSE;
+    CHECK(Monitor_ReadBrightnessSync(&monitor));
+    CHECK(monitor.controllable && !monitor.awaitingAnswer);
 }
 
 static BOOL RejectAfterSourceRead(void *context)
@@ -564,6 +688,9 @@ int main(void)
     TestTransientSourceReadRetry();
     TestLargeBrightnessRange();
     TestExcludedMonitorsAreNeverWritten();
+    TestRangeMasterMappingAndWriteFailures();
+    TestUnavailableMonitorsRetainNewestMasterIntent();
+    TestUnansweredRecoveryUsesStableIdentity();
     TestSourceFilterChecksBeforeEveryWrite();
     TestIdleRestoresExactRawBrightness();
     TestIdleReleaseNeverBypassesUnknownOrChangedSource();

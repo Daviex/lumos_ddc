@@ -1,4 +1,5 @@
 #include "brightness.h"
+#include "brightmap.h"
 #include <wchar.h>
 
 BOOL Monitor_CanControl(const BrightMonitor *monitor)
@@ -53,7 +54,8 @@ int Brightness_MasterTarget(const MonitorList *view)
         for (int i = 0; i < view->count; i++) {
             const BrightMonitor *monitor = &view->monitors[i];
             if (!Monitor_CanControl(monitor)) continue;
-            sum += Brightness_GetPercent(monitor) - monitor->delta;
+            sum += BrightMap_Master(Brightness_GetPercent(monitor),
+                                    monitor->rangeLo, monitor->rangeHi);
             count++;
         }
     }
@@ -62,36 +64,23 @@ int Brightness_MasterTarget(const MonitorList *view)
 
 void Brightness_TargetRange(const MonitorList *view, int *minimum, int *maximum)
 {
-    int minimumDelta = 0, maximumDelta = 0;
-    if (view) {
-        for (int i = 0; i < view->count; i++) {
-            const BrightMonitor *monitor = &view->monitors[i];
-            if (!Monitor_CanControl(monitor)) continue;
-            if (monitor->delta < minimumDelta) minimumDelta = monitor->delta;
-            if (monitor->delta > maximumDelta) maximumDelta = monitor->delta;
-        }
-    }
-    if (minimum) *minimum = -maximumDelta;
-    if (maximum) *maximum = 100 - minimumDelta;
+    (void)view;
+    if (minimum) *minimum = 0;
+    if (maximum) *maximum = 100;
 }
 
 int Brightness_SliderToTarget(const MonitorList *view, int sliderPercent)
 {
-    int minimum, maximum;
-    Brightness_TargetRange(view, &minimum, &maximum);
+    (void)view;
     if (sliderPercent < 0) sliderPercent = 0;
     if (sliderPercent > 100) sliderPercent = 100;
-    return minimum + (sliderPercent * (maximum - minimum)) / 100;
+    return sliderPercent;
 }
 
 int Brightness_TargetToSlider(const MonitorList *view, int target)
 {
-    int minimum, maximum;
-    Brightness_TargetRange(view, &minimum, &maximum);
-    if (maximum == minimum) return 50;
-    if (target <= minimum) return 0;
-    if (target >= maximum) return 100;
-    return ((target - minimum) * 100) / (maximum - minimum);
+    (void)view;
+    return target < 0 ? 0 : (target > 100 ? 100 : target);
 }
 
 BOOL Monitor_SameDisplay(const BrightMonitor *source, const BrightMonitor *candidate)

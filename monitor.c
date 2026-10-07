@@ -1,5 +1,6 @@
 #include "monitor.h"
 #include "brightness.h"
+#include "brightmap.h"
 #include "wmibright.h"
 #include "monitor_worker.h"
 #include <physicalmonitorenumerationapi.h>
@@ -422,6 +423,8 @@ static BOOL CALLBACK MonitorEnumProc(HMONITOR hMon, HDC hdcMon, LPRECT lpRect, L
             bm->hasHandle = TRUE;
             bm->hMonitor = hMon;
             GetMonitorInstanceKey(hMon, bm->deviceInstance, ARRAYSIZE(bm->deviceInstance));
+            bm->rangeLo = 0;     /* until Settings_ApplyRanges finds a saved one */
+            bm->rangeHi = 100;
 
             /* Try to get friendly name from EnumDisplayDevices */
             WCHAR friendly[128] = { 0 };
@@ -500,6 +503,8 @@ void Monitor_Enumerate(MonitorList *ml)
         bm->hasHandle = FALSE;
         bm->hMonitor = NULL;
         wcscpy(bm->name, L"No DDC/CI monitors found");
+        bm->rangeLo = 0;
+        bm->rangeHi = 100;
         bm->brightnessMin = 0;
         bm->brightnessCur = 0;
         bm->brightnessMax = 100;
@@ -530,6 +535,7 @@ BOOL Monitor_ReadBrightnessSync(BrightMonitor *bm)
             bm->brightnessCur = current;
             bm->brightnessMax = maximum;
             bm->controllable = TRUE;
+            bm->awaitingAnswer = FALSE;
             return TRUE;
         }
     } else if (bm->backend == BACKEND_WMI) {
@@ -537,6 +543,7 @@ BOOL Monitor_ReadBrightnessSync(BrightMonitor *bm)
         if (Wmi_GetBrightness(bm->wmiInstance, &pct) && pct <= 100) {
             bm->brightnessCur = pct;   /* WMI range is fixed 0-100 */
             bm->controllable = TRUE;
+            bm->awaitingAnswer = FALSE;
             return TRUE;
         }
     }
@@ -731,15 +738,129 @@ BOOL Monitor_HasControllable(const MonitorList *ml)
     return FALSE;
 }
 
-void Monitor_SetAllBrightness(MonitorList *ml, int percent)
+/* Prefer stable PnP identity, which survives reordered/renamed displays.
+   Without one, pair equal names by occurrence as upstream does. Known but
+   different PnP keys must never be paired merely because names match. */
+static const BrightMonitor *FindPrevious(const MonitorList *prev,
+                                         const BrightMonitor *monitor,
+                                         const BOOL matched[MAX_MONITORS],
+                                         BOOL identityOnly)
 {
-    for (int i = 0; i < ml->count; i++) {
-        if (!Monitor_CanControl(&ml->monitors[i])) continue;
-        int adj = percent + ml->monitors[i].delta;
-        if (adj < 0) adj = 0;
-        if (adj > 100) adj = 100;
-        Monitor_SetBrightness(&ml->monitors[i], (DWORD)adj);
+    for (int j = 0; j < prev->count; j++) {
+        const BrightMonitor *candidate = &prev->monitors[j];
+        if (matched[j]) continue;
+        if (identityOnly) {
+            if (monitor->deviceInstance[0] &&
+                _wcsicmp(candidate->deviceInstance, monitor->deviceInstance) == 0)
+                return candidate;
+        } else if (!(monitor->deviceInstance[0] && candidate->deviceInstance[0]) &&
+                   wcscmp(candidate->name, monitor->name) == 0) {
+            return candidate;
+        }
     }
+    return NULL;
+}
+
+int Monitor_TrackUnanswered(MonitorList *fresh, const MonitorList *prev, unsigned *recovered)
+{
+    const BrightMonitor *match[MAX_MONITORS] = { NULL };
+    BOOL prevMatched[MAX_MONITORS] = { FALSE };
+    /* Match every known identity before considering name-only stand-ins,
+       otherwise an unknown identical model could consume a known match. */
+    for (int pass = 0; pass < 2; pass++) {
+        for (int i = 0; i < fresh->count; i++) {
+            if (match[i]) continue;
+            match[i] = FindPrevious(prev, &fresh->monitors[i], prevMatched, pass == 0);
+            if (match[i])
+                prevMatched[match[i] - prev->monitors] = TRUE;
+        }
+    }
+
+    /* A monitor can come back from sleep under another name for a moment
+       (Windows reports a "Digital Flat Panel" stand-in while the link trains).
+       Count the monitors of *prev that worked, or were waiting, and have no
+       namesake now, so an unknown monitor in their place is paired with them
+       instead of being taken for a new one that never answered. */
+    int lostWorking = 0, lostWaiting = 0;
+    for (int j = 0; j < prev->count; j++) {
+        if (prevMatched[j] || prev->monitors[j].excludedFromControl) continue;
+        if (prev->monitors[j].awaitingAnswer) lostWaiting++;
+        else if (prev->monitors[j].controllable) lostWorking++;
+    }
+
+    int waiting = 0;
+    *recovered = 0;
+    for (int i = 0; i < fresh->count; i++) {
+        BrightMonitor *mon = &fresh->monitors[i];
+        const BrightMonitor *old = match[i];
+        BOOL answeredAgain = FALSE, stillAwaited = FALSE;
+        if (mon->excludedFromControl) {
+            mon->awaitingAnswer = FALSE;
+            continue;
+        }
+        if (old) {
+            answeredAgain = mon->controllable && old->awaitingAnswer;
+            stillAwaited = !mon->controllable && (old->controllable || old->awaitingAnswer);
+        } else if (mon->deviceInstance[0]) {
+            /* A new display with a different stable key is not the old one
+               recovering. Stand-ins with unknown identity use the fallback. */
+        } else if (mon->controllable) {
+            if (lostWaiting > 0) { lostWaiting--; answeredAgain = TRUE; }
+        } else if (lostWorking > 0) {
+            lostWorking--; stillAwaited = TRUE;
+        } else if (lostWaiting > 0) {
+            lostWaiting--; stillAwaited = TRUE;
+        }
+        if (answeredAgain)
+            *recovered |= 1u << i;
+        mon->awaitingAnswer = stillAwaited;
+        if (stillAwaited) {
+            waiting++;
+        }
+    }
+    return waiting;
+}
+
+BOOL Monitor_SetAllBrightness(MonitorList *ml, int percent)
+{
+    BOOL allOk = TRUE;
+    for (int i = 0; i < ml->count; i++) {
+        BrightMonitor *monitor = &ml->monitors[i];
+        if (monitor->excludedFromControl) continue;
+        int adj = BrightMap_Level(percent, monitor->rangeLo, monitor->rangeHi);
+        if (!monitor->controllable) {
+            /* Keep the newest master intent for connected/waking displays.
+               Recovery must not replay their older per-monitor target; these
+               snapshots cannot yet queue a hardware write. */
+            if (monitor->awaitingAnswer ||
+                (monitor->backend == BACKEND_DDC && monitor->hasHandle)) {
+                monitor->desiredBrightnessValid = TRUE;
+                monitor->desiredBrightness = (DWORD)adj;
+            }
+            continue;
+        }
+        if (!Monitor_SetBrightness(monitor, (DWORD)adj))
+            allOk = FALSE;
+    }
+    return allOk;
+}
+
+int Monitor_GetPercent(const BrightMonitor *mon)
+{
+    return Brightness_GetPercent(mon);
+}
+
+int Monitor_MasterFromSnapshot(const MonitorList *ml)
+{
+    return Brightness_MasterTarget(ml);
+}
+
+BOOL Monitor_StepAllBrightness(MonitorList *ml, int delta)
+{
+    /* Clamp before addition so even an untrusted large step cannot overflow. */
+    if (delta < -100) delta = -100;
+    if (delta > 100) delta = 100;
+    return Monitor_SetAllBrightness(ml, Monitor_MasterFromSnapshot(ml) + delta);
 }
 
 void Monitor_AdjustActive(MonitorList *ml, int delta)
@@ -751,7 +872,7 @@ void Monitor_AdjustActive(MonitorList *ml, int delta)
     BrightMonitor *mon = &ml->monitors[ml->active];
     if (!Monitor_CanControl(mon)) return;
 
-    int pct = Brightness_GetPercent(mon) + delta;
+    int pct = Monitor_GetPercent(mon) + delta;
     if (pct < 0) pct = 0;
     if (pct > 100) pct = 100;
 

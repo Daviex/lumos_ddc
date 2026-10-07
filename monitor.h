@@ -38,10 +38,13 @@ typedef struct {
     BOOL     idleReleasePending;
     DWORD    idleEpoch; /* Distinguishes successive idle cycles in worker results. */
     BOOL     hasHandle;    /* TRUE if hPhysical is valid (can be 0!) */
-    int      delta;        /* per-monitor brightness offset, -40..+40 */
+    int      rangeLo;      /* level at All Monitors 0% (see brightmap.h) */
+    int      rangeHi;      /* level at All Monitors 100% */
+    int      delta;        /* Legacy offset retained for config migration only. */
     MonitorBackend backend;
     WCHAR    wmiInstance[256]; /* WMI InstanceName when backend == BACKEND_WMI */
     WCHAR    deviceInstance[256]; /* stable PnP key for matching across rescans */
+    BOOL     awaitingAnswer;   /* was controllable on an earlier scan, does not answer now */
 } BrightMonitor;
 
 typedef struct {
@@ -61,6 +64,10 @@ void Monitor_Cleanup(MonitorList *ml);
 /* Refresh brightness values from hardware */
 void Monitor_RefreshBrightness(MonitorList *ml);
 
+/* Current level of a monitor as a percentage of its own range (cached value,
+   no DDC traffic). */
+int Monitor_GetPercent(const BrightMonitor *mon);
+
 /* Set brightness for a single monitor (0-100 percentage) */
 BOOL Monitor_SetBrightness(BrightMonitor *mon, DWORD percent);
 BOOL Monitor_SetIdleBrightness(BrightMonitor *mon, DWORD percent);
@@ -79,8 +86,22 @@ BOOL Monitor_CanControl(const BrightMonitor *monitor);
 BOOL Monitor_SourceAllowsControl(const BrightMonitor *monitor);
 BOOL Monitor_HasSelected(const MonitorList *ml);
 
-/* Set brightness for all monitors (base percent, can exceed 0-100 with deltas) */
-void Monitor_SetAllBrightness(MonitorList *ml, int percent);
+/* Mark the monitors of *fresh that were controllable in *prev (or were already
+   waiting) but did not answer this scan. Stable identity is matched first;
+   EDID names and unknown stand-ins cover partially woken displays. Excluded
+   monitors do not trigger retries. Returns how many monitors are waiting,
+   and sets bit i of *recovered for each selected monitor i of *fresh that
+   was waiting and answers again. */
+int Monitor_TrackUnanswered(MonitorList *fresh, const MonitorList *prev, unsigned *recovered);
+
+/* Set selected monitors from an All Monitors level (0-100), each through its
+   range. With a running worker TRUE means requests were queued; native write
+   outcomes arrive asynchronously as MonitorResult messages. */
+BOOL Monitor_SetAllBrightness(MonitorList *ml, int percent);
+/* Infer the master from selected controllable monitors' cached range levels. */
+int Monitor_MasterFromSnapshot(const MonitorList *ml);
+/* Step the inferred master and send each selected monitor through its range. */
+BOOL Monitor_StepAllBrightness(MonitorList *ml, int delta);
 
 /* Adjust active monitor brightness by delta (-10 or +10 etc) */
 void Monitor_AdjustActive(MonitorList *ml, int delta);

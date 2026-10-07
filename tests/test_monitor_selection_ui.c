@@ -5,6 +5,9 @@
 #include <commctrl.h>
 #include <shellapi.h>
 #include <dwmapi.h>
+#ifndef STRSAFE_NO_DEPRECATE
+#define STRSAFE_NO_DEPRECATE
+#endif
 #include <strsafe.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -22,6 +25,7 @@ static ULONGLONG sourceTestTick = 20000;
 static HWND settingsCapture;
 static BYTE *settingsFrame;
 static int settingsFrameHeight;
+static SHORT WINAPI MockGetKeyState(int vk) { (void)vk; return 0; }
 #define CHECK(condition) do { \
     if (!(condition)) { \
         printf("FAIL line %d: %s\n", __LINE__, #condition); \
@@ -37,7 +41,7 @@ static HWND WINAPI MockGetCapture(void) { return settingsCapture; }
 static HWND WINAPI MockSetCapture(HWND window) { HWND old = settingsCapture; settingsCapture = window; return old; }
 static BOOL WINAPI MockReleaseCapture(void) { settingsCapture = NULL; return TRUE; }
 static BOOL WINAPI MockScreenToClient(HWND window, LPPOINT point) { (void)window; (void)point; return TRUE; }
-static BOOL MockSettingsCommit(HWND window, HDC dc, int width, int height);
+static void MockSettingsCommit(HWND window, HDC dc, int width, int height);
 
 #undef GetWindowLongPtrW
 #define GetWindowLongPtrW MockGetWindowLongPtrW
@@ -48,9 +52,10 @@ static BOOL MockSettingsCommit(HWND window, HDC dc, int width, int height);
 #define SetCapture MockSetCapture
 #define ReleaseCapture MockReleaseCapture
 #define ScreenToClient MockScreenToClient
-#define UI_CommitLayered MockSettingsCommit
+#define GetKeyState MockGetKeyState
+#define CommitLayered MockSettingsCommit
 #include "../ui_monitor_selection.c"
-#include "../ui.c"
+#include "../ui_settings.c"
 #undef GetWindowLongPtrW
 #undef DestroyWindow
 #undef PostMessageW
@@ -59,24 +64,36 @@ static BOOL MockSettingsCommit(HWND window, HDC dc, int width, int height);
 #undef SetCapture
 #undef ReleaseCapture
 #undef ScreenToClient
-#undef UI_CommitLayered
+#undef GetKeyState
+#undef CommitLayered
 
-static BOOL MockSettingsCommit(HWND window, HDC dc, int width, int height)
+HINSTANCE g_uiInst;
+
+/* Accessibility notifications are isolated from the desktop in these tests. */
+void A11y_Attach(HWND window, const A11yModel *model) { (void)window; (void)model; }
+void A11y_Detach(HWND window) { (void)window; }
+BOOL A11y_HandleGetObject(HWND window, WPARAM wp, LPARAM lp, LRESULT *result)
+{ (void)window; (void)wp; (void)lp; (void)result; return FALSE; }
+void A11y_NotifyFocus(HWND window, int index) { (void)window; (void)index; }
+void A11y_NotifyValue(HWND window, int index) { (void)window; (void)index; }
+void A11y_NotifyName(HWND window, int index) { (void)window; (void)index; }
+void A11y_NotifyState(HWND window, int index) { (void)window; (void)index; }
+
+static void MockSettingsCommit(HWND window, HDC dc, int width, int height)
 {
     CHECK(window == testParent && width == SET_WIDTH);
     DIBSECTION dib = {0};
     HBITMAP bitmap = (HBITMAP)GetCurrentObject(dc, OBJ_BITMAP);
     CHECK(GetObjectW(bitmap, sizeof(dib), &dib) == sizeof(dib));
     CHECK(dib.dsBm.bmBits != NULL && dib.dsBm.bmBitsPixel == 32);
-    if (!dib.dsBm.bmBits) return FALSE;
+    if (!dib.dsBm.bmBits) return;
     GdiFlush();
     BYTE *frame = (BYTE *)realloc(settingsFrame, (size_t)width * height * 4);
     CHECK(frame != NULL);
-    if (!frame) return FALSE;
+    if (!frame) return;
     settingsFrame = frame;
     settingsFrameHeight = height;
     memcpy(settingsFrame, dib.dsBm.bmBits, (size_t)width * height * 4);
-    return TRUE;
 }
 
 static BOOL WINAPI MockDestroyWindow(HWND window)
@@ -138,7 +155,8 @@ static void InitParent(SetEditData *parent, Settings *settings)
     parent->scheduleEnabled = settings->scheduleEnabled;
     parent->sourcePollSeconds = Settings_ClampSourcePollSeconds(settings->sourcePollSeconds);
     parent->activeSliderRow = -1;
-    parent->keyboardRow = -1;
+    parent->focusRow = 1;
+    parent->captureRow = parent->errorRow = -1;
     BuildSettingsRows(parent);
 }
 
@@ -171,7 +189,7 @@ static void TestAllAndCustomWorkingCopies(void)
     CHECK(parent.monitorSelection.count == 1 && live.monitorSelection.count == 0);
     CHECK(_wcsicmp(parent.monitorSelection.keys[0], L"DDC:DISPLAY\\DEVICE1") == 0);
     CHECK(SetCanSave(&parent));
-    SetSave(testParent, &parent);
+    SetTrySave(testParent, &parent);
     CHECK(destroys == 3 && saveNotifications == 1);
     CHECK(live.monitorSelection.selectedOnly && live.monitorSelection.count == 1);
     CHECK(memcmp(&live.monitorSelection, &parent.monitorSelection,
@@ -312,21 +330,21 @@ static void TestParentRowsAndSaveValidation(void)
     CHECK(chooser >= 0); /* Global scope remains available while idle dim is disabled. */
     BOOL visitedChooser = FALSE, visitedSave = FALSE;
     for (int i = 0; i <= parent.rowCount; i++) {
-        SetMoveKeyboard(&parent, 1);
-        if (parent.keyboardRow == chooser) visitedChooser = TRUE;
-        if (parent.keyboardRow == parent.rowCount) visitedSave = TRUE;
-        else CHECK(parent.rows[parent.keyboardRow].kind != SET_SECTION);
+        parent.focusRow = SetStepFocus(&parent, parent.focusRow, 1);
+        if (parent.focusRow == chooser) visitedChooser = TRUE;
+        if (parent.focusRow == SET_SAVE(&parent)) visitedSave = TRUE;
+        else if (parent.focusRow < parent.rowCount) CHECK(parent.rows[parent.focusRow].kind != SET_SECTION);
     }
     CHECK(visitedChooser && visitedSave);
-    parent.keyboardRow = 1;
-    SetMoveKeyboard(&parent, -1);
-    CHECK(parent.keyboardRow == parent.rowCount); /* Shift-Tab wraps to Save. */
+    parent.focusRow = 1;
+    parent.focusRow = SetStepFocus(&parent, parent.focusRow, -1);
+    CHECK(parent.focusRow == SET_SAVE(&parent)); /* Shift-Tab wraps to Save. */
 
     parent.monitorSelection.selectedOnly = TRUE;
     parent.monitorSelection.count = 0;
     int oldDestroys = destroys, oldNotifications = saveNotifications;
     CHECK(!SetCanSave(&parent));
-    SetSave(testParent, &parent);
+    SetTrySave(testParent, &parent);
     CHECK(destroys == oldDestroys && saveNotifications == oldNotifications);
     CHECK(!live.monitorSelection.selectedOnly);
     parent.monitorSelection.count = MAX_MONITORS + 1;
@@ -506,7 +524,7 @@ static void TestSourceIntervalSlider(void)
     CHECK(g_set.sourcePollSeconds == 1); /* Signed coordinates while dragging outside. */
     SetWndProc(testParent, WM_LBUTTONUP, 0, MAKELPARAM(track.right, cy));
     CHECK(g_set.sourcePollSeconds == 60 && g_set.activeSliderRow == -1 && !settingsCapture);
-    g_set.keyboardRow = row;
+    g_set.focusRow = row;
     SetWndProc(testParent, WM_KEYDOWN, VK_LEFT, 0);
     CHECK(g_set.sourcePollSeconds == 59);
     SetWndProc(testParent, WM_KEYDOWN, VK_HOME, 0);
@@ -529,11 +547,12 @@ static void TestSourceIntervalSlider(void)
     SetWndProc(testParent, WM_MOUSEMOVE, MK_LBUTTON, MAKELPARAM(track.right, cy));
     CHECK(g_set.activeSliderRow == -1 && g_set.sourcePollSeconds == 1);
     g_set.sourcePollSeconds = 37;
-    SetSave(testParent, &g_set);
+    SetTrySave(testParent, &g_set);
     CHECK(live.sourcePollSeconds == 37);
     g_set.presetCount = MAX_PRESETS;
     BuildSettingsRows(&g_set);
-    CHECK(g_set.rowCount == MAX_SET_ROWS && g_set.rows[g_set.rowCount - 1].kind == SET_NUMBER);
+    CHECK(g_set.rowCount <= MAX_SET_ROWS && g_set.rows[g_set.rowCount - 1].kind == SET_NUMBER);
+    CHECK(g_set.rows[g_set.rowCount - 1].ival == &g_set.presetValues[MAX_PRESETS - 1]);
 }
 
 static void TestSlowPollingTelemetryFreshness(void)
@@ -554,6 +573,64 @@ static void TestSlowPollingTelemetryFreshness(void)
     row.sourceCheckedTick = sourceTestTick;
     sourceTestTick += 10001;
     CHECK(!SourceTelemetryCurrent(&row));
+}
+
+static int hotkeyApplyCalls, hotkeyApplyFailure;
+static BOOL hotkeysSuspended;
+static int ApplyTestHotkeys(const Hotkey *hotkeys)
+{ (void)hotkeys; hotkeyApplyCalls++; return hotkeyApplyFailure; }
+static void SuspendTestHotkeys(BOOL suspended) { hotkeysSuspended = suspended; }
+static int TestFirstFailedHotkey(void) { return -1; }
+
+static void TestSettingsAccessibilityAndHotkeyValidation(void)
+{
+    Settings live = {0};
+    InitParent(&g_set, &live);
+    int chooser = -1, slider = -1;
+    for (int i = 0; i < g_set.rowCount; i++) {
+        if (g_set.rows[i].kind == SET_MONITORS) chooser = i;
+        if (g_set.rows[i].kind == SET_SLIDER) slider = i;
+    }
+    A11yItem item = {0};
+    CHECK(chooser >= 0 && slider >= 0);
+    SetA11yDescribe(&g_set, SetModelFromRow(&g_set, chooser), &item);
+    CHECK(item.role == ROLE_SYSTEM_PUSHBUTTON && wcsstr(item.name, L"all monitors"));
+    ZeroMemory(&item, sizeof(item));
+    SetA11yDescribe(&g_set, SetModelFromRow(&g_set, slider), &item);
+    CHECK(item.role == ROLE_SYSTEM_SLIDER && wcsstr(item.value, L"second"));
+    CHECK(item.rect.bottom - item.rect.top == SET_SLIDER_H);
+    g_set.monitorSelection.selectedOnly = TRUE;
+    ZeroMemory(&item, sizeof(item));
+    SetA11yDescribe(&g_set, SetModelFromRow(&g_set, SET_SAVE(&g_set)), &item);
+    CHECK(item.state & STATE_SYSTEM_UNAVAILABLE);
+
+    static const HotkeyHost host = {ApplyTestHotkeys, SuspendTestHotkeys, TestFirstFailedHotkey};
+    UI_SetHotkeyHost(&host);
+    g_set.monitorSelection.selectedOnly = FALSE;
+    g_set.hotkeys[HOTKEY_BRIGHTEN] = (Hotkey){HK_MOD_CONTROL | HK_MOD_ALT, VK_UP};
+    g_set.hotkeys[HOTKEY_DIM] = g_set.hotkeys[HOTKEY_BRIGHTEN];
+    int oldDestroys = destroys, oldNotifications = saveNotifications;
+    hotkeyApplyCalls = 0;
+    SetTrySave(testParent, &g_set);
+    CHECK(destroys == oldDestroys && saveNotifications == oldNotifications);
+    CHECK(hotkeyApplyCalls == 0 && g_set.errorRow == SetRowOfHotkey(&g_set, HOTKEY_DIM));
+    CHECK(!live.hotkeys[HOTKEY_BRIGHTEN].vk);
+    g_set.hotkeys[HOTKEY_DIM].vk = VK_DOWN;
+    hotkeyApplyFailure = HOTKEY_DIM;
+    SetTrySave(testParent, &g_set);
+    CHECK(hotkeyApplyCalls == 1 && destroys == oldDestroys && saveNotifications == oldNotifications);
+    CHECK(wcsstr(g_set.errorText, L"another app"));
+    int capture = SetRowOfHotkey(&g_set, HOTKEY_BRIGHTEN);
+    SetBeginCapture(testParent, &g_set, capture);
+    CHECK(hotkeysSuspended && g_set.captureRow == capture);
+    SetWndProc(testParent, WM_KEYDOWN, VK_BACK, 0);
+    CHECK(!hotkeysSuspended && g_set.captureRow == -1 && !g_set.hotkeys[HOTKEY_BRIGHTEN].vk);
+    hotkeyApplyFailure = -1;
+    g_set.sourcePollSeconds = 23;
+    SetTrySave(testParent, &g_set);
+    CHECK(hotkeyApplyCalls == 2 && destroys == oldDestroys + 1 && saveNotifications == oldNotifications + 1);
+    CHECK(live.hotkeys[HOTKEY_DIM].vk == VK_DOWN && live.sourcePollSeconds == 23);
+    UI_SetHotkeyHost(NULL);
 }
 
 static void SaveSettingsPreview(const char *path, int seconds)
@@ -603,6 +680,7 @@ int main(int argc, char **argv)
     TestSourceStatusAndBuiltIn();
     TestSourceIntervalSlider();
     TestSlowPollingTelemetryFreshness();
+    TestSettingsAccessibilityAndHotkeyValidation();
     if (argc > 1 && strcmp(argv[1], "--preview") == 0) {
         SaveSettingsPreview("build/settings-source-interval-3.bmp", 3);
         SaveSettingsPreview("build/settings-source-interval-60.bmp", 60);

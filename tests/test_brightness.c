@@ -22,6 +22,7 @@ static BrightMonitor MakeMonitor(DWORD minimum, DWORD current, DWORD maximum, in
     monitor.brightnessCur = current;
     monitor.brightnessMax = maximum;
     monitor.delta = delta;
+    monitor.rangeHi = 100;
     return monitor;
 }
 
@@ -70,38 +71,41 @@ static void TestMasterTargets(void)
     Brightness_TargetRange(&view, &minimum, &maximum);
     CHECK(minimum == 0 && maximum == 100);
     view.count = 3;
-    view.monitors[0] = MakeMonitor(0, 80, 100, 40);
-    view.monitors[1] = MakeMonitor(0, 20, 100, -40);
+    view.monitors[0] = MakeMonitor(0, 70, 100, 40);
+    view.monitors[0].rangeLo = 40;
+    view.monitors[1] = MakeMonitor(0, 30, 100, -40);
+    view.monitors[1].rangeHi = 60;
     view.monitors[2] = MakeMonitor(0, 100, 100, 0);
     view.monitors[2].controllable = FALSE;
-    CHECK(Brightness_MasterTarget(&view) == 50);  /* Average of base targets 40,60. */
+    CHECK(Brightness_MasterTarget(&view) == 50);  /* Both ranges map their middle to 50. */
     Brightness_TargetRange(&view, &minimum, &maximum);
-    CHECK(minimum == -40 && maximum == 140);
-    CHECK(Brightness_SliderToTarget(&view, 0) == -40);
+    CHECK(minimum == 0 && maximum == 100);
+    CHECK(Brightness_SliderToTarget(&view, 0) == 0);
     CHECK(Brightness_SliderToTarget(&view, 50) == 50);
-    CHECK(Brightness_SliderToTarget(&view, 100) == 140);
-    CHECK(Brightness_SliderToTarget(&view, 1) == -39);  /* Truncated 180/100. */
+    CHECK(Brightness_SliderToTarget(&view, 100) == 100);
+    CHECK(Brightness_SliderToTarget(&view, 1) == 1);
     CHECK(Brightness_TargetToSlider(&view, -39) == 0);
     CHECK(Brightness_TargetToSlider(&view, 50) == 50);
     CHECK(Brightness_TargetToSlider(&view, 140) == 100);
     CHECK(Brightness_TargetToSlider(&view, -40) == 0);
     CHECK(Brightness_TargetToSlider(&view, INT_MIN) == 0);
     CHECK(Brightness_TargetToSlider(&view, INT_MAX) == 100);
-    CHECK(Brightness_SliderToTarget(&view, INT_MIN) == -40);
-    CHECK(Brightness_SliderToTarget(&view, INT_MAX) == 140);
+    CHECK(Brightness_SliderToTarget(&view, INT_MIN) == 0);
+    CHECK(Brightness_SliderToTarget(&view, INT_MAX) == 100);
     view.count = 1;
     view.monitors[0] = MakeMonitor(0, 50, 100, 40);
+    view.monitors[0].rangeLo = 40;
     Brightness_TargetRange(&view, &minimum, &maximum);
-    CHECK(minimum == -40 && maximum == 100);  /* Positive delta still includes 100. */
-    CHECK(Brightness_MasterTarget(&view) == 10);
-    CHECK(Brightness_TargetToSlider(&view, 10) == 35);
+    CHECK(minimum == 0 && maximum == 100);
+    CHECK(Brightness_MasterTarget(&view) == 17); /* Inverse range rounds to nearest. */
+    CHECK(Brightness_TargetToSlider(&view, 17) == 17);
     view.monitors[0].delta = -40;
     Brightness_TargetRange(&view, &minimum, &maximum);
-    CHECK(minimum == 0 && maximum == 140);
+    CHECK(minimum == 0 && maximum == 100); /* Legacy offset no longer widens master. */
     view.count = 2;
     view.monitors[0] = MakeMonitor(0, 0, 100, 7);
     view.monitors[1] = MakeMonitor(0, 0, 100, 0);
-    CHECK(Brightness_MasterTarget(&view) == -3);  /* Signed average truncates toward zero. */
+    CHECK(Brightness_MasterTarget(&view) == 0);  /* Legacy deltas do not affect ranges. */
     view.monitors[0].controllable = view.monitors[1].controllable = FALSE;
     CHECK(Brightness_MasterTarget(&view) == 50);
     Brightness_TargetRange(&view, &minimum, &maximum);
@@ -167,23 +171,25 @@ static void TestSelectedMonitorTargets(void)
     view.count = 3;
     view.selectedOnly = TRUE;
     view.monitors[0] = MakeMonitor(0, 70, 100, 10);
+    view.monitors[0].rangeLo = 10;
     view.monitors[1] = MakeMonitor(0, 50, 100, -10);
+    view.monitors[1].rangeHi = 90;
     view.monitors[2] = MakeMonitor(0, 5, 100, 40);
     view.monitors[2].excludedFromControl = TRUE;
     CHECK(Monitor_CanControl(&view.monitors[0]) && Monitor_HasSelected(&view));
     CHECK(!Monitor_CanControl(&view.monitors[2]) && view.monitors[2].controllable);
-    CHECK(Brightness_MasterTarget(&view) == 60); /* Excluded base -35 is ignored. */
+    CHECK(Brightness_MasterTarget(&view) == 61); /* Average inverse levels 67 and 56. */
     Brightness_TargetRange(&view, &minimum, &maximum);
-    CHECK(minimum == -10 && maximum == 110); /* Excluded +40 offset cannot widen it. */
-    CHECK(Brightness_SliderToTarget(&view, 0) == -10);
-    CHECK(Brightness_SliderToTarget(&view, 100) == 110);
+    CHECK(minimum == 0 && maximum == 100);
+    CHECK(Brightness_SliderToTarget(&view, 0) == 0);
+    CHECK(Brightness_SliderToTarget(&view, 100) == 100);
     CHECK(Brightness_TargetToSlider(&view, 50) == 50);
     CHECK(Brightness_GetPercent(&view.monitors[2]) == 5); /* Its reading stays available. */
 
     view.monitors[1].excludedFromControl = TRUE;
-    CHECK(Brightness_MasterTarget(&view) == 60);
+    CHECK(Brightness_MasterTarget(&view) == 67);
     Brightness_TargetRange(&view, &minimum, &maximum);
-    CHECK(minimum == -10 && maximum == 100);
+    CHECK(minimum == 0 && maximum == 100);
     view.monitors[0].excludedFromControl = TRUE;
     CHECK(!Monitor_HasSelected(&view) && Brightness_MasterTarget(&view) == 50);
     Brightness_TargetRange(&view, &minimum, &maximum);
@@ -194,16 +200,20 @@ static void TestSelectedMonitorTargets(void)
     view.monitors[1].controllable = FALSE;
     CHECK(!Monitor_CanControl(&view.monitors[1]) && !Monitor_HasSelected(&view));
     view.monitors[1].controllable = TRUE;
-    CHECK(Monitor_HasSelected(&view) && Brightness_MasterTarget(&view) == 60);
+    CHECK(Monitor_HasSelected(&view) && Brightness_MasterTarget(&view) == 56);
     Brightness_TargetRange(&view, &minimum, &maximum);
-    CHECK(minimum == 0 && maximum == 110);
+    CHECK(minimum == 0 && maximum == 100);
+
+    view.monitors[1].sourceFilter = TRUE;
+    view.monitors[1].sourceKnown = FALSE;
+    CHECK(Brightness_MasterTarget(&view) == 56); /* Suspended source preserves master intent. */
 
     view.selectedOnly = FALSE;
     for (int i = 0; i < view.count; i++) view.monitors[i].excludedFromControl = FALSE;
     CHECK(Monitor_CanControl(&view.monitors[2]));
-    CHECK(Brightness_MasterTarget(&view) == 28); /* Default All includes all three. */
+    CHECK(Brightness_MasterTarget(&view) == 42); /* Default All includes all three. */
     Brightness_TargetRange(&view, &minimum, &maximum);
-    CHECK(minimum == -40 && maximum == 110);
+    CHECK(minimum == 0 && maximum == 100);
 }
 
 int main(void)
@@ -216,6 +226,6 @@ int main(void)
         printf("%d brightness checks failed\n", failures);
         return 1;
     }
-    puts("ALL PASS: brightness arithmetic, delta targets and display identity");
+    puts("ALL PASS: brightness arithmetic, range targets and display identity");
     return 0;
 }

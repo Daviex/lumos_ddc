@@ -4,6 +4,7 @@
 #include <commctrl.h>
 #include <wtsapi32.h>
 #include <shlobj.h>
+#include <windowsx.h>
 #include <stdio.h>
 #include <stdarg.h>
 #include <stdlib.h>
@@ -18,6 +19,8 @@
 #include "capture.h"
 #include "ui_monitor_selection.h"
 #include "idle_black.h"
+#include "brightmap.h"
+#include "remote.h"
 
 /* GUID_CONSOLE_DISPLAY_STATE {6FE69556-704A-47A0-8F24-C28D936FDA47}
    Defined manually because some MinGW headers omit it. Fires on display
@@ -33,6 +36,10 @@ static const GUID kGuidConsoleDisplayState =
 /* Posted by the rescan worker thread when the fresh MonitorList is ready.
    lParam = MonitorList* (heap, adopted and freed by the main thread). */
 #define WM_APP_RESCAN_DONE  (WM_APP + 1)
+
+/* Posted by the mouse hook when wheel notches over the tray icon start to
+   pile up; the notches themselves are counted in g_wheelPending. */
+#define WM_APP_WHEEL        (WM_APP + 4)
 
 /* Schedule tick: recompute the interpolated brightness once a minute. */
 #define SCHEDULE_TIMER_ID   0xB101
@@ -50,6 +57,15 @@ static const GUID kGuidConsoleDisplayState =
 #define RESCAN_RETRY_TIMER_ID     0xB104
 static const DWORD kRescanBackoffMs[] = { 2000, 5000, 10000, 20000 };
 #define RESCAN_MAX_RETRIES ((int)(sizeof(kRescanBackoffMs) / sizeof(kRescanBackoffMs[0])))
+
+/* An external monitor can come back from sleep slower than the laptop panel
+   beside it: the list then has a controllable monitor and is adopted, while the
+   external one does not answer DDC/CI yet. Such a monitor is rescanned on the
+   backoff above and then at this interval until it answers. A retry that falls
+   due while the popup is open waits for it to close, because adopting a list
+   rebuilds the popup and would close it under the user. */
+#define RESCAN_AWAIT_STEADY_MS    60000
+#define RESCAN_AWAIT_DEFER_MS     2000
 
 /* A written-off worker stays parked in the driver call forever, so retrying
    without a bound would leak one thread every watchdog period for as long as
@@ -86,7 +102,7 @@ static int          g_scheduleSuspendMinute = 0;   /* minute-of-day at suspend *
 static int          g_scheduleResumeMinute = 0;    /* next anchor to resume at */
 static ULONGLONG    g_scheduleResumeLocalMinute;   /* dated local-time deadline */
 static int          g_scheduleLastApplied = -1;    /* last brightness pushed by the schedule */
-static int          g_masterTarget;          /* intended base percent, including negative delta compensation */
+static int          g_masterTarget;          /* intended base percent, mapped through per-monitor ranges */
 static BOOL         g_masterTargetValid;
 static BOOL         g_idleDimmed = FALSE;     /* TRUE while the idle level is on the monitors */
 static DWORD        g_idleEpoch;
@@ -104,6 +120,21 @@ typedef struct {
 } RescanState;
 
 static RescanState g_rescan;
+static int          g_awaitRetry = 0;         /* index into kRescanBackoffMs for unanswered monitors */
+static Hotkey       g_hotkeysActive[HOTKEY_COUNT]; /* what RegisterHotKey currently holds */
+static int          g_hotkeyStartupFailure = -1;   /* first action we could not register, or -1 */
+static BOOL         g_hotkeysSuspended = FALSE;    /* released while Settings captures keys */
+static DWORD        g_trayRightClickTick = 0;      /* last right button down or up on the icon */
+static DWORD        g_trayKeySelectTick = 0;       /* last NIN_KEYSELECT */
+static DWORD        g_lastRemoteTick = 0;          /* last lumosctl command, counted as activity */
+static int          g_wheelPending = 0;            /* tray wheel notches not applied yet (hook and handler share the UI thread) */
+static BOOL         g_remoteSeen = FALSE;          /* g_lastRemoteTick is valid */
+#define TRAY_CLICK_WINDOW_MS 1000
+
+/* RegisterHotKey id per HOTKEY_* action, which is also the WM_HOTKEY wParam. */
+static const int kHotkeyIds[HOTKEY_COUNT] = {
+    WM_HOTKEY_BRIGHTEN, WM_HOTKEY_DIM, WM_HOTKEY_POPUP
+};
 
 static const WCHAR APPCLASS[] = L"LumosMain";
 
@@ -113,15 +144,19 @@ static void CreateTrayIcon(HWND hwnd);
 static void RemoveTrayIcon(void);
 static void RegisterHotkeys(HWND hwnd);
 static void UnregisterHotkeys(HWND hwnd);
-static void ShowContextMenu(HWND hwnd);
+static int  ApplyHotkeys(const Hotkey *hotkeys);
+static void SuspendHotkeys(BOOL suspended);
+static int  FirstFailedHotkey(void);
+static void ShowContextMenu(HWND hwnd, const POINT *anchor, BOOL fromKeyboard);
 static void HandleHotkey(int id);
-static void ApplyPreset(int index);
-static void ApplyPresetBrightness(DWORD brightness);
+static BOOL ApplyPreset(int index);
+static BOOL ApplyPresetBrightness(DWORD brightness);
 static void ApplyStartupBrightness(BOOL loginLaunch);
 static void InstallMouseHook(void);
 static void RemoveMouseHook(void);
 static void ScheduleRescan(HWND hwnd);
 static void ScheduleRescanFromTrigger(HWND hwnd);
+static const AppControl kAppControl;   /* lumosctl actions, defined below */
 static void StartRescan(HWND hwnd);
 static DWORD WINAPI RescanThreadProc(LPVOID param);
 
@@ -132,6 +167,7 @@ static void Schedule_ApplyNow(void);
 static void Schedule_Suspend(void);
 static void ManualChange(void);
 static void SliderManualChange(int row, int target);
+static int MasterTargetFromMonitors(void);
 static void Idle_Tick(void);
 static void Idle_Restore(void);
 static void ResumeSourceMonitor(BrightMonitor *monitor);
@@ -139,10 +175,21 @@ static void RestartSourcePolling(void);
 static void TryIdleHandoff(BrightMonitor *monitor);
 static void ApplyIdleBrightness(void);
 
-static void SaveDeltasCallback(void)
+/* A monitor's range changed in the popup. Save it, then put every monitor
+   back on the current master level so the change shows at once: matching two
+   monitors means adjusting one while looking at both. masterLevel is the
+   popup's All Monitors level, used when no level has been set yet. */
+static void RangeChanged(int masterLevel)
 {
-    Settings_SaveDeltas(&g_settings, &g_monitors);
+    Settings_StoreRanges(&g_settings, &g_monitors);
     Settings_Save(&g_settings);
+    if (g_idleDimmed)
+        return;   /* the idle level owns the monitors; the restore uses the new range */
+    if (!g_masterTargetValid)
+        g_masterTarget = masterLevel;
+    g_masterTargetValid = TRUE;
+    UI_SetMasterTarget(g_masterTarget);
+    Monitor_SetAllBrightness(&g_monitors, g_masterTarget);
 }
 
 /* ---- Entry Point ---- */
@@ -204,7 +251,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdLineA, int showCmd
     Monitor_Enumerate(&g_monitors);
     Settings_Init(&g_settings);
     Settings_UpgradeAutostart(); /* Add the login switch to this exe's legacy Run entry. */
-    Settings_LoadDeltas(&g_settings, &g_monitors);
+    Settings_ApplyRanges(&g_settings, &g_monitors);
     Settings_ApplyMonitorSelection(&g_settings, &g_monitors);
 
     if (!UI_Init(hInst)) {
@@ -255,7 +302,10 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdLineA, int showCmd
 
     /* Create popup (hidden) */
     g_hwndPopup = UI_CreatePopup(hInst, &g_monitors);
-    UI_SetDeltaSaveCallback(SaveDeltasCallback);
+    UI_SetRangeChangeCallback(RangeChanged);
+    static const HotkeyHost hotkeyHost = { ApplyHotkeys, SuspendHotkeys, FirstFailedHotkey };
+    UI_SetHotkeyHost(&hotkeyHost);
+    Remote_Init(&kAppControl);
 
     /* Tray icon, hotkeys, mouse hook */
     CreateTrayIcon(g_hwndHidden);
@@ -312,13 +362,22 @@ static void CreateTrayIcon(HWND hwnd)
     g_nid.cbSize = sizeof(g_nid);
     g_nid.hWnd = hwnd;
     g_nid.uID = 1;
-    g_nid.uFlags = NIF_ICON | NIF_TIP | NIF_MESSAGE;
+    /* NIF_SHOWTIP: with NOTIFYICON_VERSION_4 (below) the shell shows the
+       standard tooltip only when asked to; without it hovering showed nothing. */
+    g_nid.uFlags = NIF_ICON | NIF_TIP | NIF_MESSAGE | NIF_SHOWTIP;
     g_nid.uCallbackMessage = WM_TRAYICON;
     g_nid.hIcon = LoadIconW(g_hInst, MAKEINTRESOURCEW(IDI_LUMOS));
     if (!g_nid.hIcon)
         g_nid.hIcon = LoadIconW(NULL, IDI_APPLICATION);
     wcscpy(g_nid.szTip, APP_NAME L" - Monitor Brightness");
     Shell_NotifyIconW(NIM_ADD, &g_nid);
+
+    /* Version 4 is what makes the icon usable from the keyboard: Win+B, then
+       Enter or Space arrives as NIN_KEYSELECT and Shift+F10 or the Menu key as
+       WM_CONTEXTMENU. It also moves the event into LOWORD(lParam) and puts the
+       icon's anchor point into wParam. */
+    g_nid.uVersion = NOTIFYICON_VERSION_4;
+    Shell_NotifyIconW(NIM_SETVERSION, &g_nid);
 }
 
 static void RemoveTrayIcon(void)
@@ -398,9 +457,17 @@ static LRESULT CALLBACK MouseHookProc(int nCode, WPARAM wParam, LPARAM lParam)
         MSLLHOOKSTRUCT *mhs = (MSLLHOOKSTRUCT *)lParam;
         if (IsCursorOverTrayIcon(mhs->pt)) {
             DbgLog("Tray mouse wheel: mouseData=0x%08X", (unsigned)mhs->mouseData);
+            /* Notches are counted, not posted one by one. A brightness step
+               keeps the UI thread busy for 150 ms or more (DDC and WMI writes),
+               and a fast scroll sends 10 to 20 notches a second; one message per
+               notch built a queue that kept the brightness moving long after
+               the wheel stopped. The handler applies all pending notches in
+               one write. */
             short delta = (short)HIWORD(mhs->mouseData);
-            PostMessageW(g_hwndHidden, WM_HOTKEY,
-                         (WPARAM)(delta > 0 ? WM_HOTKEY_BRIGHTEN : WM_HOTKEY_DIM), 0);
+            int before = g_wheelPending;
+            g_wheelPending += (delta > 0) ? 1 : -1;
+            if (before == 0)
+                PostMessageW(g_hwndHidden, WM_APP_WHEEL, 0, 0);
             return 1;
         }
     }
@@ -423,102 +490,221 @@ static void RemoveMouseHook(void)
 
 /* ---- Hotkeys ---- */
 
+/* Holding the brighten or dim combination keeps stepping, as it always has.
+   The popup hotkey gets MOD_NOREPEAT, because a held key would otherwise open
+   and close the popup over and over. */
+static BOOL RegisterOne(int action, Hotkey hk)
+{
+    if (hk.vk == 0)
+        return TRUE;   /* disabled, nothing to hold */
+    UINT mods = hk.mods | (action == HOTKEY_POPUP ? MOD_NOREPEAT : 0);
+    return RegisterHotKey(g_hwndHidden, kHotkeyIds[action], mods, hk.vk);
+}
+
+static void ReleaseAll(void)
+{
+    for (int i = 0; i < HOTKEY_COUNT; i++)
+        UnregisterHotKey(g_hwndHidden, kHotkeyIds[i]);
+}
+
+/* Put g_hotkeysActive back after a capture or a rejected Save. Another program
+   can take a combination in the meantime; such a hotkey is dropped and
+   reported, so the Settings window shows it instead of claiming it works. */
+static void ReregisterActive(void)
+{
+    for (int i = 0; i < HOTKEY_COUNT; i++) {
+        if (!RegisterOne(i, g_hotkeysActive[i])) {
+            DbgLog("hotkey %d was taken by another program", i);
+            g_hotkeysActive[i].vk = 0;
+            if (g_hotkeyStartupFailure < 0)
+                g_hotkeyStartupFailure = i;
+        }
+    }
+}
+
+/* Startup: register what the settings ask for. A combination another program
+   already holds is skipped, since there is nobody to ask at this point. The
+   Settings window shows the conflict on the row when it next opens. */
 static void RegisterHotkeys(HWND hwnd)
 {
-    RegisterHotKey(hwnd, WM_HOTKEY_BRIGHTEN, MOD_CONTROL | MOD_ALT, VK_UP);
-    RegisterHotKey(hwnd, WM_HOTKEY_DIM,      MOD_CONTROL | MOD_ALT, VK_DOWN);
+    (void)hwnd;
+    for (int i = 0; i < HOTKEY_COUNT; i++) {
+        g_hotkeysActive[i] = g_settings.hotkeys[i];
+        if (!RegisterOne(i, g_settings.hotkeys[i])) {
+            DbgLog("hotkey %d is in use by another program", i);
+            g_hotkeysActive[i].vk = 0;
+            if (g_hotkeyStartupFailure < 0)
+                g_hotkeyStartupFailure = i;
+        }
+    }
 }
 
 static void UnregisterHotkeys(HWND hwnd)
 {
-    UnregisterHotKey(hwnd, WM_HOTKEY_BRIGHTEN);
-    UnregisterHotKey(hwnd, WM_HOTKEY_DIM);
+    (void)hwnd;
+    ReleaseAll();
+}
+
+/* Swap in a whole new set, or none of it. Our own registrations are released
+   first, because RegisterHotKey refuses a combination this window already
+   holds under another id. On failure the previous set goes back, so a rejected
+   Save never leaves the user without working hotkeys. */
+static int ApplyHotkeys(const Hotkey *hotkeys)
+{
+    ReleaseAll();
+    for (int i = 0; i < HOTKEY_COUNT; i++) {
+        if (!RegisterOne(i, hotkeys[i])) {
+            ReleaseAll();
+            ReregisterActive();
+            return i;
+        }
+    }
+    for (int i = 0; i < HOTKEY_COUNT; i++)
+        g_hotkeysActive[i] = hotkeys[i];
+    g_hotkeysSuspended = FALSE;
+    g_hotkeyStartupFailure = -1;
+    return -1;
+}
+
+static int FirstFailedHotkey(void)
+{
+    return g_hotkeyStartupFailure;
+}
+
+static void SuspendHotkeys(BOOL suspended)
+{
+    if (suspended == g_hotkeysSuspended)
+        return;
+    g_hotkeysSuspended = suspended;
+    if (suspended)
+        ReleaseAll();
+    else
+        ReregisterActive();
 }
 
 /* ---- Context Menu ---- */
 
-static void ShowContextMenu(HWND hwnd)
+static void ShowContextMenu(HWND hwnd, const POINT *anchor, BOOL fromKeyboard)
 {
-    UI_ShowContextMenu(hwnd, &g_settings);
+    UI_ShowContextMenu(hwnd, &g_settings, anchor, fromKeyboard);
 }
 
 /* ---- Hotkey Handler ---- */
 
-static void HandleHotkey(int id)
+/* Recover the All Monitors level from what the monitors currently report:
+   map each selected reading back through its range and average the results. */
+static int MasterTargetFromMonitors(void)
+{
+    return Brightness_MasterTarget(&g_monitors);
+}
+
+/* Move the master level by delta, the way the All Monitors slider would.
+   Shared by the hotkeys, the tray wheel and lumosctl; the OSD is the caller's. */
+static BOOL StepMaster(int delta)
+{
+    /* Initialize target from current state if needed */
+    if (!g_masterTargetValid)
+        g_masterTarget = MasterTargetFromMonitors();
+    g_masterTargetValid = TRUE;
+
+    g_masterTarget += delta;
+    if (g_masterTarget < 0) g_masterTarget = 0;
+    if (g_masterTarget > 100) g_masterTarget = 100;
+    UI_SetMasterTarget(g_masterTarget);
+
+    /* No DDC read-back: Monitor_SetBrightness already stores the written
+       level, and the read cost about half of every step, which made the tray
+       wheel lag. */
+    BOOL ok = TRUE;
+    TIMED("step: SetAllBrightness",
+          ok = Monitor_SetAllBrightness(&g_monitors, g_masterTarget));
+
+    /* Update popup if visible */
+    UI_RefreshPopup(g_hwndPopup, &g_monitors);
+
+    ManualChange();
+    return ok;
+}
+
+/* A brightness step from the hotkeys or the tray wheel: the step itself, then
+   the OSD on the monitor under the cursor. */
+static void StepWithOsd(int delta)
 {
     if (!Monitor_HasSelected(&g_monitors)) return;
+    StepMaster(delta);
+
+    /* The OSD shows the All Monitors level, the value the step just moved.
+       The level of the monitor under the cursor stops at the ends of that
+       monitor's range (50% for a range of 50-100) and looks stuck there. */
+    POINT curPos;
+    GetCursorPos(&curPos);
+    HMONITOR hCurMon = MonitorFromPoint(curPos, MONITOR_DEFAULTTOPRIMARY);
+    int selected = -1;
+    for (int i = 0; i < g_monitors.count; i++) {
+        BrightMonitor *monitor = &g_monitors.monitors[i];
+        if (!Monitor_CanControl(monitor) || !Monitor_SourceAllowsControl(monitor)) continue;
+        if (selected < 0) selected = i;
+        if (monitor->hMonitor == hCurMon) {
+            selected = i;
+            break;
+        }
+    }
+    if (selected >= 0)
+        UI_ShowOSD(g_hInst, g_monitors.monitors[selected].hMonitor, g_masterTarget,
+                   !UI_IsPopupVisible(g_hwndPopup));
+}
+
+static void HandleHotkey(int id)
+{
     int step = g_settings.step;
     int delta = 0;
 
     switch (id) {
     case WM_HOTKEY_BRIGHTEN: delta = step;  break;
     case WM_HOTKEY_DIM:      delta = -step; break;
+    case WM_HOTKEY_POPUP:
+        /* No tray icon to anchor to, so the popup opens in the middle of the
+           monitor the cursor is on. WM_HOTKEY grants the foreground right that
+           UI_ShowPopup needs to take the keyboard focus. */
+        if (UI_IsPopupVisible(g_hwndPopup)) {
+            UI_HidePopup(g_hwndPopup);
+        } else {
+            POINT pt;
+            GetCursorPos(&pt);
+            MONITORINFO mi = { 0 };
+            mi.cbSize = sizeof(mi);
+            GetMonitorInfoW(MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST), &mi);
+            POINT center = { (mi.rcWork.left + mi.rcWork.right) / 2,
+                             (mi.rcWork.top + mi.rcWork.bottom) / 2 };
+            UI_ShowPopup(g_hwndPopup, &g_monitors, &center, TRUE);
+        }
+        return;
     default: return;
     }
 
-    /* Initialize target from current state if needed */
-    if (!g_masterTargetValid) {
-        g_masterTarget = Brightness_MasterTarget(&g_monitors);
-        g_masterTargetValid = TRUE;
-    }
-
-    g_masterTarget += delta;
-
-    int lo, hi;
-    Brightness_TargetRange(&g_monitors, &lo, &hi);
-    if (g_masterTarget < lo) g_masterTarget = lo;
-    if (g_masterTarget > hi) g_masterTarget = hi;
-    UI_SetMasterTarget(g_masterTarget);
-
-    TIMED("hotkey: SetAllBrightness",
-          Monitor_SetAllBrightness(&g_monitors, g_masterTarget));
-
-    /* Show feedback on an affected display, preferring the cursor's monitor. */
-    TIMED("hotkey: RefreshBrightness", Monitor_RefreshBrightness(&g_monitors));
-    {
-        POINT curPos;
-        GetCursorPos(&curPos);
-        HMONITOR hCurMon = MonitorFromPoint(curPos, MONITOR_DEFAULTTOPRIMARY);
-        int selected = -1;
-        for (int i = 0; i < g_monitors.count; i++) {
-            BrightMonitor *mon = &g_monitors.monitors[i];
-            if (!Monitor_CanControl(mon) || !Monitor_SourceAllowsControl(mon)) continue;
-            if (selected < 0) selected = i;
-            if (mon->hMonitor == hCurMon) {
-                selected = i;
-                break;
-            }
-        }
-        if (selected >= 0) {
-            BrightMonitor *mon = &g_monitors.monitors[selected];
-            UI_ShowOSD(g_hInst, mon->hMonitor, Brightness_GetPercent(mon));
-        }
-    }
-
-    /* Update popup if visible */
-    UI_RefreshPopup(g_hwndPopup, &g_monitors);
-
-    ManualChange();
+    if (Monitor_HasSelected(&g_monitors))
+        StepWithOsd(delta);
 }
 
 /* ---- Apply Preset ---- */
 
-static void ApplyPreset(int index)
+static BOOL ApplyPreset(int index)
 {
-    if (index < 0 || index >= g_settings.presetCount) return;
-    ApplyPresetBrightness(g_settings.presets[index].brightness);
+    if (index < 0 || index >= g_settings.presetCount) return FALSE;
+    return ApplyPresetBrightness(g_settings.presets[index].brightness);
 }
 
-static void ApplyPresetBrightness(DWORD brightness)
+static BOOL ApplyPresetBrightness(DWORD brightness)
 {
     g_masterTarget = (int)brightness;
     g_masterTargetValid = TRUE;
     UI_SetMasterTarget(g_masterTarget);
-    Monitor_SetAllBrightness(&g_monitors, g_masterTarget);
+    BOOL ok = Monitor_SetAllBrightness(&g_monitors, g_masterTarget);
     Monitor_RefreshBrightness(&g_monitors);
     UI_RefreshPopup(g_hwndPopup, &g_monitors);
 
     ManualChange();
+    return ok;
 }
 
 static void ApplyStartupBrightness(BOOL loginLaunch)
@@ -528,7 +714,7 @@ static void ApplyStartupBrightness(BOOL loginLaunch)
         return;
     }
 
-    /* Treat Day as a preset selection, including per-monitor offsets and
+    /* Treat Day as a preset selection, including per-monitor ranges and
        suspension of the schedule until its next anchor. */
     ApplyPresetBrightness((DWORD)Settings_DayBrightness(&g_settings));
 
@@ -538,6 +724,80 @@ static void ApplyStartupBrightness(BOOL loginLaunch)
     g_rescan.reapplyBrightness = TRUE;
     ScheduleRescanFromTrigger(g_hwndHidden);
 }
+
+/* Forward declarations for the switches below (defined further down). */
+static void SetScheduleEnabled(BOOL on);
+static void SetIdleDimEnabled(BOOL on);
+
+/* ---- lumosctl (remote.c runs the protocol, these are its actions) ---- */
+
+/* A lumosctl command is the user acting, even though no key was pressed: it
+   ends an idle dim the way input would, and the idle countdown starts again
+   from it. Without this, the next idle tick dimmed a level the user had just
+   set (a scheduled "lumosctl --preset Day" was undone two seconds later). */
+static void RemoteActivity(void)
+{
+    g_lastRemoteTick = GetTickCount();
+    g_remoteSeen = TRUE;
+    if (g_idleDimmed)
+        Idle_Restore();
+}
+
+static MonitorList *AppMonitors(void) { return &g_monitors; }
+static Settings    *AppSettings(void) { return &g_settings; }
+
+/* What the monitors show now, as an All Monitors level. Read from the
+   monitors rather than g_masterTarget, which holds the level to come back to
+   while the idle dim is on. */
+static int AppMasterLevel(void)
+{
+    int v = MasterTargetFromMonitors();
+    return v < 0 ? 0 : (v > 100 ? 100 : v);
+}
+
+static BOOL AppSetMaster(int percent)
+{
+    RemoteActivity();
+    g_masterTarget = percent;
+    g_masterTargetValid = TRUE;
+    UI_SetMasterTarget(g_masterTarget);
+    BOOL ok = Monitor_SetAllBrightness(&g_monitors, percent);
+    Monitor_RefreshBrightness(&g_monitors);
+    UI_RefreshPopup(g_hwndPopup, &g_monitors);
+    ManualChange();
+    return ok;
+}
+
+static BOOL AppStepMaster(int delta)
+{
+    RemoteActivity();
+    return StepMaster(delta);
+}
+
+static BOOL AppSetMonitor(int index, int percent)
+{
+    if (index < 0 || index >= g_monitors.count) return FALSE;
+    RemoteActivity();
+    BOOL ok = Monitor_SetBrightness(&g_monitors.monitors[index], (DWORD)percent);
+    UI_RefreshPopup(g_hwndPopup, &g_monitors);
+    if (ok) SliderManualChange(index, percent);
+    return ok;
+}
+
+static BOOL AppApplyPreset(int index)
+{
+    RemoteActivity();
+    return ApplyPreset(index);
+}
+
+static void AppSetSchedule(BOOL on)  { RemoteActivity(); SetScheduleEnabled(on); }
+static void AppSetIdleDim(BOOL on)   { RemoteActivity(); SetIdleDimEnabled(on); }
+static void AppRescan(void)          { RemoteActivity(); ScheduleRescanFromTrigger(g_hwndHidden); }
+
+static const AppControl kAppControl = {
+    AppMonitors, AppSettings, AppMasterLevel, AppSetMaster, AppStepMaster,
+    AppSetMonitor, AppApplyPreset, AppSetSchedule, AppSetIdleDim, AppRescan
+};
 
 /* ---- Monitor rescan (async) ---- */
 
@@ -622,6 +882,7 @@ static void ScheduleRescanThrottled(HWND hwnd)
 {
     g_rescan.writeOffs = 0;
     g_rescan.retry = 0;
+    g_awaitRetry = 0;
     DWORD since = GetTickCount() - g_rescan.lastStartTick;
     DWORD delay = (since >= RESCAN_MIN_INTERVAL_MS)
                   ? RESCAN_DEBOUNCE_MS
@@ -635,6 +896,7 @@ static void ScheduleRescanFromTrigger(HWND hwnd)
 {
     g_rescan.writeOffs = 0;
     g_rescan.retry = 0;
+    g_awaitRetry = 0;
     KillTimer(hwnd, RESCAN_RETRY_TIMER_ID);   /* a pending backoff is now moot */
     ScheduleRescan(hwnd);
 }
@@ -722,6 +984,18 @@ static void ReapplyBrightness(void)
     }
 }
 
+/* Put the monitors in mask (bit i = monitor i) on the current All Monitors
+   level, leaving the others alone. Skipped when no level has been set yet. */
+static void ApplyMasterTo(unsigned mask)
+{
+    for (int i = 0; i < g_monitors.count; i++) {
+        BrightMonitor *mon = &g_monitors.monitors[i];
+        if (mask & (1u << i))
+            ResumeSourceMonitor(mon);
+    }
+    UI_RefreshPopup(g_hwndPopup, &g_monitors);
+}
+
 /* A manual brightness change: hand control back to the user until the next anchor. */
 static void Schedule_Suspend(void)
 {
@@ -778,7 +1052,12 @@ static DWORD IdleMilliseconds(void)
     lii.dwTime = 0;
     if (!GetLastInputInfo(&lii))
         return 0;
-    return GetTickCount() - lii.dwTime;   /* unsigned math, so the 49-day wrap is fine */
+    DWORD now = GetTickCount();
+    DWORD idle = now - lii.dwTime;        /* unsigned math, so the 49-day wrap is fine */
+    /* A lumosctl command counts as activity too (see RemoteActivity). */
+    if (g_remoteSeen && now - g_lastRemoteTick < idle)
+        idle = now - g_lastRemoteTick;
+    return idle;
 }
 
 /* Reasons to leave the brightness alone even though no input has arrived. */
@@ -811,7 +1090,7 @@ static void DimIdleMonitor(BrightMonitor *monitor)
         if (++g_idleEpoch == 0) ++g_idleEpoch;
         monitor->idleEpoch = g_idleEpoch;
     }
-    int percent = g_settings.idleDimPercent + monitor->delta;
+    int percent = BrightMap_Level(g_settings.idleDimPercent, monitor->rangeLo, monitor->rangeHi);
     if (percent < 0) percent = 0;
     if (percent > 100) percent = 100;
     /* A new dim replaces any queued release for this monitor. */
@@ -911,7 +1190,7 @@ static void Idle_Restore(void)
         for (int i = 0; i < g_monitors.count; i++) {
             BrightMonitor *monitor = &g_monitors.monitors[i];
             if (!Monitor_CanControl(monitor) || monitor->idleBlack) continue;
-            int target = g_masterTarget + monitor->delta;
+            int target = BrightMap_Level(g_masterTarget, monitor->rangeLo, monitor->rangeHi);
             if (target < 0) target = 0;
             if (target > 100) target = 100;
             Monitor_SetBrightness(monitor, (DWORD)target);
@@ -1029,7 +1308,7 @@ static void UpdateMonitorSelection(void)
     if (g_idleDimmed && g_masterTargetValid) {
         for (int i = 0; i < g_monitors.count; i++) {
             if (!(retained & (1u << i))) continue;
-            int target = g_masterTarget + g_monitors.monitors[i].delta;
+            int target = BrightMap_Level(g_masterTarget, g_monitors.monitors[i].rangeLo, g_monitors.monitors[i].rangeHi);
             if (target < 0) target = 0;
             if (target > 100) target = 100;
             Monitor_SetBrightness(&g_monitors.monitors[i], (DWORD)target);
@@ -1087,6 +1366,22 @@ static void HandleCommand(HWND hwnd, int cmd)
         Settings_Save(&g_settings);
         RestartSourcePolling();
         UpdateMonitorSelection();
+        int oldLo[MAX_MONITORS];
+        for (int i = 0; i < g_monitors.count; i++)
+            oldLo[i] = g_monitors.monitors[i].rangeLo;
+        int level = g_masterTargetValid ? g_masterTarget : MasterTargetFromMonitors();
+        Settings_ApplyRanges(&g_settings, &g_monitors);
+        BOOL minChanged = FALSE;
+        for (int i = 0; i < g_monitors.count; i++)
+            if (g_monitors.monitors[i].rangeLo != oldLo[i])
+                minChanged = TRUE;
+        if (minChanged && !g_idleDimmed) {
+            g_masterTarget = level;
+            g_masterTargetValid = TRUE;
+            UI_SetMasterTarget(g_masterTarget);
+            Monitor_SetAllBrightness(&g_monitors, g_masterTarget);
+            UI_RefreshPopup(g_hwndPopup, &g_monitors);
+        }
         if (!g_settings.idleDimEnabled)
             Idle_Restore();           /* undo an active dim right away */
         RestartSchedule();
@@ -1146,7 +1441,10 @@ static void HandleTimer(HWND hwnd, WPARAM wParam)
         }
     } else if (wParam == RESCAN_RETRY_TIMER_ID) {
         KillTimer(hwnd, RESCAN_RETRY_TIMER_ID);
-        StartRescan(hwnd);
+        if (g_hwndPopup && UI_IsPopupVisible(g_hwndPopup))
+            SetTimer(hwnd, RESCAN_RETRY_TIMER_ID, RESCAN_AWAIT_DEFER_MS, NULL);
+        else
+            StartRescan(hwnd);
     }
 }
 
@@ -1175,7 +1473,7 @@ static void ResumeSourceMonitor(BrightMonitor *monitor)
             return; /* Manual launch without a requested brightness. */
         }
     }
-    int percent = base + monitor->delta;
+    int percent = BrightMap_Level(base, monitor->rangeLo, monitor->rangeHi);
     if (percent < 0) percent = 0;
     if (percent > 100) percent = 100;
     Monitor_SetBrightness(monitor, (DWORD)percent);
@@ -1254,6 +1552,7 @@ static void HandleMonitorResult(HWND hwnd, MonitorResult *result)
             monitor->brightnessCur = result->current;
             monitor->brightnessMax = result->maximum;
             monitor->controllable = TRUE;
+            monitor->awaitingAnswer = FALSE;
         }
         if (!result->brightnessWritten) {
             if ((!wasControllable && monitor->controllable) ||
@@ -1320,9 +1619,11 @@ static void ApplyPendingTargets(const MonitorTarget pending[MAX_MONITORS], DWORD
 }
 
 /* Takes ownership of fresh and rebuilds the popup on the main thread. */
-static void AdoptMonitorList(MonitorList *fresh)
+static int AdoptMonitorList(MonitorList *fresh)
 {
     IdleBlack_Clear();
+    unsigned recovered = 0;
+    int waiting = Monitor_TrackUnanswered(fresh, &g_monitors, &recovered);
     /* Finish any active drag against the old topology before replacing it.
        In-flight hardware calls retain their own handle leases. */
     if (g_hwndPopup) DestroyWindow(g_hwndPopup);
@@ -1344,7 +1645,7 @@ static void AdoptMonitorList(MonitorList *fresh)
     TIMED("rescan done: cleanup", Monitor_Cleanup(&g_monitors));
     g_monitors = *fresh; /* Transfer ownership of the fresh list's leases. */
     free(fresh);
-    Settings_LoadDeltas(&g_settings, &g_monitors);
+    Settings_ApplyRanges(&g_settings, &g_monitors);
     Settings_ApplyMonitorSelection(&g_settings, &g_monitors);
     /* Enumeration can already see the PC input on return. Revalidate here so
        source polling also resumes devices which disappeared from the topology. */
@@ -1359,16 +1660,20 @@ static void AdoptMonitorList(MonitorList *fresh)
 
     /* Keep a pending restore through placeholder results, even after retries
        expire. A monitor connected while idle must inherit the idle level too. */
+    BOOL reapplied = FALSE;
     if ((g_rescan.reapplyBrightness || g_idleDimmed) &&
         Monitor_HasSelected(&g_monitors)) {
         g_rescan.reapplyBrightness = FALSE;
         TIMED("rescan done: ReapplyBrightness", ReapplyBrightness());
+        reapplied = TRUE;
     }
+    if (!reapplied && recovered) ApplyMasterTo(recovered);
     ApplyPendingTargets(pending, pendingMask);
     /* Enumeration may have read before a write completed. */
     Monitor_RefreshBrightness(&g_monitors);
     MonitorWorker_RefreshSources(&g_monitors, UI_MonitorSelectionIsOpen());
     IdleBlack_Update(&g_monitors, g_settings.idleDimEnabled, g_idleDimmed);
+    return waiting;
 }
 
 static void HandleRescanResult(HWND hwnd, DWORD gen, MonitorList *fresh)
@@ -1393,7 +1698,7 @@ static void HandleRescanResult(HWND hwnd, DWORD gen, MonitorList *fresh)
        until the next display event. Retry on a backoff and keep the list we
        have, which is either still valid or about to be replaced anyway. */
     if (fresh) Settings_ApplyMonitorSelection(&g_settings, fresh);
-    if (fresh && !Monitor_HasSelected(fresh) &&
+    if (fresh && !Monitor_HasControllable(fresh) &&
         (Monitor_HasSelected(&g_monitors) || g_rescan.reapplyBrightness) &&
         g_rescan.retry < RESCAN_MAX_RETRIES) {
         DWORD delay = kRescanBackoffMs[g_rescan.retry++];
@@ -1406,12 +1711,40 @@ static void HandleRescanResult(HWND hwnd, DWORD gen, MonitorList *fresh)
     }
     g_rescan.retry = 0;
 
-    if (fresh) AdoptMonitorList(fresh);
+    if (fresh) {
+        int waiting = AdoptMonitorList(fresh);
+        if (waiting > 0) {
+            DWORD delay = g_awaitRetry < RESCAN_MAX_RETRIES
+                          ? kRescanBackoffMs[g_awaitRetry++] : RESCAN_AWAIT_STEADY_MS;
+            SetTimer(hwnd, RESCAN_RETRY_TIMER_ID, delay, NULL);
+        } else {
+            g_awaitRetry = 0;
+        }
+    }
     g_rescan.busy = 0;
     if (g_rescan.pending) {   /* triggers arrived mid-run: coalesce one more */
         g_rescan.pending = FALSE;
         ScheduleRescan(hwnd);
     }
+}
+
+/* ---- Switches shared by the tray menu and lumosctl ---- */
+
+static void SetScheduleEnabled(BOOL on)
+{
+    g_settings.scheduleEnabled = on;
+    Settings_Save(&g_settings);
+    g_scheduleSuspended = FALSE;      /* re-enable takes effect immediately */
+    g_scheduleLastApplied = -1;
+    Schedule_ApplyNow();
+}
+
+static void SetIdleDimEnabled(BOOL on)
+{
+    g_settings.idleDimEnabled = on;
+    Settings_Save(&g_settings);
+    if (!on)
+        Idle_Restore();   /* undo an active dim immediately */
 }
 
 /* ---- Main Window Proc ---- */
@@ -1426,20 +1759,56 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
     }
 
     switch (msg) {
-    case WM_TRAYICON:
+    case WM_TRAYICON: {
+        /* NOTIFYICON_VERSION_4: event in LOWORD(lParam), anchor in wParam. */
+        POINT anchor = { GET_X_LPARAM(wParam), GET_Y_LPARAM(wParam) };
         switch (LOWORD(lParam)) {
-        case WM_LBUTTONUP:
-            UI_TogglePopup(g_hwndPopup, &g_monitors);
+        case NIN_SELECT:          /* left click */
+            /* Ignored right after a keyboard select, in case the shell sends
+               both for one Enter: the toggle would close the popup again. */
+            if (GetTickCount() - g_trayKeySelectTick > TRAY_CLICK_WINDOW_MS)
+                UI_TogglePopup(g_hwndPopup, &g_monitors);
             break;
+        case NIN_KEYSELECT:
+            /* Show, never toggle: Enter can deliver NIN_KEYSELECT twice, and a
+               toggle would close the popup again at once. */
+            g_trayKeySelectTick = GetTickCount();
+            if (!UI_IsPopupVisible(g_hwndPopup))
+                UI_ShowPopup(g_hwndPopup, &g_monitors, &anchor, TRUE);
+            break;
+        case WM_RBUTTONDOWN:
         case WM_RBUTTONUP:
-            ShowContextMenu(hwnd);
+            g_trayRightClickTick = GetTickCount();
+            break;
+        case WM_CONTEXTMENU:      /* right click, Shift+F10 or the Menu key */
+            /* A right click sends button messages just before; without one,
+               the menu was opened from the keyboard. The button-up counts too,
+               so a long press still reads as a click. */
+            ShowContextMenu(hwnd, &anchor,
+                            GetTickCount() - g_trayRightClickTick > TRAY_CLICK_WINDOW_MS);
             break;
         }
         return 0;
+    }
 
     case WM_HOTKEY:
         HandleHotkey((int)wParam);
         return 0;
+
+    case WM_APP_WHEEL: {
+        int notches = g_wheelPending;
+        g_wheelPending = 0;
+        if (notches != 0)
+            StepWithOsd(notches * g_settings.step);
+        return 0;
+    }
+
+    case WM_COPYDATA: {
+        LRESULT r;
+        if (Remote_HandleCopyData(hwnd, wParam, lParam, &r))
+            return r;
+        break;
+    }
 
     case WM_COMMAND:
         HandleCommand(hwnd, LOWORD(wParam));

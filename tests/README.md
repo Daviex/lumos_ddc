@@ -17,14 +17,14 @@ From the repository root with a Windows Clang/MinGW toolchain in `PATH`:
 Create the `build` directory first if it does not exist.
 
 ```powershell
-clang -std=c11 -Wall -Wextra -Werror -DUNICODE -D_UNICODE tests/test_settings.c schedule.c monitor_selection.c -o build/test_settings.exe
+clang -std=c11 -Wall -Wextra -Werror -DUNICODE -D_UNICODE tests/test_settings.c schedule.c monitor_selection.c brightmap.c hotkey.c -o build/test_settings.exe
 ./build/test_settings.exe
 ```
 
 With MSVC from a developer command prompt:
 
 ```bat
-cl /nologo /std:c11 /W4 /DUNICODE /D_UNICODE tests\test_settings.c schedule.c monitor_selection.c /Fe:build\test_settings.exe /Fo"build\\"
+cl /nologo /std:c11 /W4 /DUNICODE /D_UNICODE tests\test_settings.c schedule.c monitor_selection.c brightmap.c hotkey.c /Fe:build\test_settings.exe /Fo"build\\"
 build\test_settings.exe
 ```
 
@@ -74,12 +74,12 @@ and is skipped when its final source read reports the PC input, a different
 alternate input, or an unknown input. Cancellation prevents pending native writes.
 
 ```powershell
-clang -std=c11 -Wall -Wextra -Werror -DUNICODE -D_UNICODE tests/test_monitor.c brightness.c -ldxva2 -luser32 -lgdi32 -ladvapi32 -o build/test_monitor.exe
+clang -std=c11 -Wall -Wextra -Werror -DUNICODE -D_UNICODE tests/test_monitor.c brightness.c brightmap.c -ldxva2 -luser32 -lgdi32 -ladvapi32 -o build/test_monitor.exe
 ./build/test_monitor.exe
 ```
 
 ```bat
-cl /nologo /std:c11 /W4 /DUNICODE /D_UNICODE tests\test_monitor.c brightness.c /Fe:build\test_monitor.exe /Fo"build\\" /link dxva2.lib user32.lib gdi32.lib advapi32.lib
+cl /nologo /std:c11 /W4 /DUNICODE /D_UNICODE tests\test_monitor.c brightness.c brightmap.c /Fe:build\test_monitor.exe /Fo"build\\" /link dxva2.lib user32.lib gdi32.lib advapi32.lib
 build\test_monitor.exe
 ```
 
@@ -87,15 +87,15 @@ build\test_monitor.exe
 APIs, renders the real popup into offscreen DIBs and simulates mouse
 messages. It verifies GDI resource reuse and cleanup, pixel stability, resize
 and allocation errors, the final drag value, capture loss, cancellation and
-master target bookkeeping. Excluded sliders and delta controls cannot write, and the master operates only
+master target bookkeeping. Excluded sliders and range controls cannot write, and the master operates only
 on the selected displays, including the case where none is available.
-Source-filtered rows reject slider/delta input on another or unknown source and
+Source-filtered rows reject slider/range input on another or unknown source and
 become available again when the PC input is reported.
 Window and monitor operations are mocked; no window is shown and no monitor or
 registry setting is changed.
 
 ```powershell
-clang -std=c11 -Wall -Wextra -Werror -DUNICODE -D_UNICODE tests/test_ui.c brightness.c -o build/test_ui.exe -lgdi32 -luser32 -lshell32 -ldwmapi
+clang -std=c11 -Wall -Wextra -Werror -DUNICODE -D_UNICODE tests/test_ui.c brightness.c brightmap.c ui_draw.c -o build/test_ui.exe -lgdi32 -luser32 -lshell32 -ldwmapi
 ./build/test_ui.exe
 ```
 
@@ -108,11 +108,11 @@ clang -std=c11 -Wall -Wextra -Werror test_schedule.c schedule.c -o build/test_sc
 ```
 
 `test_brightness.c` exercises the shared pure calculations and identity matching:
-nonzero offsets, rounding, full DWORD ranges, delta compensation, master slider
+nonzero native bounds, rounding, full DWORD ranges, per-monitor range mapping, master slider
 endpoints, renamed/reordered displays and ambiguous monitor identities.
 
 ```powershell
-clang -std=c11 -Wall -Wextra -Werror -DUNICODE -D_UNICODE tests/test_brightness.c brightness.c -o build/test_brightness.exe
+clang -std=c11 -Wall -Wextra -Werror -DUNICODE -D_UNICODE tests/test_brightness.c brightness.c brightmap.c -o build/test_brightness.exe
 ./build/test_brightness.exe
 ```
 
@@ -145,12 +145,12 @@ GDI DIB verifies that every painted pixel is RGB 0,0,0. No screen is covered
 and no real execution-state request is made.
 
 ```powershell
-clang -std=c11 -Wall -Wextra -Werror -DUNICODE -D_UNICODE tests/test_idle_black.c brightness.c -lgdi32 -luser32 -o build/test_idle_black.exe
+clang -std=c11 -Wall -Wextra -Werror -DUNICODE -D_UNICODE tests/test_idle_black.c brightness.c brightmap.c -lgdi32 -luser32 -o build/test_idle_black.exe
 ./build/test_idle_black.exe
 ```
 
 ```powershell
-clang -O2 -std=c11 -Wall -Wextra -Werror -DUNICODE -D_UNICODE -ffunction-sections -fdata-sections tests/test_startup.c brightness.c schedule.c monitor_selection.c '-Wl,--gc-sections' -lshell32 -o build/test_startup.exe
+clang -O2 -std=c11 -Wall -Wextra -Werror -DUNICODE -D_UNICODE -ffunction-sections -fdata-sections tests/test_startup.c brightness.c brightmap.c schedule.c monitor_selection.c hotkey.c '-Wl,--gc-sections' -lshell32 -o build/test_startup.exe
 ./build/test_startup.exe
 ```
 
@@ -165,6 +165,35 @@ Its real renderer draws to offscreen DIBs; optional `--preview` saves 3-second
 and 60-second Settings BMP previews under `build` for visual inspection.
 
 ```powershell
-clang -O2 -std=c11 -Wall -Wextra -Werror -DUNICODE -D_UNICODE -ffunction-sections -fdata-sections tests/test_monitor_selection_ui.c monitor_selection.c schedule.c ui_graphics.c '-Wl,--gc-sections' -lgdi32 -luser32 -lshell32 -ldwmapi -lcomctl32 -o build/test_monitor_selection_ui.exe
+clang -O2 -std=c11 -Wall -Wextra -Werror -DUNICODE -D_UNICODE -ffunction-sections -fdata-sections tests/test_monitor_selection_ui.c monitor_selection.c schedule.c ui_graphics.c ui_draw.c hotkey.c '-Wl,--gc-sections' -lgdi32 -luser32 -lshell32 -ldwmapi -lcomctl32 -o build/test_monitor_selection_ui.exe
 ./build/test_monitor_selection_ui.exe
+```
+
+The upstream `test_brightmap.c`, `test_hotkey.c` and `test_cliparse.c` cover
+range mapping/inversion, hotkey parsing/formatting and command line parsing.
+They perform no hardware writes or configuration changes.
+
+```powershell
+clang -std=c11 -Wall -Wextra -Werror test_brightmap.c brightmap.c -o build/test_brightmap.exe
+./build/test_brightmap.exe
+clang -std=c11 -Wall -Wextra -Werror test_hotkey.c hotkey.c -o build/test_hotkey.exe
+./build/test_hotkey.exe
+clang -std=c11 -Wall -Wextra -Werror test_cliparse.c cliparse.c -o build/test_cliparse.exe
+./build/test_cliparse.exe
+```
+
+Settings tests also verify legacy hotkeys and range migration together with
+the saved monitor selection, source filters, polling interval and OLED policy.
+Startup tests cover partial monitor recovery with steady retries, popup deferral
+and command line activity across idle, range mapping and reordered discovery.
+
+`test_remote.c` runs the real command execution with mocked windows, monitor
+snapshots and worker actions. It checks cumulative relative commands while a
+filtered write is pending, fresh unfiltered readings, selected preset targets,
+queued replies, invalid requests and ambiguous monitor names. It performs no
+hardware writes, window creation or configuration I/O.
+
+```powershell
+clang -std=c11 -Wall -Wextra -Werror -DUNICODE -D_UNICODE tests/test_remote.c -o build/test_remote.exe
+./build/test_remote.exe
 ```

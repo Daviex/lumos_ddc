@@ -1,4 +1,5 @@
-#include "ui.h"
+#include "ui_internal.h"
+#include "brightmap.h"
 #include "ui_graphics.h"
 #include "brightness.h"
 #include <shellapi.h>
@@ -16,6 +17,9 @@ typedef struct {
     int activeSlider;
     int masterPercent;
     int dragPercent;
+    BOOL keyDrag;
+    int focusItem;
+    BOOL focusVisible;
 } PopupData;
 
 typedef struct {
@@ -26,7 +30,9 @@ typedef struct {
     BOOL sourceBlocked[MAX_MONITORS];
     BOOL sourceUnknown[MAX_MONITORS];
     int percent[MAX_MONITORS + 1];
-    int delta[MAX_MONITORS];
+    int rangeHi[MAX_MONITORS];
+    int focusItem;
+    BOOL focusVisible;
     WCHAR name[MAX_MONITORS][128];
 } PopupFrame;
 
@@ -57,8 +63,7 @@ static int g_masterTarget;
 
 static int GetMasterPercent(MonitorList *ml)
 {
-    int target = g_masterTargetKnown ? g_masterTarget : Brightness_MasterTarget(ml);
-    return Brightness_TargetToSlider(ml, target);
+    return g_masterTargetKnown ? g_masterTarget : Monitor_MasterFromSnapshot(ml);
 }
 
 static BOOL CanAdjustSlider(const PopupData *pd, int row)
@@ -72,13 +77,13 @@ static BOOL CanAdjustSlider(const PopupData *pd, int row)
 /* Forward declarations for layout helpers */
 static void GetSliderRect(int row, RECT *rc);
 
-/* ---- Callback for saving deltas from UI ---- */
+/* ---- Callback for range changes from the UI ---- */
 
-static DeltaSaveCallback g_deltaSaveCb = NULL;
+static RangeChangeCallback g_rangeChangeCb = NULL;
 
-void UI_SetDeltaSaveCallback(DeltaSaveCallback cb)
+void UI_SetRangeChangeCallback(RangeChangeCallback cb)
 {
-    g_deltaSaveCb = cb;
+    g_rangeChangeCb = cb;
 }
 
 static ManualChangeCallback g_manualChangeCb = NULL;
@@ -172,6 +177,92 @@ static int XFromPercent(RECT *sliderRect, int pct)
     int trackRight = sliderRect->right - SLIDER_THUMB_R;
     return trackLeft + (pct * (trackRight - trackLeft)) / 100;
 }
+
+/* ---- Keyboard items ----
+   Focus order follows the layout: each monitor's slider, then its offset
+   control, then "All Monitors". Item i belongs to row i / 2, which also gives
+   the master row (ml->count) for the last item. */
+
+static int ItemCount(PopupData *pd)  { return pd->ml->count * 2 + 1; }
+static int MasterItem(PopupData *pd) { return pd->ml->count * 2; }
+static int ItemRow(int item)         { return item / 2; }
+
+static BOOL ItemIsOffset(PopupData *pd, int item)
+{
+    return item < MasterItem(pd) && (item % 2) == 1;
+}
+
+/* The percentage a row shows right now, including a drag in progress. */
+static int RowPercent(PopupData *pd, int row)
+{
+    if (pd->activeSlider == row && pd->dragPercent >= 0)
+        return pd->dragPercent;
+    if (row == pd->ml->count)
+        return pd->masterPercent;
+    return Brightness_GetPercent(&pd->ml->monitors[row]);
+}
+
+/* Outline drawn around the focused item. */
+static void GetItemFocusRect(PopupData *pd, int item, RECT *rc)
+{
+    int row = ItemRow(item);
+    if (ItemIsOffset(pd, item)) {
+        RECT rcMinus, rcValue, rcPlus;
+        GetDeltaButtonRects(row, &rcMinus, &rcValue, &rcPlus);
+        SetRect(rc, rcMinus.left - 3, rcMinus.top - 3, rcPlus.right + 3, rcPlus.bottom + 3);
+    } else {
+        GetSliderRect(row, rc);
+        InflateRect(rc, 4, SLIDER_THUMB_R + 3);
+    }
+}
+
+static int PopupA11yCount(void *ctx)
+{
+    return ItemCount((PopupData *)ctx);
+}
+
+static void PopupA11yDescribe(void *ctx, int index, A11yItem *out)
+{
+    PopupData *pd = (PopupData *)ctx;
+    if (index < 0) {
+        out->role = ROLE_SYSTEM_DIALOG;
+        out->state = STATE_SYSTEM_FOCUSABLE;
+        wcscpy(out->name, APP_NAME L" brightness");
+        return;
+    }
+    int row = ItemRow(index);
+    BOOL isMaster = (index == MasterItem(pd));
+    BrightMonitor *mon = isMaster ? NULL : &pd->ml->monitors[row];
+    GetItemFocusRect(pd, index, &out->rect);
+    out->state = STATE_SYSTEM_FOCUSABLE;
+    if (!CanAdjustSlider(pd, row))
+        out->state |= STATE_SYSTEM_UNAVAILABLE;
+
+    if (ItemIsOffset(pd, index)) {
+        out->role = ROLE_SYSTEM_SPINBUTTON;
+        _snwprintf(out->name, 159, L"%s maximum", mon->name);
+        _snwprintf(out->value, 63, L"%d%%", mon->rangeHi);
+    } else {
+        out->role = ROLE_SYSTEM_SLIDER;
+        if (isMaster)
+            wcscpy(out->name, pd->ml->selectedOnly ? L"Selected monitors" : L"All monitors");
+        else
+            _snwprintf(out->name, 159, L"%s", mon->name);
+        if (!CanAdjustSlider(pd, row))
+            wcscpy(out->value, L"Unavailable");
+        else
+            _snwprintf(out->value, 63, L"%d%%", RowPercent(pd, row));
+    }
+}
+
+static int PopupA11yFocused(void *ctx)
+{
+    return ((PopupData *)ctx)->focusItem;
+}
+
+static const A11yModel g_popupModel = {
+    PopupA11yCount, PopupA11yDescribe, PopupA11yFocused, NULL, &g_popupData
+};
 
 /* ---- Popup rendering (UpdateLayeredWindow) ---- */
 
@@ -304,6 +395,8 @@ static void GetPopupFrame(PopupData *pd, PopupFrame *frame)
     memset(frame, 0, sizeof(*frame));
     frame->count = pd->ml->count;
     frame->selectedOnly = pd->ml->selectedOnly;
+    frame->focusItem = pd->focusItem;
+    frame->focusVisible = pd->focusVisible;
     for (int row = 0; row <= frame->count; row++) {
         frame->enabled[row] = CanAdjustSlider(pd, row);
         if (row == frame->count) {
@@ -311,7 +404,7 @@ static void GetPopupFrame(PopupData *pd, PopupFrame *frame)
         } else {
             BrightMonitor *mon = &pd->ml->monitors[row];
             frame->percent[row] = Brightness_GetPercent(mon);
-            frame->delta[row] = mon->delta;
+            frame->rangeHi[row] = mon->rangeHi;
             frame->excluded[row] = mon->excludedFromControl;
             frame->sourceBlocked[row] = !Monitor_SourceAllowsControl(mon);
             frame->sourceUnknown[row] = !mon->sourceKnown || !mon->expectedInput;
@@ -430,18 +523,18 @@ static void RenderPopup(HWND hwnd, PopupData *pd)
             DrawTextW(dc, L"\x2013", -1, &rcMinus, DT_CENTER | DT_VCENTER | DT_SINGLELINE); /* en dash as minus */
             DrawTextW(dc, L"+", -1, &rcPlus, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
 
-            /* Delta value */
+            /* Upper end of this monitor's brightness range. */
             WCHAR deltaStr[16];
-            int d = frame.delta[row];
-            if (d > 0)
-                wsprintfW(deltaStr, L"\x25B3+%d", d);
-            else if (d < 0)
-                wsprintfW(deltaStr, L"\x25B3%d", d);
-            else
-                wsprintfW(deltaStr, L"\x25B3 0");
+            wsprintfW(deltaStr, L"Max %d%%", frame.rangeHi[row]);
             SetTextColor(dc, UI_ColorRef(CLR_SUBTEXT));
             DrawTextW(dc, deltaStr, -1, &rcValue, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
         }
+    }
+
+    if (pd->focusVisible && pd->focusItem >= 0 && pd->focusItem < ItemCount(pd)) {
+        RECT focus;
+        GetItemFocusRect(pd, pd->focusItem, &focus);
+        DrawFocusRing(dc, &focus, 8);
     }
 
     RestoreDC(dc, savedDC);
@@ -486,7 +579,7 @@ static void ApplySliderValue(PopupData *pd, int row, int percent)
     MonitorList *ml = pd->ml;
     if (!CanAdjustSlider(pd, row)) return;
     BOOL isMaster = (row == ml->count);
-    int target = isMaster ? Brightness_SliderToTarget(ml, percent) : percent;
+    int target = percent;
 
     if (isMaster) {
         pd->masterPercent = percent;
@@ -519,6 +612,109 @@ static void FinishSliderDrag(HWND hwnd, PopupData *pd, int releasePercent)
     RenderPopup(hwnd, pd);
 }
 
+/* ---- Keyboard ---- */
+
+static void SetFocusItem(HWND hwnd, PopupData *pd, int item)
+{
+    int n = ItemCount(pd);
+    pd->focusItem = (item % n + n) % n;   /* wrap both ways */
+    RenderPopup(hwnd, pd);
+    A11y_NotifyFocus(hwnd, pd->focusItem);
+}
+
+/* The worker coalesces targets while the UI follows each key repeat. */
+static void KeyAdjustSlider(HWND hwnd, PopupData *pd, int row, int pct)
+{
+    if (!CanAdjustSlider(pd, row)) return;
+    if (pct < 0) pct = 0;
+    if (pct > 100) pct = 100;
+    if (pct == RowPercent(pd, row)) return;
+    pd->activeSlider = row;
+    pd->keyDrag = TRUE;
+    pd->dragPercent = pct;
+    ApplySliderValue(pd, row, pct);
+    RenderPopup(hwnd, pd);
+    A11y_NotifyValue(hwnd, pd->focusItem);
+}
+
+static void EndKeyDrag(HWND hwnd, PopupData *pd)
+{
+    if (!pd || !pd->keyDrag) return;
+    pd->keyDrag = FALSE;
+    FinishSliderDrag(hwnd, pd, -1);
+}
+
+/* Set a monitor's level at All Monitors 100%. The low end comes from
+   Settings, and the range keeps its minimum width. */
+static void AdjustMax(HWND hwnd, PopupData *pd, int row, int value)
+{
+    if (!CanAdjustSlider(pd, row) || row >= pd->ml->count) return;
+    BrightMonitor *mon = &pd->ml->monitors[row];
+    int lo = mon->rangeLo;
+    if (value < lo + BRIGHTMAP_MIN_SPAN) value = lo + BRIGHTMAP_MIN_SPAN;
+    if (value > 100) value = 100;
+    if (value == mon->rangeHi)
+        return;
+    mon->rangeHi = value;
+    if (g_rangeChangeCb) g_rangeChangeCb(pd->masterPercent);
+    RenderPopup(hwnd, pd);
+    A11y_NotifyValue(hwnd, pd->focusItem);
+}
+
+/* Standard slider keys: Tab and Shift+Tab move between controls, the arrows
+   change the value by 1 (Up and Right raise it), Page Up and Page Down by 10,
+   Home and End go to the limits. Escape closes. */
+static void PopupKeyDown(HWND hwnd, PopupData *pd, WPARAM vk)
+{
+    int item = pd->focusItem;
+    int row = ItemRow(item);
+
+    if (!pd->focusVisible) {
+        pd->focusVisible = TRUE;
+        RenderPopup(hwnd, pd);
+    }
+
+    if (vk == VK_ESCAPE) {
+        UI_HidePopup(hwnd);
+        return;
+    }
+    if (vk == VK_TAB) {
+        EndKeyDrag(hwnd, pd);
+        SetFocusItem(hwnd, pd, item + (KEY_DOWN(VK_SHIFT) ? -1 : 1));
+        return;
+    }
+
+    int dir = 0, page = 0, limit = 0;
+    switch (vk) {
+    case VK_RIGHT: case VK_UP:   dir = 1;  break;
+    case VK_LEFT:  case VK_DOWN: dir = -1; break;
+    case VK_PRIOR: page = 1;  break;
+    case VK_NEXT:  page = -1; break;
+    case VK_HOME:  limit = -1; break;
+    case VK_END:   limit = 1;  break;
+    default: return;
+    }
+
+    if (ItemIsOffset(pd, item)) {
+        int v = pd->ml->monitors[row].rangeHi;
+        if (limit)
+            v = (limit > 0) ? 100 : 0;   /* AdjustMax raises 0 to the lowest allowed */
+        else
+            v += dir + page * 5;
+        AdjustMax(hwnd, pd, row, v);
+        return;
+    }
+
+    if (!CanAdjustSlider(pd, row))
+        return;
+    int pct = RowPercent(pd, row);
+    if (limit)
+        pct = (limit > 0) ? 100 : 0;
+    else
+        pct += dir + page * 10;
+    KeyAdjustSlider(hwnd, pd, row, pct);
+}
+
 /* ---- Popup Window Procedure ---- */
 
 static LRESULT CALLBACK PopupWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
@@ -530,8 +726,27 @@ static LRESULT CALLBACK PopupWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
         CREATESTRUCTW *cs = (CREATESTRUCTW *)lParam;
         pd = (PopupData *)cs->lpCreateParams;
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, (LONG_PTR)pd);
+        A11y_Attach(hwnd, &g_popupModel);
         return 0;
     }
+
+    case WM_GETOBJECT: {
+        LRESULT result;
+        if (A11y_HandleGetObject(hwnd, wParam, lParam, &result)) return result;
+        break;
+    }
+
+    case WM_KEYDOWN:
+        if (pd) PopupKeyDown(hwnd, pd, wParam);
+        return 0;
+
+    case WM_KEYUP:
+        if (pd) EndKeyDrag(hwnd, pd);
+        return 0;
+
+    case WM_CLOSE:
+        UI_HidePopup(hwnd);
+        return 0;
 
     case WM_LBUTTONDOWN: {
         if (!pd) break;
@@ -541,20 +756,16 @@ static LRESULT CALLBACK PopupWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
         int deltaRow;
         int deltaDir = HitTestDelta(pd, x, y, &deltaRow);
         if (deltaDir != 0 && deltaRow >= 0) {
-            BrightMonitor *mon = &pd->ml->monitors[deltaRow];
-            int oldDelta = mon->delta;
-            mon->delta += deltaDir;
-            if (mon->delta < -40) mon->delta = -40;
-            if (mon->delta > 40) mon->delta = 40;
-            if (mon->delta == oldDelta) return 0;
-            if (g_deltaSaveCb) g_deltaSaveCb();
-            pd->masterPercent = GetMasterPercent(pd->ml);
-            RenderPopup(hwnd, pd);
+            EndKeyDrag(hwnd, pd);
+            pd->focusItem = deltaRow * 2 + 1;
+            AdjustMax(hwnd, pd, deltaRow, pd->ml->monitors[deltaRow].rangeHi + deltaDir);
             return 0;
         }
 
         int row = HitTestSlider(pd, x, y);
         if (row >= 0) {
+            EndKeyDrag(hwnd, pd);
+            pd->focusItem = row * 2;
             pd->activeSlider = row;
             RECT rc;
             GetSliderRect(row, &rc);
@@ -568,7 +779,7 @@ static LRESULT CALLBACK PopupWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
     }
 
     case WM_MOUSEMOVE: {
-        if (!pd || pd->activeSlider < 0) break;
+        if (!pd || pd->activeSlider < 0 || pd->keyDrag) break;
         if (!(wParam & MK_LBUTTON)) {
             FinishSliderDrag(hwnd, pd, -1);
             return 0;
@@ -603,7 +814,9 @@ static LRESULT CALLBACK PopupWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
         return 0;
 
     case WM_DESTROY:
+        A11y_Detach(hwnd);
         if (pd) {
+            pd->keyDrag = FALSE;
             pd->activeSlider = -1;
             pd->dragPercent = -1;
         }
@@ -649,6 +862,7 @@ HWND UI_CreatePopup(HINSTANCE hInst, MonitorList *ml)
     g_popupData.activeSlider = -1;
     g_popupData.dragPercent = -1;
     g_popupData.masterPercent = GetMasterPercent(ml);
+    g_popupData.focusItem = MasterItem(&g_popupData);
 
     int h = GetPopupHeight(&g_popupData);
 
@@ -662,20 +876,24 @@ HWND UI_CreatePopup(HINSTANCE hInst, MonitorList *ml)
     return hwnd;
 }
 
-void UI_ShowPopup(HWND hwnd, MonitorList *ml)
+void UI_ShowPopup(HWND hwnd, MonitorList *ml, const POINT *anchor, BOOL fromKeyboard)
 {
     if (!hwnd) return;
 
     Monitor_RefreshBrightness(ml);
     g_popupData.ml = ml;
     g_popupData.masterPercent = GetMasterPercent(ml);
+    g_popupData.focusItem = MasterItem(&g_popupData);
 
     int h = GetPopupHeight(&g_popupData);
     SetWindowPos(hwnd, NULL, 0, 0, POPUP_WIDTH, h, SWP_NOMOVE | SWP_NOZORDER);
 
-    /* Position near cursor (tray icon), adjusted to stay on-screen */
+    g_popupData.focusVisible = fromKeyboard;
+
+    /* Position near the tray anchor or cursor, adjusted to stay on-screen. */
     POINT pt;
-    GetCursorPos(&pt);
+    if (anchor) pt = *anchor;
+    else GetCursorPos(&pt);
 
     HMONITOR hMon = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
     MONITORINFO mi = { 0 };
@@ -702,7 +920,7 @@ void UI_ShowPopup(HWND hwnd, MonitorList *ml)
         y = pt.y - h;
         if (y < mi.rcWork.top) y = pt.y;
     } else {
-        /* Bottom taskbar (default) — place above cursor */
+        /* Bottom taskbar (default) â€” place above cursor */
         y = pt.y - h - 8;
         if (y < mi.rcWork.top)
             y = pt.y + 8;
@@ -712,11 +930,13 @@ void UI_ShowPopup(HWND hwnd, MonitorList *ml)
     RenderPopup(hwnd, &g_popupData);
     ShowWindow(hwnd, SW_SHOWNOACTIVATE);
     SetForegroundWindow(hwnd);
+    A11y_NotifyFocus(hwnd, g_popupData.focusItem);
 }
 
 void UI_HidePopup(HWND hwnd)
 {
     if (!hwnd) return;
+    EndKeyDrag(hwnd, &g_popupData);
     FinishSliderDrag(hwnd, &g_popupData, -1);
     ShowWindow(hwnd, SW_HIDE);
 }
@@ -726,7 +946,7 @@ void UI_TogglePopup(HWND hwnd, MonitorList *ml)
     if (IsWindowVisible(hwnd))
         UI_HidePopup(hwnd);
     else
-        UI_ShowPopup(hwnd, ml);
+        UI_ShowPopup(hwnd, ml, NULL, FALSE);
 }
 
 BOOL UI_IsPopupVisible(HWND hwnd)
@@ -736,21 +956,39 @@ BOOL UI_IsPopupVisible(HWND hwnd)
 
 void UI_SetMasterTarget(int target)
 {
+    if (target < 0) target = 0;
+    if (target > 100) target = 100;
     if (g_masterTargetKnown && g_masterTarget == target) return;
     g_masterTargetKnown = TRUE;
     g_masterTarget = target;
     if (g_popupData.ml)
-        g_popupData.masterPercent = Brightness_TargetToSlider(g_popupData.ml, target);
+        g_popupData.masterPercent = target;
     g_popupRender.frameValid = FALSE;
 }
 
 void UI_RefreshPopup(HWND hwnd, MonitorList *ml)
 {
     if (!hwnd || !IsWindowVisible(hwnd)) return;
+    int oldItem = g_popupData.focusItem;
+    int oldRow = ItemRow(oldItem);
+    int before = g_popupRender.frameValid && oldRow >= 0 && oldRow <= g_popupRender.frame.count
+        ? g_popupRender.frame.percent[oldRow] : -1;
     g_popupData.ml = ml;
-    if (g_popupData.activeSlider >= 0 && !CanAdjustSlider(&g_popupData, g_popupData.activeSlider))
+    if (g_popupData.focusItem >= ItemCount(&g_popupData))
+        g_popupData.focusItem = MasterItem(&g_popupData);
+    if (g_popupData.activeSlider >= 0 && !CanAdjustSlider(&g_popupData, g_popupData.activeSlider)) {
+        g_popupData.keyDrag = FALSE;
         FinishSliderDrag(hwnd, &g_popupData, -1);
+    }
     if (g_popupData.activeSlider != ml->count)
         g_popupData.masterPercent = GetMasterPercent(ml);
     RenderPopup(hwnd, &g_popupData);
+    if (oldItem == g_popupData.focusItem && !ItemIsOffset(&g_popupData, oldItem) &&
+        RowPercent(&g_popupData, ItemRow(oldItem)) != before)
+        A11y_NotifyValue(hwnd, oldItem);
+}
+
+BOOL UiPopup_Init(HINSTANCE hInst)
+{
+    return UI_PopupInit(hInst);
 }

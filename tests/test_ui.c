@@ -24,6 +24,7 @@ static int lastRow, lastTarget;
 static BOOL failNextDC, failNextBrush, failNextCommit;
 static BOOL sawAllLabel, sawSelectedLabel, sawExcludedLabel;
 static MonitorList testMonitors;
+static SHORT WINAPI MockGetKeyState(int vk) { (void)vk; return 0; }
 
 static BOOL WINAPI MockUpdateLayeredWindow(HWND, HDC, const POINT *, const SIZE *,
                                           HDC, const POINT *, COLORREF,
@@ -56,6 +57,7 @@ static int WINAPI MockDrawTextW(HDC, LPCWSTR, int, LPRECT, UINT);
 #define DeleteDC MockDeleteDC
 #define DeleteObject MockDeleteObject
 #define DrawTextW MockDrawTextW
+#define GetKeyState MockGetKeyState
 #include "../ui_graphics.c"
 #include "../ui_popup.c"
 #undef UpdateLayeredWindow
@@ -71,6 +73,7 @@ static int WINAPI MockDrawTextW(HDC, LPCWSTR, int, LPRECT, UINT);
 #undef DeleteDC
 #undef DeleteObject
 #undef DrawTextW
+#undef GetKeyState
 
 static BOOL WINAPI MockUpdateLayeredWindow(HWND hwnd, HDC destination,
                                           const POINT *position, const SIZE *size,
@@ -174,17 +177,22 @@ BOOL Monitor_SetBrightness(BrightMonitor *monitor, DWORD percent)
     return TRUE;
 }
 
-void Monitor_SetAllBrightness(MonitorList *view, int target)
+BOOL Monitor_SetAllBrightness(MonitorList *view, int target)
 {
     CHECK(view == &testMonitors);
     allCalls++;
     for (int i = 0; i < view->count; i++) {
         if (!Monitor_CanControl(&view->monitors[i])) continue;
-        int percent = target + view->monitors[i].delta;
-        if (percent < 0) percent = 0;
-        if (percent > 100) percent = 100;
-        Monitor_SetBrightness(&view->monitors[i], (DWORD)percent);
+        int percent = BrightMap_Level(target, view->monitors[i].rangeLo, view->monitors[i].rangeHi);
+        if (Monitor_SourceAllowsControl(&view->monitors[i]))
+            Monitor_SetBrightness(&view->monitors[i], (DWORD)percent);
     }
+    return TRUE;
+}
+
+int Monitor_MasterFromSnapshot(const MonitorList *view)
+{
+    return Brightness_MasterTarget(view);
 }
 
 void Monitor_RefreshBrightness(MonitorList *view)
@@ -193,6 +201,16 @@ void Monitor_RefreshBrightness(MonitorList *view)
     refreshCalls++;
 }
 
+/* Accessibility notifications are isolated from the desktop in these tests. */
+void A11y_Attach(HWND window, const A11yModel *model) { (void)window; (void)model; }
+void A11y_Detach(HWND window) { (void)window; }
+BOOL A11y_HandleGetObject(HWND window, WPARAM wp, LPARAM lp, LRESULT *result)
+{ (void)window; (void)wp; (void)lp; (void)result; return FALSE; }
+void A11y_NotifyFocus(HWND window, int index) { (void)window; (void)index; }
+void A11y_NotifyValue(HWND window, int index) { (void)window; (void)index; }
+void A11y_NotifyName(HWND window, int index) { (void)window; (void)index; }
+void A11y_NotifyState(HWND window, int index) { (void)window; (void)index; }
+
 static void ManualChange(int row, int target)
 {
     manualCalls++;
@@ -200,11 +218,11 @@ static void ManualChange(int row, int target)
     lastTarget = target;
     /* Match the application callback's authoritative master bookkeeping. */
     UI_SetMasterTarget(row == -1 ? target :
-                       (int)testMonitors.monitors[row].brightnessCur -
-                       testMonitors.monitors[row].delta);
+                       BrightMap_Master((int)testMonitors.monitors[row].brightnessCur,
+                           testMonitors.monitors[row].rangeLo, testMonitors.monitors[row].rangeHi));
 }
 
-static void SaveDelta(void) { deltaSaves++; }
+static void SaveRange(int masterLevel) { CHECK(masterLevel == g_popupData.masterPercent); deltaSaves++; }
 
 static void ResetPopup(int count)
 {
@@ -214,6 +232,7 @@ static void ResetPopup(int count)
     for (int i = 0; i < count; i++) {
         BrightMonitor *monitor = &testMonitors.monitors[i];
         monitor->brightnessMax = 100;
+        monitor->rangeHi = 100;
         monitor->brightnessCur = 50;
         monitor->controllable = TRUE;
         monitor->backend = BACKEND_DDC;
@@ -225,6 +244,7 @@ static void ResetPopup(int count)
     g_popupData.dragPercent = -1;
     g_masterTargetKnown = FALSE;
     g_popupData.masterPercent = GetMasterPercent(&testMonitors);
+    g_popupData.focusItem = MasterItem(&g_popupData);
     testUserData = (LONG_PTR)&g_popupData;
     testCapture = NULL;
     testVisible = TRUE;
@@ -232,7 +252,7 @@ static void ResetPopup(int count)
     sawAllLabel = sawSelectedLabel = sawExcludedLabel = FALSE;
     failNextDC = failNextBrush = failNextCommit = FALSE;
     UI_SetManualChangeCallback(ManualChange);
-    UI_SetDeltaSaveCallback(SaveDelta);
+    UI_SetRangeChangeCallback(SaveRange);
 }
 
 static LPARAM SliderPosition(int row, int percent)
@@ -385,13 +405,14 @@ static void TestDragFinalValue(void)
 static void TestMasterTarget(void)
 {
     ResetPopup(1);
-    testMonitors.monitors[0].delta = 40;
+    testMonitors.monitors[0].rangeLo = 20;
+    testMonitors.monitors[0].rangeHi = 80;
     CHECK(!g_masterTargetKnown);
-    CHECK(GetMasterPercent(&testMonitors) == 35); /* infer (50 - 40) */
+    CHECK(GetMasterPercent(&testMonitors) == 50); /* inverse range maps 50 to 50. */
     PopupWndProc(testWindow, WM_LBUTTONDOWN, MK_LBUTTON, SliderPosition(1, 100));
     PopupWndProc(testWindow, WM_LBUTTONUP, 0, SliderPosition(1, 100));
     CHECK(lastRow == -1 && lastTarget == 100);
-    CHECK(testMonitors.monitors[0].brightnessCur == 100);
+    CHECK(testMonitors.monitors[0].brightnessCur == 80);
     UI_RefreshPopup(testWindow, &testMonitors);
     CHECK(g_popupData.masterPercent == 100 && GetMasterPercent(&testMonitors) == 100);
 
@@ -405,7 +426,7 @@ static void TestMasterTarget(void)
     UI_RefreshPopup(testWindow, &testMonitors);
     CHECK(commits == oldCommits);
     ReleasePopupRenderCache();
-    puts("PASS master target stays authoritative with delta and clamping");
+    puts("PASS master target stays authoritative with range mapping and clamping");
 }
 
 static LPARAM DeltaPosition(int row, BOOL plus)
@@ -437,7 +458,7 @@ static void TestMonitorSelection(void)
     CHECK(g_popupData.activeSlider == -1 && testCapture == NULL);
     CHECK(setCalls == 0 && allCalls == 0 && manualCalls == 0);
     PopupWndProc(testWindow, WM_LBUTTONDOWN, MK_LBUTTON, DeltaPosition(1, TRUE));
-    CHECK(testMonitors.monitors[1].delta == 0 && deltaSaves == 0);
+    CHECK(testMonitors.monitors[1].rangeHi == 100 && deltaSaves == 0);
     ApplySliderValue(&g_popupData, 1, 0); /* Direct callers are guarded as well. */
     CHECK(setCalls == 0 && manualCalls == 0 && refreshCalls == 0);
 
@@ -446,8 +467,8 @@ static void TestMonitorSelection(void)
     CHECK(lastRow == -1 && lastTarget == 100 && allCalls == 2 && setCalls == 2);
     CHECK(testMonitors.monitors[0].brightnessCur == 100);
     CHECK(testMonitors.monitors[1].brightnessCur == 50 && manualCalls == 2);
-    PopupWndProc(testWindow, WM_LBUTTONDOWN, MK_LBUTTON, DeltaPosition(0, TRUE));
-    CHECK(testMonitors.monitors[0].delta == 1 && deltaSaves == 1);
+    PopupWndProc(testWindow, WM_LBUTTONDOWN, MK_LBUTTON, DeltaPosition(0, FALSE));
+    CHECK(testMonitors.monitors[0].rangeHi == 99 && deltaSaves == 1);
     CHECK(manualCalls == 2); /* Calibration retains its existing callback policy. */
 
     testMonitors.monitors[1].excludedFromControl = FALSE;
@@ -527,6 +548,62 @@ static void TestSourceFilteredControls(void)
     puts("PASS source mismatch/unknown suspends row controls and recovers on match");
 }
 
+static void TestKeyboardAndAccessibility(void)
+{
+    ResetPopup(2);
+    testMonitors.selectedOnly = TRUE;
+    testMonitors.monitors[1].excludedFromControl = TRUE;
+    A11yItem item = {0};
+    PopupA11yDescribe(&g_popupData, 2, &item);
+    CHECK(item.role == ROLE_SYSTEM_SLIDER && (item.state & STATE_SYSTEM_UNAVAILABLE));
+    g_popupData.focusItem = 2;
+    PopupWndProc(testWindow, WM_KEYDOWN, VK_END, 0);
+    PopupWndProc(testWindow, WM_KEYUP, VK_END, 0);
+    CHECK(!setCalls && !manualCalls && !g_popupData.keyDrag);
+    g_popupData.focusItem = 3;
+    PopupWndProc(testWindow, WM_KEYDOWN, VK_HOME, 0);
+    CHECK(testMonitors.monitors[1].rangeHi == 100 && !deltaSaves);
+
+    BrightMonitor *monitor = &testMonitors.monitors[0];
+    monitor->sourceFilter = TRUE;
+    monitor->expectedInput = 0x0F;
+    monitor->sourceKnown = TRUE;
+    monitor->currentInput = 0x12;
+    g_popupData.focusItem = 0;
+    ZeroMemory(&item, sizeof(item));
+    PopupA11yDescribe(&g_popupData, 0, &item);
+    CHECK(item.state & STATE_SYSTEM_UNAVAILABLE);
+    PopupWndProc(testWindow, WM_KEYDOWN, VK_END, 0);
+    CHECK(!setCalls && !manualCalls);
+    monitor->currentInput = 0x0F;
+    PopupWndProc(testWindow, WM_KEYDOWN, VK_RIGHT, 0);
+    CHECK(lastRow == 0 && lastTarget == 51 && g_popupData.keyDrag);
+    PopupWndProc(testWindow, WM_KEYUP, VK_RIGHT, 0);
+    CHECK(lastTarget == 51 && !g_popupData.keyDrag && g_popupData.activeSlider == -1);
+
+    g_popupData.focusItem = 1;
+    monitor->rangeLo = 20;
+    PopupWndProc(testWindow, WM_KEYDOWN, VK_HOME, 0);
+    CHECK(monitor->rangeHi == 20 + BRIGHTMAP_MIN_SPAN && deltaSaves == 1);
+    g_popupData.focusItem = 0;
+    UI_RefreshPopup(testWindow, &testMonitors);
+    CHECK(g_popupData.focusItem == 0); /* Worker refresh keeps keyboard focus. */
+    PopupWndProc(testWindow, WM_KEYDOWN, VK_TAB, 0);
+    CHECK(g_popupData.focusItem == 1 && g_popupData.focusVisible);
+    ZeroMemory(&item, sizeof(item));
+    PopupA11yDescribe(&g_popupData, MasterItem(&g_popupData), &item);
+    CHECK(wcscmp(item.name, L"Selected monitors") == 0);
+    CHECK(!(item.state & STATE_SYSTEM_UNAVAILABLE));
+    monitor->excludedFromControl = TRUE;
+    ZeroMemory(&item, sizeof(item));
+    PopupA11yDescribe(&g_popupData, MasterItem(&g_popupData), &item);
+    CHECK(item.state & STATE_SYSTEM_UNAVAILABLE);
+    PopupWndProc(testWindow, WM_KEYDOWN, VK_ESCAPE, 0);
+    CHECK(!testVisible && testCapture == NULL);
+    ReleasePopupRenderCache();
+    puts("PASS keyboard exact intent, range bounds, focus refresh and accessible eligibility");
+}
+
 int main(void)
 {
     TestRenderCache();
@@ -535,6 +612,7 @@ int main(void)
     TestMonitorSelection();
     TestNoEligibleControls();
     TestSourceFilteredControls();
+    TestKeyboardAndAccessibility();
     ReleasePopupRenderCache();
     printf("UI tests: %s\n", failures ? "FAIL" : "ALL PASS");
     return failures ? 1 : 0;

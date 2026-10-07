@@ -4,8 +4,13 @@
 #include <windows.h>
 #include "monitor.h"
 #include "schedule.h"
+#include "hotkey.h"
 
 #define MAX_PRESETS 10
+
+/* Range entries outlive the monitors they belong to (a dock at work, a TV at
+   home), so the table holds more names than can be connected at once. */
+#define MAX_RANGES  32
 #define MAX_PRESET_NAME 64
 #define DEFAULT_DAY_BRIGHTNESS 80
 #define MIN_SOURCE_POLL_SECONDS 1
@@ -44,9 +49,16 @@ typedef struct {
     int    presetCount;
     int    step;       /* brightness step for hotkeys and mouse wheel (default 5) */
     BOOL   autostart;
-    int    deltaCount;
-    WCHAR  deltaNames[MAX_MONITORS][128];
-    int    deltaValues[MAX_MONITORS];
+    /* Per-monitor ranges from [Ranges], keyed by monitor name (a second
+       monitor with the same name gets " #2", and so on). rangeConnected marks
+       the entries whose monitor is in the current list (Settings_ApplyRanges).
+       rangeNewLo/Hi is the range a monitor without an entry starts with. */
+    int    rangeCount;
+    WCHAR  rangeNames[MAX_RANGES][136];
+    int    rangeLo[MAX_RANGES];
+    int    rangeHi[MAX_RANGES];
+    BOOL   rangeConnected[MAX_RANGES];
+    int    rangeNewLo, rangeNewHi;
     SchedulePoint schedule[MAX_SCHEDULE];
     int           scheduleCount;
     BOOL          scheduleEnabled;
@@ -55,6 +67,7 @@ typedef struct {
     int           idleDimMinutes;   /* idle time before dimming */
     int           sourcePollSeconds; /* periodic input-source checks, 1-60 seconds */
     MonitorSelection monitorSelection;
+    Hotkey        hotkeys[HOTKEY_COUNT];   /* indexed by HOTKEY_BRIGHTEN etc. */
 } Settings;
 
 /* Initialize settings path and load from INI */
@@ -96,10 +109,12 @@ BOOL Settings_GetAutostart(void);
    startup flag. Absent entries and other commands are left unchanged. */
 BOOL Settings_UpgradeAutostart(void);
 
-/* Load delta values from settings into monitors (match by name) */
-void Settings_LoadDeltas(Settings *s, MonitorList *ml);
+/* Give every monitor its saved range (matched by name). A monitor without one
+   gets the full range and an entry, so the Settings window can list it. */
+void Settings_ApplyRanges(Settings *s, MonitorList *ml);
 
-/* Copy current monitor deltas into settings for saving */
-void Settings_SaveDeltas(Settings *s, MonitorList *ml);
+/* Copy the monitors' ranges into the settings for saving. Entries of monitors
+   that are not connected are kept. */
+void Settings_StoreRanges(Settings *s, const MonitorList *ml);
 
 #endif /* PRESETS_H */

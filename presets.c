@@ -1,4 +1,5 @@
 #include "presets.h"
+#include "brightmap.h"
 #include <shlobj.h>
 #include <strsafe.h>
 #include <stdio.h>
@@ -9,6 +10,11 @@
 #define MONITOR_SELECTION_SECTION L"MonitorSelection"
 #define MONITOR_INPUT_SECTION L"MonitorInputs"
 #define MONITOR_BLACK_SECTION L"MonitorIdleBlack"
+
+/* INI key per hotkey action, in HOTKEY_* order. */
+static const WCHAR *const kHotkeyKeys[HOTKEY_COUNT] = {
+    L"HotkeyBrighten", L"HotkeyDim", L"HotkeyPopup"
+};
 
 static void EnsureDirectory(const WCHAR *path)
 {
@@ -63,6 +69,18 @@ void Settings_CreateDefaults(Settings *s)
     WritePrivateProfileStringW(MONITOR_SELECTION_SECTION, L"Count", L"0", s->iniPath);
     WritePrivateProfileStringW(MONITOR_INPUT_SECTION, L"Count", L"0", s->iniPath);
     WritePrivateProfileStringW(MONITOR_BLACK_SECTION, L"Count", L"0", s->iniPath);
+
+    /* Written out on a new install, so that a config.ini with no hotkey lines
+       is recognizably older than 1.2 (see Settings_Load). */
+    for (int i = 0; i < HOTKEY_COUNT; i++) {
+        char text[HOTKEY_TEXT_MAX];
+        WCHAR textW[HOTKEY_TEXT_MAX];
+        Hotkey_Format(Hotkey_Default(i), text, HOTKEY_TEXT_MAX);
+        int k = 0;
+        for (; text[k]; k++) textW[k] = (WCHAR)(unsigned char)text[k];
+        textW[k] = L'\0';
+        WritePrivateProfileStringW(L"Settings", kHotkeyKeys[i], textW, s->iniPath);
+    }
 }
 
 int Settings_DayBrightness(const Settings *s)
@@ -282,6 +300,76 @@ static void SaveMonitorInputs(const Settings *s)
     WritePrivateProfileStringW(MONITOR_INPUT_SECTION, L"Count", value, s->iniPath);
 }
 
+/* Parse "lo,hi". wcstol rather than swscanf, because a hand-edited number
+   too large for an int is undefined behaviour in scanf. */
+static BOOL ParseRange(const WCHAR *text, int *lo, int *hi)
+{
+    WCHAR *end;
+    long a = wcstol(text, &end, 10);
+    if (end == text || *end != L',')
+        return FALSE;
+    const WCHAR *second = end + 1;
+    long b = wcstol(second, &end, 10);
+    if (end == second || a < 0 || a > 100 || b < 0 || b > 100)
+        return FALSE;
+    *lo = (int)a;
+    *hi = (int)b;
+    return TRUE;
+}
+
+/* Read [Ranges] ("Name=lo,hi"). Without it, convert the [Deltas] offsets of
+   older versions, so an upgrade keeps the monitors matched as they were. The
+   result reaches the file on the next save. */
+static void LoadRanges(Settings *s)
+{
+    WCHAR buf[4096], val[32];
+    s->rangeCount = 0;
+    s->rangeNewLo = 0;
+    s->rangeNewHi = 100;
+    DWORD len = GetPrivateProfileStringW(L"Ranges", NULL, L"", buf, 4096, s->iniPath);
+    for (WCHAR *key = buf; len > 0 && *key && s->rangeCount < MAX_RANGES;
+         key += wcslen(key) + 1) {
+        int lo, hi;
+        GetPrivateProfileStringW(L"Ranges", key, L"", val, 32, s->iniPath);
+        if (!ParseRange(val, &lo, &hi))
+            continue;
+        BrightMap_Normalize(&lo, &hi);
+        int i = s->rangeCount++;
+        wcsncpy(s->rangeNames[i], key, 135);
+        s->rangeNames[i][135] = L'\0';
+        s->rangeLo[i] = lo;
+        s->rangeHi[i] = hi;
+        s->rangeConnected[i] = FALSE;
+    }
+    if (s->rangeCount > 0)
+        return;
+
+    /* The last slot is an implicit offset 0. Older versions wrote only the
+       non-zero offsets, so a monitor missing from [Deltas] had offset 0 and
+       must start from that range, not from 0-100. */
+    int offsets[MAX_RANGES + 1], los[MAX_RANGES + 1], his[MAX_RANGES + 1];
+    int n = 0;
+    len = GetPrivateProfileStringW(L"Deltas", NULL, L"", buf, 4096, s->iniPath);
+    for (WCHAR *key = buf; len > 0 && *key && n < MAX_RANGES; key += wcslen(key) + 1) {
+        GetPrivateProfileStringW(L"Deltas", key, L"0", val, 32, s->iniPath);
+        wcsncpy(s->rangeNames[n], key, 135);
+        s->rangeNames[n][135] = L'\0';
+        s->rangeConnected[n] = FALSE;
+        offsets[n++] = (int)wcstol(val, NULL, 10);
+    }
+    if (n == 0)
+        return;
+    offsets[n] = 0;
+    BrightMap_FromOffsets(offsets, n + 1, los, his);
+    for (int i = 0; i < n; i++) {
+        s->rangeLo[i] = los[i];
+        s->rangeHi[i] = his[i];
+    }
+    s->rangeCount = n;
+    s->rangeNewLo = los[n];
+    s->rangeNewHi = his[n];
+}
+
 void Settings_Load(Settings *s)
 {
     WCHAR buf[4096];
@@ -325,23 +413,31 @@ void Settings_Load(Settings *s)
     s->sourcePollSeconds = Settings_ClampSourcePollSeconds((int)GetPrivateProfileIntW(
         L"Settings", L"SourcePollSeconds", DEFAULT_SOURCE_POLL_SECONDS, s->iniPath));
 
-    /* Load deltas */
-    s->deltaCount = 0;
-    len = GetPrivateProfileStringW(L"Deltas", NULL, L"", buf, 4096, s->iniPath);
-    if (len > 0) {
-        WCHAR *key = buf;
-        while (*key && s->deltaCount < MAX_MONITORS) {
-            GetPrivateProfileStringW(L"Deltas", key, L"0", val, 16, s->iniPath);
-            int idx = s->deltaCount;
-            wcsncpy(s->deltaNames[idx], key, 127);
-            s->deltaNames[idx][127] = L'\0';
-            s->deltaValues[idx] = _wtoi(val);
-            if (s->deltaValues[idx] < -40) s->deltaValues[idx] = -40;
-            if (s->deltaValues[idx] > 40) s->deltaValues[idx] = 40;
-            s->deltaCount++;
-            key += wcslen(key) + 1;
+    /* Hotkeys are stored as text ("Ctrl+Win+Up"). A missing line means the
+       file predates configurable hotkeys, because a new install writes all of
+       them: such a file keeps the Ctrl+Alt combinations it has always had. An
+       unreadable value falls back to the default, so a typo cannot leave the
+       user without a way to change the brightness from the keyboard. */
+    for (int i = 0; i < HOTKEY_COUNT; i++) {
+        WCHAR textW[HOTKEY_TEXT_MAX];
+        char text[HOTKEY_TEXT_MAX];
+        s->hotkeys[i] = Hotkey_Default(i);
+        GetPrivateProfileStringW(L"Settings", kHotkeyKeys[i], L"\x01", textW,
+                                 HOTKEY_TEXT_MAX, s->iniPath);
+        if (textW[0] == 0x01) {                 /* no such line */
+            s->hotkeys[i] = Hotkey_LegacyDefault(i);
+            continue;
         }
+        int k = 0;
+        for (; textW[k] && k < HOTKEY_TEXT_MAX - 1; k++)
+            text[k] = (textW[k] < 0x80) ? (char)textW[k] : '?';
+        text[k] = '\0';
+        Hotkey hk;
+        if (Hotkey_Parse(text, &hk))
+            s->hotkeys[i] = hk;
     }
+
+    LoadRanges(s);
 
     /* Load schedule enabled flag */
     s->scheduleEnabled = (BOOL)GetPrivateProfileIntW(L"Settings", L"ScheduleEnabled", 0, s->iniPath);
@@ -402,13 +498,22 @@ void Settings_Save(Settings *s)
     wsprintfW(val, L"%d", Settings_ClampSourcePollSeconds(s->sourcePollSeconds));
     WritePrivateProfileStringW(L"Settings", L"SourcePollSeconds", val, s->iniPath);
 
-    /* Save deltas */
-    WritePrivateProfileSectionW(L"Deltas", L"", s->iniPath);
-    for (int i = 0; i < s->deltaCount; i++) {
-        if (s->deltaValues[i] != 0) {
-            wsprintfW(val, L"%d", s->deltaValues[i]);
-            WritePrivateProfileStringW(L"Deltas", s->deltaNames[i], val, s->iniPath);
-        }
+    for (int i = 0; i < HOTKEY_COUNT; i++) {
+        char text[HOTKEY_TEXT_MAX];
+        WCHAR textW[HOTKEY_TEXT_MAX];
+        Hotkey_Format(s->hotkeys[i], text, HOTKEY_TEXT_MAX);
+        int k = 0;
+        for (; text[k]; k++) textW[k] = (WCHAR)(unsigned char)text[k];
+        textW[k] = L'\0';
+        WritePrivateProfileStringW(L"Settings", kHotkeyKeys[i], textW, s->iniPath);
+    }
+
+    /* Rewrite [Ranges]. [Deltas] from older versions is left as it was, so
+       going back to an older build still finds its offsets. */
+    WritePrivateProfileSectionW(L"Ranges", L"", s->iniPath);
+    for (int i = 0; i < s->rangeCount; i++) {
+        wsprintfW(val, L"%d,%d", s->rangeLo[i], s->rangeHi[i]);
+        WritePrivateProfileStringW(L"Ranges", s->rangeNames[i], val, s->iniPath);
     }
 
     /* Save schedule enabled flag */
@@ -533,27 +638,92 @@ BOOL Settings_GetAutostart(void)
     return result;
 }
 
-void Settings_LoadDeltas(Settings *s, MonitorList *ml)
+/* The entry key of monitor i: its name, plus " #2", " #3" and so on for a
+   second or third monitor of the same name, so two identical models keep
+   separate ranges instead of overwriting one shared entry. */
+static void RangeKey(const MonitorList *ml, int i, WCHAR *key, int cch)
 {
+    int nth = 1;
+    for (int j = 0; j < i; j++)
+        if (wcscmp(ml->monitors[j].name, ml->monitors[i].name) == 0)
+            nth++;
+    if (nth == 1)
+        _snwprintf(key, cch - 1, L"%s", ml->monitors[i].name);
+    else
+        _snwprintf(key, cch - 1, L"%s #%d", ml->monitors[i].name, nth);
+    key[cch - 1] = L'\0';
+}
+
+static int RangeFind(const Settings *s, const WCHAR *key)
+{
+    for (int i = 0; i < s->rangeCount; i++)
+        if (wcscmp(s->rangeNames[i], key) == 0)
+            return i;
+    return -1;
+}
+
+/* The entry for this key. A monitor that answers gets one with the starting
+   range when it has none; a monitor that does not answer only uses an
+   existing entry, so a stand-in name Windows reports during a wake never
+   gets a line in [Ranges] or a row in Settings. Returns -1 when there is no
+   entry, or when the table is full. */
+static int RangeEntry(Settings *s, const WCHAR *key, BOOL create)
+{
+    int found = RangeFind(s, key);
+    if (found >= 0 || !create)
+        return found;
+    if (s->rangeCount >= MAX_RANGES)
+        return -1;
+    int i = s->rangeCount++;
+    wcsncpy(s->rangeNames[i], key, 135);
+    s->rangeNames[i][135] = L'\0';
+    s->rangeLo[i] = s->rangeNewLo;
+    s->rangeHi[i] = s->rangeNewHi;
+    s->rangeConnected[i] = FALSE;
+    return i;
+}
+
+/* Only a monitor that can be set, or is expected to answer again, has a range
+   worth keeping; the "No DDC/CI monitors found" stand-in does not. */
+static BOOL HasRange(const BrightMonitor *mon)
+{
+    return mon->controllable || mon->awaitingAnswer;
+}
+
+void Settings_ApplyRanges(Settings *s, MonitorList *ml)
+{
+    for (int i = 0; i < s->rangeCount; i++)
+        s->rangeConnected[i] = FALSE;
+    WCHAR key[136];
     for (int i = 0; i < ml->count; i++) {
-        ml->monitors[i].delta = 0;
-        for (int j = 0; j < s->deltaCount; j++) {
-            if (wcscmp(ml->monitors[i].name, s->deltaNames[j]) == 0) {
-                ml->monitors[i].delta = s->deltaValues[j];
-                break;
-            }
-        }
+        BrightMonitor *mon = &ml->monitors[i];
+        mon->rangeLo = 0;
+        mon->rangeHi = 100;
+        if (!HasRange(mon))
+            continue;
+        RangeKey(ml, i, key, 136);
+        int e = RangeEntry(s, key, mon->controllable);
+        if (e < 0)
+            continue;
+        BrightMap_Normalize(&s->rangeLo[e], &s->rangeHi[e]);
+        mon->rangeLo = s->rangeLo[e];
+        mon->rangeHi = s->rangeHi[e];
+        s->rangeConnected[e] = TRUE;
     }
 }
 
-void Settings_SaveDeltas(Settings *s, MonitorList *ml)
+void Settings_StoreRanges(Settings *s, const MonitorList *ml)
 {
-    s->deltaCount = 0;
-    for (int i = 0; i < ml->count && s->deltaCount < MAX_MONITORS; i++) {
-        int idx = s->deltaCount;
-        wcsncpy(s->deltaNames[idx], ml->monitors[i].name, 127);
-        s->deltaNames[idx][127] = L'\0';
-        s->deltaValues[idx] = ml->monitors[i].delta;
-        s->deltaCount++;
+    WCHAR key[136];
+    for (int i = 0; i < ml->count; i++) {
+        const BrightMonitor *mon = &ml->monitors[i];
+        if (!HasRange(mon))
+            continue;
+        RangeKey(ml, i, key, 136);
+        int e = RangeEntry(s, key, mon->controllable);
+        if (e < 0)
+            continue;
+        s->rangeLo[e] = mon->rangeLo;
+        s->rangeHi[e] = mon->rangeHi;
     }
 }

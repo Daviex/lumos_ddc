@@ -8,6 +8,7 @@
 #define WM_HOTKEY_DIM       2
 #define WM_HOTKEY_PREV_MON  3
 #define WM_HOTKEY_NEXT_MON  4
+#define WM_HOTKEY_POPUP     5
 
 #define IDM_RESCAN          2001
 #define IDM_AUTOSTART       2002
@@ -23,7 +24,7 @@
 
 /* ---- App identity (shown in the About window) ---- */
 #define APP_NAME            L"Lumos"
-#define APP_VERSION         L"1.1.0"
+#define APP_VERSION         L"1.2.0"
 #define APP_AUTHOR          L"sfortis"
 #define APP_REPO_DISPLAY    L"github.com/sfortis/lumos_ddc"
 #define APP_REPO_URL        L"https://github.com/sfortis/lumos_ddc"
