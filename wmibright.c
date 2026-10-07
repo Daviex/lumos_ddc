@@ -1,5 +1,6 @@
 #define COBJMACROS
 #include "wmibright.h"
+#include "diagnostics.h"
 #include <wbemidl.h>
 #include <oleauto.h>
 #include <objbase.h>
@@ -23,8 +24,10 @@ static BOOL WmiConnect(IWbemServices **ppSvc, IWbemLocator **ppLoc, BOOL *pDidIn
      * it, but do NOT uninit (we did not initialize it). */
     if (SUCCEEDED(hr))
         *pDidInit = TRUE;
-    else if (hr != RPC_E_CHANGED_MODE)
+    else if (hr != RPC_E_CHANGED_MODE) {
+        Diagnostics_Log("ERROR", "wmi", "CoInitializeEx FAILED hr=0x%08lX", (DWORD)hr);
         return FALSE;
+    }
 
     /* Process-wide; harmless if already set (RPC_E_TOO_LATE). Ignore result. */
     CoInitializeSecurity(NULL, -1, NULL, NULL,
@@ -62,6 +65,7 @@ static BOOL WmiConnect(IWbemServices **ppSvc, IWbemLocator **ppLoc, BOOL *pDidIn
     return TRUE;
 
 fail:
+    Diagnostics_Log("ERROR", "wmi", "connection FAILED hr=0x%08lX", (DWORD)hr);
     if (*pDidInit) {
         CoUninitialize();
         *pDidInit = FALSE;
@@ -114,6 +118,7 @@ static BOOL GetPropString(IWbemClassObject *obj, const WCHAR *name, WCHAR *out, 
 
 int Wmi_QueryPanels(WmiPanel *out, int max)
 {
+    Diagnostics_Log("INFO", "wmi", "panel enumeration START");
     if (max <= 0) return 0;
 
     IWbemServices *pSvc = NULL;
@@ -156,6 +161,7 @@ int Wmi_QueryPanels(WmiPanel *out, int max)
     }
 
     WmiDisconnect(pSvc, pLoc, didInit);
+    Diagnostics_Log(FAILED(hr) ? "WARN" : "INFO", "wmi", "panel enumeration END count=%d lastHr=0x%08lX", found, (DWORD)hr);
     return found;
 }
 
@@ -166,8 +172,10 @@ BOOL Wmi_GetBrightness(const WCHAR *instanceName, DWORD *outPercent)
     IWbemServices *pSvc = NULL;
     IWbemLocator *pLoc = NULL;
     BOOL didInit = FALSE;
-    if (!WmiConnect(&pSvc, &pLoc, &didInit))
+    if (!WmiConnect(&pSvc, &pLoc, &didInit)) {
+        Diagnostics_Log("ERROR", "wmi", "brightness read FAILED id=\"WMI:%ls\" reason=connection", instanceName);
         return FALSE;
+    }
 
     BOOL ok = FALSE;
     IEnumWbemClassObject *pEnum = NULL;
@@ -201,6 +209,8 @@ BOOL Wmi_GetBrightness(const WCHAR *instanceName, DWORD *outPercent)
     }
 
     WmiDisconnect(pSvc, pLoc, didInit);
+    Diagnostics_Log(ok ? "INFO" : "ERROR", "wmi", "brightness read %s id=\"WMI:%ls\" lastHr=0x%08lX",
+                    ok ? "OK" : "FAILED", instanceName, (DWORD)hr);
     return ok;
 }
 
@@ -212,8 +222,10 @@ BOOL Wmi_SetBrightness(const WCHAR *instanceName, DWORD percent)
     IWbemServices *pSvc = NULL;
     IWbemLocator *pLoc = NULL;
     BOOL didInit = FALSE;
-    if (!WmiConnect(&pSvc, &pLoc, &didInit))
+    if (!WmiConnect(&pSvc, &pLoc, &didInit)) {
+        Diagnostics_Log("ERROR", "wmi", "brightness write FAILED id=\"WMI:%ls\" percent=%lu reason=connection", instanceName, percent);
         return FALSE;
+    }
 
     BOOL ok = FALSE;
 
@@ -292,5 +304,7 @@ BOOL Wmi_SetBrightness(const WCHAR *instanceName, DWORD percent)
     }
 
     WmiDisconnect(pSvc, pLoc, didInit);
+    Diagnostics_Log(ok ? "INFO" : "ERROR", "wmi", "brightness write %s id=\"WMI:%ls\" percent=%lu lastHr=0x%08lX",
+                    ok ? "APPLIED" : "FAILED", instanceName, percent, (DWORD)hr);
     return ok;
 }

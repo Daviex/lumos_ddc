@@ -17,14 +17,14 @@ From the repository root with a Windows Clang/MinGW toolchain in `PATH`:
 Create the `build` directory first if it does not exist.
 
 ```powershell
-clang -std=c11 -Wall -Wextra -Werror -DUNICODE -D_UNICODE tests/test_settings.c schedule.c monitor_selection.c brightmap.c hotkey.c -o build/test_settings.exe
+clang -std=c11 -Wall -Wextra -Werror -DSTRSAFE_NO_DEPRECATE -DUNICODE -D_UNICODE tests/test_settings.c tests/diagnostics_stub.c schedule.c monitor_selection.c brightmap.c hotkey.c -o build/test_settings.exe
 ./build/test_settings.exe
 ```
 
 With MSVC from a developer command prompt:
 
 ```bat
-cl /nologo /std:c11 /W4 /DUNICODE /D_UNICODE tests\test_settings.c schedule.c monitor_selection.c brightmap.c hotkey.c /Fe:build\test_settings.exe /Fo"build\\"
+cl /nologo /std:c11 /W4 /DUNICODE /D_UNICODE tests\test_settings.c tests\diagnostics_stub.c schedule.c monitor_selection.c brightmap.c hotkey.c /Fe:build\test_settings.exe /Fo"build\\"
 build\test_settings.exe
 ```
 
@@ -48,12 +48,12 @@ writes report applied ownership; refresh reads never do. Idle restores are not
 saved as pending user targets.
 
 ```powershell
-clang -std=c11 -Wall -Wextra -Werror -DUNICODE -D_UNICODE tests/test_monitor_worker.c -o build/test_monitor_worker.exe
+clang -std=c11 -Wall -Wextra -Werror -DSTRSAFE_NO_DEPRECATE -DUNICODE -D_UNICODE tests/test_monitor_worker.c tests/diagnostics_stub.c -o build/test_monitor_worker.exe
 ./build/test_monitor_worker.exe
 ```
 
 ```bat
-cl /nologo /std:c11 /W4 /DUNICODE /D_UNICODE tests\test_monitor_worker.c /Fe:build\test_monitor_worker.exe /Fo"build\\"
+cl /nologo /std:c11 /W4 /DUNICODE /D_UNICODE tests\test_monitor_worker.c tests\diagnostics_stub.c /Fe:build\test_monitor_worker.exe /Fo"build\\"
 build\test_monitor_worker.exe
 ```
 
@@ -66,6 +66,11 @@ Transient source errors are retried once after 100 ms; persistent failures and
 invalid replies cannot authorize writes from cached telemetry. Brightness
 capability recovers independently, without revoking previously validated values
 after another failed read.
+DDC recovery tests reproduce a display rejecting a write without a 100 ms command
+gap. They cover bounded retries of transmit/receive errors, fresh source checks
+between attempts, source changes and cancellation during the waits, unsupported
+errors without retries, and preserving the original idle baseline across retries.
+Transient brightness reads receive one retry without revoking confirmed values.
 Excluded displays are checked at the preview, DDC/WMI write, group and active
 monitor boundaries to ensure their brightness remains unchanged.
 Idle dimming captures a fresh, validated native brightness only on a successful
@@ -74,12 +79,12 @@ and is skipped when its final source read reports the PC input, a different
 alternate input, or an unknown input. Cancellation prevents pending native writes.
 
 ```powershell
-clang -std=c11 -Wall -Wextra -Werror -DUNICODE -D_UNICODE tests/test_monitor.c brightness.c brightmap.c -ldxva2 -luser32 -lgdi32 -ladvapi32 -o build/test_monitor.exe
+clang -std=c11 -Wall -Wextra -Werror -DSTRSAFE_NO_DEPRECATE -DUNICODE -D_UNICODE tests/test_monitor.c tests/diagnostics_stub.c brightness.c brightmap.c -ldxva2 -luser32 -lgdi32 -ladvapi32 -o build/test_monitor.exe
 ./build/test_monitor.exe
 ```
 
 ```bat
-cl /nologo /std:c11 /W4 /DUNICODE /D_UNICODE tests\test_monitor.c brightness.c brightmap.c /Fe:build\test_monitor.exe /Fo"build\\" /link dxva2.lib user32.lib gdi32.lib advapi32.lib
+cl /nologo /std:c11 /W4 /DUNICODE /D_UNICODE tests\test_monitor.c tests\diagnostics_stub.c brightness.c brightmap.c /Fe:build\test_monitor.exe /Fo"build\\" /link dxva2.lib user32.lib gdi32.lib advapi32.lib
 build\test_monitor.exe
 ```
 
@@ -95,7 +100,7 @@ Window and monitor operations are mocked; no window is shown and no monitor or
 registry setting is changed.
 
 ```powershell
-clang -std=c11 -Wall -Wextra -Werror -DUNICODE -D_UNICODE tests/test_ui.c brightness.c brightmap.c ui_draw.c -o build/test_ui.exe -lgdi32 -luser32 -lshell32 -ldwmapi
+clang -std=c11 -Wall -Wextra -Werror -DSTRSAFE_NO_DEPRECATE -DUNICODE -D_UNICODE tests/test_ui.c brightness.c brightmap.c ui_draw.c -o build/test_ui.exe -lgdi32 -luser32 -lshell32 -ldwmapi
 ./build/test_ui.exe
 ```
 
@@ -112,7 +117,7 @@ nonzero native bounds, rounding, full DWORD ranges, per-monitor range mapping, m
 endpoints, renamed/reordered displays and ambiguous monitor identities.
 
 ```powershell
-clang -std=c11 -Wall -Wextra -Werror -DUNICODE -D_UNICODE tests/test_brightness.c brightness.c brightmap.c -o build/test_brightness.exe
+clang -std=c11 -Wall -Wextra -Werror -DSTRSAFE_NO_DEPRECATE -DUNICODE -D_UNICODE tests/test_brightness.c brightness.c brightmap.c -o build/test_brightness.exe
 ./build/test_brightness.exe
 ```
 
@@ -136,6 +141,10 @@ They also cover failed releases, wake/re-idle with queued work, rule edits, and
 applied results superseded by newer requests or a uniquely matched rescan.
 Mixed OLED/LCD idle checks verify that black-idle displays receive no idle
 brightness write and no manual-policy brightness restore when input returns.
+The mixed OLED/LCD wake regression verifies that a failed LCD restore stays
+pending after the cover is removed. Recovery retries only the dimmed LCD, uses
+the newest intent, respects source/selection, avoids duplicating in-flight work
+and stops after success.
 
 `test_idle_black.c` exercises the overlay with mocked windows, monitor geometry,
 last-input timestamps, source selection and power requests. It verifies an
@@ -145,12 +154,12 @@ GDI DIB verifies that every painted pixel is RGB 0,0,0. No screen is covered
 and no real execution-state request is made.
 
 ```powershell
-clang -std=c11 -Wall -Wextra -Werror -DUNICODE -D_UNICODE tests/test_idle_black.c brightness.c brightmap.c -lgdi32 -luser32 -o build/test_idle_black.exe
+clang -std=c11 -Wall -Wextra -Werror -DSTRSAFE_NO_DEPRECATE -DUNICODE -D_UNICODE tests/test_idle_black.c tests/diagnostics_stub.c brightness.c brightmap.c -lgdi32 -luser32 -o build/test_idle_black.exe
 ./build/test_idle_black.exe
 ```
 
 ```powershell
-clang -O2 -std=c11 -Wall -Wextra -Werror -DUNICODE -D_UNICODE -ffunction-sections -fdata-sections tests/test_startup.c brightness.c brightmap.c schedule.c monitor_selection.c hotkey.c '-Wl,--gc-sections' -lshell32 -o build/test_startup.exe
+clang -O2 -std=c11 -Wall -Wextra -Werror -DSTRSAFE_NO_DEPRECATE -DUNICODE -D_UNICODE -ffunction-sections -fdata-sections tests/test_startup.c tests/diagnostics_stub.c brightness.c brightmap.c schedule.c monitor_selection.c hotkey.c '-Wl,--gc-sections' -lshell32 -o build/test_startup.exe
 ./build/test_startup.exe
 ```
 
@@ -165,7 +174,7 @@ Its real renderer draws to offscreen DIBs; optional `--preview` saves 3-second
 and 60-second Settings BMP previews under `build` for visual inspection.
 
 ```powershell
-clang -O2 -std=c11 -Wall -Wextra -Werror -DUNICODE -D_UNICODE -ffunction-sections -fdata-sections tests/test_monitor_selection_ui.c monitor_selection.c schedule.c ui_graphics.c ui_draw.c hotkey.c '-Wl,--gc-sections' -lgdi32 -luser32 -lshell32 -ldwmapi -lcomctl32 -o build/test_monitor_selection_ui.exe
+clang -O2 -std=c11 -Wall -Wextra -Werror -DSTRSAFE_NO_DEPRECATE -DUNICODE -D_UNICODE -ffunction-sections -fdata-sections tests/test_monitor_selection_ui.c tests/diagnostics_stub.c monitor_selection.c schedule.c ui_graphics.c ui_draw.c hotkey.c '-Wl,--gc-sections' -lgdi32 -luser32 -lshell32 -ldwmapi -lcomctl32 -o build/test_monitor_selection_ui.exe
 ./build/test_monitor_selection_ui.exe
 ```
 
@@ -197,3 +206,18 @@ hardware writes, window creation or configuration I/O.
 clang -std=c11 -Wall -Wextra -Werror -DUNICODE -D_UNICODE tests/test_remote.c -o build/test_remote.exe
 ./build/test_remote.exe
 ```
+
+`diagnostics_stub.c` suppresses runtime logging in existing regression suites
+(no log file is created). `test_diagnostics.c` uses the real logger with mocked
+file APIs and real Win32 threads. It verifies the executable-relative path,
+read-only-folder fallback, UTF-8 monitor names/stable identity, timestamps and
+process/thread tags, Win32 last-error preservation, concurrent complete entries,
+5 MiB rotation, write/rotation failures and late worker logs after shutdown.
+
+```powershell
+clang -std=c11 -Wall -Wextra -Werror -DSTRSAFE_NO_DEPRECATE -DUNICODE -D_UNICODE tests/test_diagnostics.c -o build/test_diagnostics.exe
+./build/test_diagnostics.exe
+```
+
+When using GCC rather than Clang, the startup test's renamed static Windows entry
+point requires `-Wno-old-style-declaration` in addition to the documented flags.

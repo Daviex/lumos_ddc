@@ -44,6 +44,7 @@ static int acceptCalls;
 static int idleWrites, releaseWrites, cancelCalls;
 static BOOL mockWorkerRunning;
 static BOOL mockReleaseSucceeds;
+static BOOL mockNormalSucceeds;
 static int releaseRequests;
 static int blackUpdates, blackClears;
 static BOOL blackIdle, blackEnabled;
@@ -231,6 +232,7 @@ BOOL Monitor_SetBrightness(BrightMonitor *monitor, DWORD percent)
     monitor->desiredBrightness = percent;
     monitor->desiredBrightnessValid = TRUE;
     if (!Monitor_SourceAllowsControl(monitor)) return FALSE;
+    if (!mockNormalSucceeds) return FALSE;
     monitor->brightnessCur = Brightness_ToRaw(monitor, percent);
     if (!mockWorkerRunning) {
         monitor->idleApplied = FALSE;
@@ -429,6 +431,7 @@ static void ResetState(void)
     idleWrites = releaseWrites = cancelCalls = 0;
     mockWorkerRunning = FALSE;
     mockReleaseSucceeds = TRUE;
+    mockNormalSucceeds = TRUE;
     releaseRequests = 0;
     blackUpdates = blackClears = 0;
     blackIdle = blackEnabled = FALSE;
@@ -1523,6 +1526,60 @@ static void TestOledBlackIdleKeepsPanelBrightness(void)
     CHECK(!g_idleDimmed && !blackIdle);
 }
 
+static void TestMixedOledWakeRetriesOnlyUnrestoredMonitor(void)
+{
+    ResetState();
+    ConfigureTwoFilteredMonitors();
+    BrightMonitor *oled = &g_monitors.monitors[0];
+    BrightMonitor *lcd = &g_monitors.monitors[1];
+    oled->idleBlack = TRUE;
+    lcd->brightnessMax = 100;
+    lcd->brightnessCur = 60;
+    g_masterTarget = 60;
+    g_masterTargetValid = TRUE;
+    Idle_Dim();
+    CHECK(blackIdle && oled->brightnessCur == 73 && lcd->brightnessCur == 5);
+    CHECK(lcd->idleApplied && lcd->preIdleBrightness == 60);
+
+    mockNormalSucceeds = FALSE;
+    Idle_Restore();
+    CHECK(!blackIdle && !g_idleDimmed && lcd->brightnessCur == 5);
+    CHECK(lcd->idleApplied && lcd->preIdleBrightnessValid);
+    int before = setOneCalls;
+    RetryIdleRestores();
+    CHECK(setOneCalls == before + 1 && lcd->idleApplied); /* A failed retry keeps the restore intent. */
+
+    before = setOneCalls;
+    mockPendingMask = 1u << 1;
+    RetryIdleRestores();
+    CHECK(setOneCalls == before); /* Do not replace an in-flight/queued restore. */
+    mockPendingMask = 0;
+    lcd->excludedFromControl = TRUE;
+    RetryIdleRestores();
+    CHECK(setOneCalls == before);
+    lcd->excludedFromControl = FALSE;
+    lcd->sourceKnown = FALSE;
+    RetryIdleRestores();
+    CHECK(setOneCalls == before);
+    lcd->sourceKnown = TRUE;
+    lcd->currentInput = 0x12;
+    RetryIdleRestores();
+    CHECK(setOneCalls == before); /* Another input uses the guarded handoff path. */
+    lcd->currentInput = 0x0F;
+    g_idleDimmed = TRUE;
+    RetryIdleRestores();
+    CHECK(setOneCalls == before);
+    g_idleDimmed = FALSE;
+
+    lcd->desiredBrightness = 48; /* A newer request wins over the old 60% restore. */
+    mockNormalSucceeds = TRUE;
+    RetryIdleRestores();
+    CHECK(setOneCalls == before + 1 && lcd->brightnessCur == 48 && !lcd->idleApplied);
+    CHECK(oled->brightnessCur == 73 && !blackIdle && !g_idleDimmed);
+    RetryIdleRestores();
+    CHECK(setOneCalls == before + 1); /* Stop once the hardware has recovered. */
+}
+
 static void TestConfiguredSourcePollingTimer(void)
 {
     ResetState();
@@ -1746,6 +1803,7 @@ int main(void)
     TestValidExcludedTopologyDoesNotTriggerPlaceholderRetries();
     TestCliActivityRestartsIdleCountdownAndLatestRowIntent();
     TestCliRangeAndRescanPreserveLatestMaster();
+    TestMixedOledWakeRetriesOnlyUnrestoredMonitor();
     if (failures) {
         printf("startup: %d failure(s)\n", failures);
         return 1;

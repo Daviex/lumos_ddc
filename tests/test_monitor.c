@@ -34,6 +34,10 @@ static DWORD sourceAfterBrightnessRead;
 static BOOL sourceReadSuccess;
 static int sourceFailuresRemaining, retrySleeps;
 static DWORD sourceAfterRetrySleep;
+static int setFailuresRemaining, readFailuresRemaining;
+static DWORD setError, readError, sourceOnWriteFailure;
+static DWORD commandGapMs;
+static BOOL requireCommandGap;
 
 static BOOL WINAPI MockGetVCPFeatureAndVCPFeatureReply(HANDLE handle, BYTE code,
         LPMC_VCP_CODE_TYPE type, LPDWORD current, LPDWORD maximum)
@@ -41,10 +45,16 @@ static BOOL WINAPI MockGetVCPFeatureAndVCPFeatureReply(HANDLE handle, BYTE code,
     (void)handle;
     CHECK(code == 0x60);
     sourceCalls++;
+    commandGapMs = 0;
     *type = MC_SET_PARAMETER;
     *current = sourceInput;
     *maximum = 0x12;
-    if (sourceFailuresRemaining > 0) { sourceFailuresRemaining--; return FALSE; }
+    if (sourceFailuresRemaining > 0) {
+        sourceFailuresRemaining--;
+        SetLastError(ERROR_NOT_SUPPORTED);
+        return FALSE;
+    }
+    SetLastError(sourceReadSuccess ? ERROR_SUCCESS : ERROR_NOT_SUPPORTED);
     return sourceReadSuccess;
 }
 
@@ -52,6 +62,7 @@ static void WINAPI MockSleep(DWORD milliseconds)
 {
     CHECK(milliseconds == 100);
     retrySleeps++;
+    commandGapMs += milliseconds;
     if (sourceAfterRetrySleep) sourceInput = sourceAfterRetrySleep;
 }
 
@@ -68,12 +79,19 @@ static BOOL WINAPI MockGetMonitorBrightness(HANDLE handle, LPDWORD minimum,
 {
     size_t index = (size_t)(UINT_PTR)handle;
     brightnessReadCalls++;
+    commandGapMs = 0;
     if (sourceAfterBrightnessRead) sourceInput = sourceAfterBrightnessRead;
     CHECK(index < MAX_MONITORS);
     if (index >= MAX_MONITORS) return FALSE;
     *minimum = readings[index].minimum;
     *current = readings[index].current;
     *maximum = readings[index].maximum;
+    if (readFailuresRemaining > 0) {
+        readFailuresRemaining--;
+        SetLastError(readError);
+        return FALSE;
+    }
+    SetLastError(readings[index].success ? ERROR_SUCCESS : readError);
     return readings[index].success;
 }
 
@@ -82,6 +100,18 @@ static BOOL WINAPI MockSetMonitorBrightness(HANDLE handle, DWORD value)
     (void)handle;
     setCalls++;
     lastWrite = value;
+    if (requireCommandGap && commandGapMs < 100) {
+        SetLastError(0xC0262582u);
+        return FALSE;
+    }
+    commandGapMs = 0;
+    if (setFailuresRemaining > 0) {
+        setFailuresRemaining--;
+        sourceAfterRetrySleep = sourceOnWriteFailure;
+        SetLastError(setError);
+        return FALSE;
+    }
+    SetLastError(setSuccess ? ERROR_SUCCESS : setError);
     return setSuccess;
 }
 
@@ -172,6 +202,11 @@ static void ResetMocks(void)
     sourceReadSuccess = TRUE;
     sourceFailuresRemaining = retrySleeps = 0;
     sourceAfterRetrySleep = 0;
+    setFailuresRemaining = readFailuresRemaining = 0;
+    setError = readError = ERROR_NOT_SUPPORTED;
+    sourceOnWriteFailure = 0;
+    commandGapMs = 0;
+    requireCommandGap = FALSE;
 }
 
 static void TestReusedZeroHandleLeases(void)
@@ -679,6 +714,124 @@ static void TestNormalSyncWriteClearsIdleOwnershipOnlyWhenApplied(void)
     CHECK(monitor.brightnessCur == 70 && monitor.desiredBrightness == 70);
 }
 
+static BOOL CurrentBeforeSleepCount(void *context)
+{
+    return retrySleeps < *(int *)context;
+}
+
+static void TestDdcCommandGapAndTransientWriteRecovery(void)
+{
+    BrightMonitor monitor = MakeDdc(0);
+    ResetMocks();
+    monitor.sourceFilter = TRUE;
+    monitor.expectedInput = 0x0F;
+    monitor.brightnessCur = 1;
+    monitor.idleApplied = TRUE;
+    monitor.preIdleBrightnessValid = TRUE;
+    monitor.preIdleBrightness = 60;
+    requireCommandGap = TRUE;
+    CHECK(Monitor_SetBrightness(&monitor, 60));
+    CHECK(setCalls == 1 && sourceCalls == 1 && retrySleeps == 1);
+    CHECK(monitor.brightnessCur == 60 && !monitor.idleApplied);
+
+    ResetMocks();
+    setFailuresRemaining = 2;
+    setError = 0xC0262582u;
+    CHECK(Monitor_SetBrightnessSync(&monitor, 70));
+    CHECK(setCalls == 3 && sourceCalls == 3 && lastWrite == 70);
+    CHECK(monitor.brightnessCur == 70);
+
+    ResetMocks();
+    setSuccess = FALSE;
+    setError = 0xC0262583u;
+    CHECK(Monitor_SetBrightnessGuardedSync(&monitor, 80, NULL, NULL) == MONITOR_WRITE_FAILED);
+    CHECK(setCalls == 3 && sourceCalls == 3 && monitor.brightnessCur == 70);
+
+    ResetMocks();
+    setSuccess = FALSE;
+    setError = ERROR_INVALID_HANDLE;
+    CHECK(!Monitor_SetBrightnessSync(&monitor, 80));
+    CHECK(setCalls == 1 && sourceCalls == 1); /* Unsupported/stale handles are not retried. */
+
+    ResetMocks();
+    monitor.sourceFilter = FALSE;
+    setFailuresRemaining = 1;
+    setError = 0xC0262582u;
+    CHECK(Monitor_SetBrightnessSync(&monitor, 80));
+    CHECK(setCalls == 2 && sourceCalls == 0 && retrySleeps == 1);
+}
+
+static void TestDdcRetriesRespectSourceAndCancellation(void)
+{
+    BrightMonitor monitor = MakeDdc(0);
+    ResetMocks();
+    monitor.sourceFilter = TRUE;
+    monitor.expectedInput = 0x0F;
+    setFailuresRemaining = 1;
+    setError = 0xC0262582u;
+    sourceOnWriteFailure = 0x12;
+    CHECK(Monitor_SetBrightnessGuardedSync(&monitor, 60, NULL, NULL) == MONITOR_WRITE_SKIPPED);
+    CHECK(setCalls == 1 && sourceCalls == 2 && monitor.currentInput == 0x12);
+    CHECK(monitor.brightnessCur == 50);
+
+    ResetMocks();
+    sourceInput = 0x12;
+    setFailuresRemaining = 1;
+    setError = 0xC0262582u;
+    sourceOnWriteFailure = 0x0F;
+    CHECK(Monitor_SetBrightnessForPurposeGuardedSync(&monitor, 60, MONITOR_WRITE_IDLE_RELEASE,
+        0x12, NULL, NULL, NULL) == MONITOR_WRITE_SKIPPED);
+    CHECK(setCalls == 1 && sourceCalls == 2 && monitor.currentInput == 0x0F);
+
+    ResetMocks();
+    int cancelAfterSleeps = 1;
+    CHECK(Monitor_SetBrightnessGuardedSync(&monitor, 60, CurrentBeforeSleepCount,
+        &cancelAfterSleeps) == MONITOR_WRITE_CANCELLED);
+    CHECK(setCalls == 0 && sourceCalls == 1 && monitor.brightnessCur == 50);
+
+    ResetMocks();
+    setFailuresRemaining = 1;
+    setError = 0xC0262582u;
+    cancelAfterSleeps = 2;
+    CHECK(Monitor_SetBrightnessGuardedSync(&monitor, 60, CurrentBeforeSleepCount,
+        &cancelAfterSleeps) == MONITOR_WRITE_CANCELLED);
+    CHECK(setCalls == 1 && sourceCalls == 2 && monitor.brightnessCur == 50);
+}
+
+static void TestDdcReadRetryAndOriginalIdleBaseline(void)
+{
+    BrightMonitor monitor = MakeDdc(0);
+    ResetMocks();
+    readFailuresRemaining = 1;
+    readError = 0xC0262582u;
+    CHECK(Monitor_ReadBrightnessSync(&monitor));
+    CHECK(brightnessReadCalls == 2 && retrySleeps == 1 && monitor.brightnessCur == 50);
+
+    ResetMocks();
+    readings[0].success = FALSE;
+    readError = 0xC0262583u;
+    CHECK(!Monitor_ReadBrightnessSync(&monitor));
+    CHECK(brightnessReadCalls == 2 && monitor.controllable && monitor.brightnessCur == 50);
+
+    ResetMocks();
+    monitor.sourceFilter = TRUE;
+    monitor.expectedInput = 0x0F;
+    setFailuresRemaining = 1;
+    setError = 0xC0262582u;
+    requireCommandGap = TRUE;
+    CHECK(Monitor_SetIdleBrightness(&monitor, 1));
+    CHECK(brightnessReadCalls == 1 && sourceCalls == 2 && setCalls == 2);
+    CHECK(monitor.preIdleBrightnessValid && monitor.preIdleBrightness == 50);
+    CHECK(monitor.brightnessCur == 10 && monitor.brightnessMin == 10);
+
+    ResetMocks();
+    monitor.preIdleBrightnessValid = FALSE;
+    setSuccess = FALSE;
+    setError = 0xC0262582u;
+    CHECK(!Monitor_SetIdleBrightness(&monitor, 1));
+    CHECK(brightnessReadCalls == 1 && setCalls == 3 && !monitor.preIdleBrightnessValid);
+}
+
 int main(void)
 {
     TestReusedZeroHandleLeases();
@@ -696,6 +849,9 @@ int main(void)
     TestIdleReleaseNeverBypassesUnknownOrChangedSource();
     TestIdleRequiresValidatedBaselineAndAppliedWrite();
     TestNormalSyncWriteClearsIdleOwnershipOnlyWhenApplied();
+    TestDdcCommandGapAndTransientWriteRecovery();
+    TestDdcRetriesRespectSourceAndCancellation();
+    TestDdcReadRetryAndOriginalIdleBaseline();
     if (failures) {
         printf("%d monitor checks failed\n", failures);
         return 1;

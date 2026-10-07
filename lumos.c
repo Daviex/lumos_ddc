@@ -21,6 +21,7 @@
 #include "idle_black.h"
 #include "brightmap.h"
 #include "remote.h"
+#include "diagnostics.h"
 
 /* GUID_CONSOLE_DISPLAY_STATE {6FE69556-704A-47A0-8F24-C28D936FDA47}
    Defined manually because some MinGW headers omit it. Fires on display
@@ -175,6 +176,38 @@ static void RestartSourcePolling(void);
 static void TryIdleHandoff(BrightMonitor *monitor);
 static void ApplyIdleBrightness(void);
 
+static void LogMonitorList(const char *reason)
+{
+    Diagnostics_Log("INFO", "monitors", "%s count=%d selectedOnly=%d", reason,
+                    g_monitors.count, g_monitors.selectedOnly);
+    for (int i = 0; i < g_monitors.count; i++) {
+        char detail[128];
+        StringCchPrintfA(detail, ARRAYSIZE(detail), "%s row=%d", reason, i + 1);
+        Diagnostics_MonitorState(&g_monitors.monitors[i], detail);
+    }
+}
+
+static void LogSettings(const char *reason)
+{
+    Diagnostics_Log("INFO", "settings",
+        "%s ini=\"%ls\" idleEnabled=%d idleMinutes=%d idlePercent=%d sourcePollSeconds=%d "
+        "scheduleEnabled=%d schedulePoints=%d autostart=%d step=%d selectedOnly=%d "
+        "selectedCount=%d sourceRules=%d blackIdleCount=%d",
+        reason, g_settings.iniPath, g_settings.idleDimEnabled, g_settings.idleDimMinutes,
+        g_settings.idleDimPercent, g_settings.sourcePollSeconds, g_settings.scheduleEnabled,
+        g_settings.scheduleCount, g_settings.autostart, g_settings.step,
+        g_settings.monitorSelection.selectedOnly, g_settings.monitorSelection.count,
+        g_settings.monitorSelection.inputRuleCount, g_settings.monitorSelection.idleBlackCount);
+    for (int i = 0; i < g_settings.scheduleCount; i++)
+        Diagnostics_Log("INFO", "schedule", "anchor=%d time=%02d:%02d percent=%d", i + 1,
+            g_settings.schedule[i].minutes / 60, g_settings.schedule[i].minutes % 60,
+            g_settings.schedule[i].brightness);
+    for (int i = 0; i < g_settings.monitorSelection.count; i++)
+        Diagnostics_Log("INFO", "settings", "selected monitor=\"%ls\" id=\"%ls\"",
+            g_settings.monitorSelection.names[i], g_settings.monitorSelection.keys[i]);
+    LogMonitorList(reason);
+}
+
 /* A monitor's range changed in the popup. Save it, then put every monitor
    back on the current master level so the change shows at once: matching two
    monitors means adjusting one while looking at both. masterLevel is the
@@ -239,6 +272,8 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdLineA, int showCmd
         }
     }
 
+    Diagnostics_Init();
+    Diagnostics_Log("INFO", "app", "launch login=%d", loginLaunch);
     /* Initialize COM for Shell */
     CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
 
@@ -253,14 +288,17 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdLineA, int showCmd
     Settings_UpgradeAutostart(); /* Add the login switch to this exe's legacy Run entry. */
     Settings_ApplyRanges(&g_settings, &g_monitors);
     Settings_ApplyMonitorSelection(&g_settings, &g_monitors);
+    LogSettings("loaded");
 
     if (!UI_Init(hInst)) {
+        Diagnostics_Log("ERROR", "app", "UI initialization failed error=0x%08lX", GetLastError());
         MessageBoxW(NULL, L"Failed to initialize UI", APP_NAME, MB_ICONERROR);
         Monitor_Cleanup(&g_monitors);
         Monitor_FlushRetiredHandles();
         CoUninitialize();
         ReleaseMutex(hMutex);
         CloseHandle(hMutex);
+        Diagnostics_Close();
         return 1;
     }
 
@@ -280,6 +318,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdLineA, int showCmd
                                     NULL, NULL, hInst, NULL);
 
     if (!g_hwndHidden || !MonitorWorker_Start(g_hwndHidden, &g_monitors)) {
+        Diagnostics_Log("ERROR", "app", "hidden window or monitor worker startup failed error=0x%08lX", GetLastError());
         MessageBoxW(NULL, L"Failed to start monitor worker", APP_NAME, MB_ICONERROR);
         Monitor_Cleanup(&g_monitors);
         Monitor_FlushRetiredHandles();
@@ -288,6 +327,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdLineA, int showCmd
         CoUninitialize();
         ReleaseMutex(hMutex);
         CloseHandle(hMutex);
+        Diagnostics_Close();
         return 1;
     }
 
@@ -332,6 +372,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdLineA, int showCmd
     }
     int exitCode = (int)msg.wParam;
 
+    Diagnostics_Log("INFO", "app", "shutdown exitCode=%d", exitCode);
     /* Cleanup */
     IdleBlack_Shutdown();
     RemoveMouseHook();
@@ -346,6 +387,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdLineA, int showCmd
         free((void *)msg.lParam);
     UI_Shutdown();
     CoUninitialize();
+    Diagnostics_Close();
     /* Release before closing so a replacing instance sees WAIT_OBJECT_0 promptly
        instead of waiting for abandonment. */
     ReleaseMutex(hMutex);
@@ -387,37 +429,7 @@ static void RemoveTrayIcon(void)
 
 /* ---- Mouse wheel on tray icon ---- */
 
-#ifdef DEBUG
-static FILE *g_dbgLog = NULL;
-static void DbgLog(const char *fmt, ...)
-{
-    if (!g_dbgLog) {
-        /* Same folder as config.ini, for the reason explained in monitor.c. */
-        WCHAR path[MAX_PATH];
-        if (SUCCEEDED(SHGetFolderPathW(NULL, CSIDL_APPDATA, NULL, 0, path))) {
-            if (FAILED(StringCchCatW(path, MAX_PATH, L"\\Lumos"))) return;
-            CreateDirectoryW(path, NULL);
-            if (FAILED(StringCchCatW(path, MAX_PATH, L"\\lumos-app.log"))) return;
-        } else {
-            wcscpy(path, L".\\lumos-app.log");
-        }
-        g_dbgLog = _wfopen(path, L"a");
-    }
-    if (!g_dbgLog) return;
-    SYSTEMTIME st;
-    GetLocalTime(&st);
-    fprintf(g_dbgLog, "[%02d:%02d:%02d.%03d] ",
-            st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
-    va_list ap;
-    va_start(ap, fmt);
-    vfprintf(g_dbgLog, fmt, ap);
-    va_end(ap);
-    fprintf(g_dbgLog, "\n");
-    fflush(g_dbgLog);
-}
-#else
-#define DbgLog(...) ((void)0)
-#endif
+#define DbgLog(...) Diagnostics_Log("INFO", "app", __VA_ARGS__)
 
 /* Times a UI-thread operation into the debug log. Several operations here
    talk to the display over DDC/CI, which can block for seconds when the
@@ -656,6 +668,7 @@ static void StepWithOsd(int delta)
 
 static void HandleHotkey(int id)
 {
+    Diagnostics_Log("INFO", "hotkey", "id=%d step=%d", id, g_settings.step);
     int step = g_settings.step;
     int delta = 0;
 
@@ -684,6 +697,8 @@ static void HandleHotkey(int id)
 
     if (Monitor_HasSelected(&g_monitors))
         StepWithOsd(delta);
+    else
+        Diagnostics_Log("INFO", "hotkey", "SKIP reason=no-controllable-selected-monitor");
 }
 
 /* ---- Apply Preset ---- */
@@ -691,6 +706,8 @@ static void HandleHotkey(int id)
 static BOOL ApplyPreset(int index)
 {
     if (index < 0 || index >= g_settings.presetCount) return FALSE;
+    Diagnostics_Log("INFO", "preset", "index=%d name=\"%ls\" percent=%lu", index,
+                    g_settings.presets[index].name, g_settings.presets[index].brightness);
     return ApplyPresetBrightness(g_settings.presets[index].brightness);
 }
 
@@ -850,9 +867,7 @@ static void StartRescan(HWND hwnd)
     args->hwnd = hwnd;
     args->gen = ++g_rescan.generation;
     g_rescan.awaitedGeneration = args->gen;
-#ifdef DEBUG
     DWORD generation = args->gen; /* worker frees args as soon as it starts */
-#endif
     g_rescan.startTick = GetTickCount();
 
     HANDLE h = CreateThread(NULL, 0, RescanThreadProc, args, 0, NULL);
@@ -920,6 +935,9 @@ static ULONGLONG CurrentLocalMinute(int *minuteOfDay)
    disabled, or empty. Applies only when the value changed (less DDC traffic). */
 static void Schedule_ApplyNow(void)
 {
+    Diagnostics_Log("INFO", "schedule", "check enabled=%d points=%d idle=%d suspended=%d lastApplied=%d",
+        g_settings.scheduleEnabled, g_settings.scheduleCount, g_idleDimmed,
+        g_scheduleSuspended, g_scheduleLastApplied);
     if (!g_settings.scheduleEnabled || g_settings.scheduleCount == 0)
         return;
 
@@ -949,6 +967,7 @@ static void Schedule_ApplyNow(void)
         return;
 
     g_scheduleLastApplied = value;
+    Diagnostics_Log("INFO", "schedule", "APPLY minute=%d basePercent=%d", now, value);
     g_masterTarget = value;
     g_masterTargetValid = TRUE;
     UI_SetMasterTarget(value);
@@ -964,6 +983,8 @@ static void Schedule_ApplyNow(void)
    "unchanged" guard); otherwise we re-apply the last master target. */
 static void ReapplyBrightness(void)
 {
+    Diagnostics_Log("INFO", "policy", "reapply idle=%d masterValid=%d masterTarget=%d scheduleSuspended=%d",
+                    g_idleDimmed, g_masterTargetValid, g_masterTarget, g_scheduleSuspended);
     /* Woke up with nobody at the keyboard (display power-on, unlock by another
        session): hold the idle level instead of restoring the full one. */
     if (g_idleDimmed) {
@@ -1011,12 +1032,14 @@ static void Schedule_Suspend(void)
     if (untilResume <= 0) untilResume += 1440;
     g_scheduleResumeLocalMinute = localMinute ? localMinute + (ULONGLONG)untilResume : 0;
     g_scheduleLastApplied = -1;  /* force re-apply after resume */
+    Diagnostics_Log("INFO", "schedule", "SUSPEND currentMinute=%d resumeMinute=%d", now, g_scheduleResumeMinute);
 }
 
 /* Every manual brightness change (hotkey, wheel, slider, preset) goes through
    here: it supersedes the idle level and suspends the schedule. */
 static void ManualChange(void)
 {
+    Diagnostics_Log("INFO", "manual", "user brightness change master=%d previousIdle=%d", g_masterTarget, g_idleDimmed);
     g_idleDimmed = FALSE;   /* the user just set a level; do not restore over it */
     IdleBlack_Clear();
     Schedule_Suspend();
@@ -1026,6 +1049,10 @@ static void ManualChange(void)
 
 static void SliderManualChange(int row, int target)
 {
+    if (row >= 0 && row < g_monitors.count)
+        Diagnostics_Monitor(&g_monitors.monitors[row], "INFO", "slider", "manual row=%d percent=%d", row + 1, target);
+    else
+        Diagnostics_Log("INFO", "slider", "manual masterPercent=%d", target);
     /* Filtered requests do not optimistically overwrite confirmed brightness.
        Derive master intent from a temporary view of the requested row instead. */
     MonitorList intended = g_monitors;
@@ -1050,8 +1077,10 @@ static DWORD IdleMilliseconds(void)
     LASTINPUTINFO lii;
     lii.cbSize = sizeof(lii);
     lii.dwTime = 0;
-    if (!GetLastInputInfo(&lii))
+    if (!GetLastInputInfo(&lii)) {
+        Diagnostics_Log("ERROR", "idle", "GetLastInputInfo FAILED error=0x%08lX", GetLastError());
         return 0;
+    }
     DWORD now = GetTickCount();
     DWORD idle = now - lii.dwTime;        /* unsigned math, so the 49-day wrap is fine */
     /* A lumosctl command counts as activity too (see RemoteActivity). */
@@ -1085,7 +1114,13 @@ static int Idle_DimBlocked(void)
    recover it from the monitors first, otherwise there is nothing to restore. */
 static void DimIdleMonitor(BrightMonitor *monitor)
 {
-    if (!Monitor_CanControl(monitor) || monitor->idleBlack || monitor->idleDimPending) return;
+    if (!Monitor_CanControl(monitor) || monitor->idleBlack || monitor->idleDimPending) {
+        Diagnostics_Monitor(monitor, "INFO", "idle-dim", "SKIP reason=%s sourcePolicy=%s",
+            monitor->excludedFromControl ? "monitor-excluded" : monitor->idleBlack ? "true-black-overlay" :
+            !monitor->controllable ? "brightness-unavailable" : "dim-already-pending",
+            Diagnostics_SourceReason(monitor));
+        return;
+    }
     if (!monitor->idleEpoch) {
         if (++g_idleEpoch == 0) ++g_idleEpoch;
         monitor->idleEpoch = g_idleEpoch;
@@ -1098,7 +1133,10 @@ static void DimIdleMonitor(BrightMonitor *monitor)
     monitor->idleReleasePending = FALSE;
     monitor->idleDimPending = TRUE;
     BOOL asynchronous = MonitorWorker_Running();
+    Diagnostics_Monitor(monitor, "INFO", "idle-dim", "QUEUE percent=%d epoch=%lu asynchronous=%d sourcePolicy=%s",
+                        percent, monitor->idleEpoch, asynchronous, Diagnostics_SourceReason(monitor));
     if (!Monitor_SetIdleBrightness(monitor, (DWORD)percent)) {
+        Diagnostics_Monitor(monitor, "ERROR", "idle-dim", "REQUEST FAILED");
         monitor->idleDimPending = FALSE;
         monitor->idleReleasePending = releasePending;
     } else if (!asynchronous) {
@@ -1122,13 +1160,26 @@ static void TryIdleHandoff(BrightMonitor *monitor)
         !monitor->expectedInput || !monitor->sourceKnown ||
         monitor->currentInput == monitor->expectedInput ||
         !monitor->idleApplied || !monitor->preIdleBrightnessValid ||
-        monitor->idleReleasePending) return;
+        monitor->idleReleasePending) {
+        if (monitor->sourceFilter && (!monitor->sourceKnown || monitor->currentInput != monitor->expectedInput)) {
+            const char *reason = !Monitor_CanControl(monitor) ? "monitor-excluded-or-brightness-unavailable" :
+                !monitor->expectedInput ? "PC-input-unassigned" : !monitor->sourceKnown ? "input-unavailable" :
+                !monitor->idleApplied ? "no-acknowledged-idle-write" :
+                !monitor->preIdleBrightnessValid ? "no-original-brightness" : "restore-already-pending";
+            Diagnostics_Monitor(monitor, "INFO", "idle-handoff", "SKIP reason=%s idleApplied=%d baselineValid=%d releasePending=%d",
+                reason, monitor->idleApplied, monitor->preIdleBrightnessValid, monitor->idleReleasePending);
+        }
+        return;
+    }
+    Diagnostics_Monitor(monitor, "INFO", "idle-handoff", "RESTORE originalRaw=%lu otherInput=0x%02lX epoch=%lu pcStillIdle=%d",
+        monitor->preIdleBrightness, monitor->currentInput, monitor->idleEpoch, g_idleDimmed);
     monitor->idleReleasePending = TRUE;
     monitor->idleDimPending = FALSE; /* This request replaces any queued dim. */
     BOOL asynchronous = MonitorWorker_Running();
-    if (!Monitor_ReleaseIdleBrightness(monitor, monitor->preIdleBrightness, monitor->currentInput))
+    if (!Monitor_ReleaseIdleBrightness(monitor, monitor->preIdleBrightness, monitor->currentInput)) {
+        Diagnostics_Monitor(monitor, "ERROR", "idle-handoff", "restore request FAILED; retry on next source poll");
         monitor->idleReleasePending = FALSE;
-    else if (!asynchronous) {
+    } else if (!asynchronous) {
         monitor->idleReleasePending = FALSE;
         monitor->idleApplied = FALSE;
         if (!g_idleDimmed) monitor->preIdleBrightnessValid = FALSE;
@@ -1205,16 +1256,41 @@ static void Idle_Restore(void)
     IdleBlack_Update(&g_monitors, g_settings.idleDimEnabled, FALSE);
 }
 
+/* Removing the black cover is immediate, but a dimmed panel may reject its
+   restore. Keep its acknowledged idle ownership until a write succeeds, and
+   retry the latest policy without touching displays which already recovered. */
+static void RetryIdleRestores(void)
+{
+    if (g_idleDimmed) return;
+    MonitorTarget pending[MAX_MONITORS];
+    DWORD pendingMask = MonitorWorker_PendingTargets(pending);
+    for (int i = 0; i < g_monitors.count; i++) {
+        BrightMonitor *monitor = &g_monitors.monitors[i];
+        if (!monitor->idleApplied || monitor->idleBlack ||
+            !Monitor_CanControl(monitor) || !Monitor_SourceAllowsControl(monitor) ||
+            (pendingMask & (1u << i))) continue;
+        Diagnostics_Monitor(monitor, "WARN", "idle-restore",
+            "RETRY acknowledged dim still applied; resume latest brightness policy");
+        ResumeSourceMonitor(monitor);
+    }
+}
+
 static void Idle_Tick(void)
 {
+    DWORD idleMs = IdleMilliseconds();
+    Diagnostics_Log("INFO", "idle", "tick enabled=%d noInputMs=%lu thresholdMs=%lu dimmed=%d masterValid=%d master=%d",
+        g_settings.idleDimEnabled, idleMs, (DWORD)g_settings.idleDimMinutes * 60000u,
+        g_idleDimmed, g_masterTargetValid, g_masterTarget);
     if (!g_settings.idleDimEnabled) {
         Idle_Restore();   /* setting turned off mid-dim */
+        RetryIdleRestores();
         IdleBlack_Update(&g_monitors, FALSE, FALSE);
         return;
     }
-    BOOL idle = IdleMilliseconds() >= (DWORD)g_settings.idleDimMinutes * 60000u;
+    BOOL idle = idleMs >= (DWORD)g_settings.idleDimMinutes * 60000u;
     if (idle && !g_idleDimmed)       Idle_Dim();
     else if (!idle && g_idleDimmed)  Idle_Restore();
+    RetryIdleRestores();
     IdleBlack_Update(&g_monitors, TRUE, g_idleDimmed);
 }
 
@@ -1232,7 +1308,9 @@ static void RestartSourcePolling(void)
     g_settings.sourcePollSeconds = Settings_ClampSourcePollSeconds(g_settings.sourcePollSeconds);
     UINT interval = (UINT)g_settings.sourcePollSeconds * 1000u;
     UI_MonitorSelectionSetSourcePollInterval(interval);
-    SetTimer(g_hwndHidden, SOURCE_TIMER_ID, interval, NULL);
+    UINT_PTR armed = SetTimer(g_hwndHidden, SOURCE_TIMER_ID, interval, NULL);
+    Diagnostics_Log(armed ? "INFO" : "ERROR", "source-timer", "configured intervalMs=%u armed=%d error=0x%08lX",
+                    interval, armed != 0, armed ? ERROR_SUCCESS : GetLastError());
 }
 
 /* A scope change cancels queued writes and any drag against the previous
@@ -1272,6 +1350,7 @@ static void UpdateMonitorSelection(void)
         g_monitors.monitors[i].idleReleasePending = FALSE;
     }
     Settings_ApplyMonitorSelection(&g_settings, &g_monitors);
+    LogMonitorList("selection updated");
     if (!scopeChanged) {
         /* A changed association is checked afresh. It must neither rebase the
            master from another PC's brightness nor cancel the current policy. */
@@ -1331,6 +1410,7 @@ static void UpdateMonitorSelection(void)
 
 static void HandleCommand(HWND hwnd, int cmd)
 {
+    Diagnostics_Log("INFO", "command", "id=%d", cmd);
     if (cmd >= IDM_PRESET_BASE && cmd < IDM_PRESET_BASE + MAX_PRESETS) {
         ApplyPreset(cmd - IDM_PRESET_BASE);
     } else switch (cmd) {
@@ -1382,6 +1462,7 @@ static void HandleCommand(HWND hwnd, int cmd)
             Monitor_SetAllBrightness(&g_monitors, g_masterTarget);
             UI_RefreshPopup(g_hwndPopup, &g_monitors);
         }
+        LogSettings("saved and applied");
         if (!g_settings.idleDimEnabled)
             Idle_Restore();           /* undo an active dim right away */
         RestartSchedule();
@@ -1420,6 +1501,8 @@ static void HandleTimer(HWND hwnd, WPARAM wParam)
                      !monitor->excludedFromControl &&
                      (monitor->sourceFilter || !monitor->controllable);
         }
+        Diagnostics_Log("INFO", "source-timer", "tick needed=%d pickerOpen=%d intervalSeconds=%d",
+                        needed, UI_MonitorSelectionIsOpen(), g_settings.sourcePollSeconds);
         if (needed) MonitorWorker_RefreshSources(&g_monitors, UI_MonitorSelectionIsOpen());
     } else if (wParam == RESCAN_WATCHDOG_TIMER_ID) {
         KillTimer(hwnd, RESCAN_WATCHDOG_TIMER_ID);
@@ -1452,9 +1535,15 @@ static void HandleTimer(HWND hwnd, WPARAM wParam)
    Only the monitor which came back is written when the policy is unchanged. */
 static void ResumeSourceMonitor(BrightMonitor *monitor)
 {
-    if (!Monitor_CanControl(monitor) || !Monitor_SourceAllowsControl(monitor)) return;
+    Diagnostics_MonitorState(monitor, "source-resume requested");
+    if (!Monitor_CanControl(monitor) || !Monitor_SourceAllowsControl(monitor)) {
+        Diagnostics_Monitor(monitor, "INFO", "source-resume", "SKIP sourcePolicy=%s", Diagnostics_SourceReason(monitor));
+        return;
+    }
     int base;
     if (g_idleDimmed) {
+        Diagnostics_Monitor(monitor, "INFO", "source-resume", "policy=idle mode=%s",
+                            monitor->idleBlack ? "true-black" : "brightness");
         DimIdleMonitor(monitor);
         return;
     } else {
@@ -1506,6 +1595,20 @@ static void HandleMonitorResult(HWND hwnd, MonitorResult *result)
 {
     BOOL current = result && MonitorWorker_Accept(result);
     int stateIndex = MonitorResultStateIndex(result);
+    if (result) {
+        BrightMonitor identity = {0};
+        identity.backend = result->backend;
+        CopyMemory(identity.deviceInstance, result->deviceInstance, sizeof(identity.deviceInstance));
+        const BrightMonitor *logged = current ? &g_monitors.monitors[result->index] :
+                                      stateIndex >= 0 ? &g_monitors.monitors[stateIndex] : &identity;
+        Diagnostics_Monitor(logged, result->success ? "INFO" : "WARN", "worker-result",
+            "row=%d accepted=%d stateIndex=%d kind=%d success=%d purpose=%s generation=%lu sequence=%lu "
+            "brightnessWritten=%d brightnessUpdated=%d sourceUpdated=%d sourceKnown=%d input=0x%02lX epoch=%lu",
+            result->index + 1, current, stateIndex, result->kind, result->success,
+            Diagnostics_WritePurpose(result->purpose), result->generation, result->sequence,
+            result->brightnessWritten, result->brightnessUpdated, result->sourceUpdated,
+            result->sourceKnown, result->currentInput, result->idleEpoch);
+    }
     if (stateIndex >= 0) {
         BrightMonitor *monitor = &g_monitors.monitors[stateIndex];
         if (result->idleEpoch == monitor->idleEpoch && result->brightnessWritten) {
@@ -1582,6 +1685,7 @@ static void HandleMonitorResult(HWND hwnd, MonitorResult *result)
             TryIdleHandoff(monitor);
         UI_RefreshPopup(g_hwndPopup, &g_monitors);
         UI_MonitorSelectionRefresh(&g_monitors);
+        Diagnostics_MonitorState(monitor, "result applied");
         IdleBlack_Update(&g_monitors, g_settings.idleDimEnabled, g_idleDimmed);
     } else if (stateIndex >= 0 && result->brightnessWritten && result->purpose == MONITOR_WRITE_IDLE) {
         /* Its brightness result was superseded, but an actual dim still needs
@@ -1647,6 +1751,7 @@ static int AdoptMonitorList(MonitorList *fresh)
     free(fresh);
     Settings_ApplyRanges(&g_settings, &g_monitors);
     Settings_ApplyMonitorSelection(&g_settings, &g_monitors);
+    LogMonitorList("rescan adopted");
     /* Enumeration can already see the PC input on return. Revalidate here so
        source polling also resumes devices which disappeared from the topology. */
     for (int i = 0; i < g_monitors.count; i++) {
@@ -1754,6 +1859,7 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
     /* A newer instance is launching and wants our spot: exit cleanly so it can
        take over. Registered message, so it cannot be a compile-time switch case. */
     if (msg == g_wmTakeover && g_wmTakeover != 0) {
+        Diagnostics_Log("INFO", "app", "replacement requested by another Lumos instance");
         DestroyWindow(hwnd);   /* -> WM_DESTROY -> PostQuitMessage */
         return 0;
     }

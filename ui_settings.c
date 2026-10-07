@@ -1,6 +1,7 @@
 #include "ui_internal.h"
 #include "brightmap.h"
 #include "ui_monitor_selection.h"
+#include "diagnostics.h"
 #include <windowsx.h>
 
 static const WCHAR SET_CLASS[]     = L"LumosSettings";
@@ -881,7 +882,10 @@ static int SetRowOfHotkey(SetEditData *d, int action)
    reason on the row and the focus moved there so a screen reader reads it. */
 static void SetTrySave(HWND hwnd, SetEditData *d)
 {
-    if (!SetCanSave(d)) return;
+    if (!SetCanSave(d)) {
+        Diagnostics_Log("WARN", "settings-ui", "SAVE rejected: monitor selection is empty");
+        return;
+    }
     SetEndCapture(hwnd, d);
 
     for (int i = 0; i < HOTKEY_COUNT; i++) {
@@ -907,6 +911,8 @@ static void SetTrySave(HWND hwnd, SetEditData *d)
         }
     }
 
+    Diagnostics_Log("INFO", "settings-ui", "SAVE sourcePollSeconds=%d idleEnabled=%d idleMinutes=%d idlePercent=%d",
+                    d->sourcePollSeconds, d->idleDimEnabled, d->idleDimMinutes, d->idleDimPercent);
     SetCommit(d);
     HWND owner = d->owner;
     DestroyWindow(hwnd);
@@ -1186,6 +1192,7 @@ static LRESULT CALLBACK SetWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
 
 void UI_ShowSettings(HWND hwndOwner, Settings *s, MonitorList *monitors)
 {
+    Diagnostics_Log("INFO", "settings-ui", "OPEN");
     if (g_setHwnd && IsWindow(g_setHwnd)) {
         DestroyWindow(g_setHwnd);
         g_setHwnd = NULL;

@@ -3,6 +3,7 @@
 #include "brightmap.h"
 #include "wmibright.h"
 #include "monitor_worker.h"
+#include "diagnostics.h"
 #include <physicalmonitorenumerationapi.h>
 #include <highlevelmonitorconfigurationapi.h>
 #include <lowlevelmonitorconfigurationapi.h>
@@ -10,6 +11,38 @@
 #include <stdarg.h>
 #include <stdlib.h>
 #include <strsafe.h>
+
+/* Older MinGW headers omit these graphics status codes. */
+#ifndef ERROR_GRAPHICS_I2C_ERROR_TRANSMITTING_DATA
+#define ERROR_GRAPHICS_I2C_ERROR_TRANSMITTING_DATA ((DWORD)0xC0262582u)
+#endif
+#ifndef ERROR_GRAPHICS_I2C_ERROR_RECEIVING_DATA
+#define ERROR_GRAPHICS_I2C_ERROR_RECEIVING_DATA ((DWORD)0xC0262583u)
+#endif
+
+enum { DDC_SETTLE_MS = 100, DDC_WRITE_ATTEMPTS = 3 };
+
+static BOOL DdcCommunicationError(DWORD error)
+{
+    return error == (DWORD)ERROR_GRAPHICS_I2C_ERROR_TRANSMITTING_DATA ||
+           error == (DWORD)ERROR_GRAPHICS_I2C_ERROR_RECEIVING_DATA;
+}
+
+static BOOL ReadDdcBrightness(const BrightMonitor *monitor, DWORD *minimum,
+                              DWORD *current, DWORD *maximum)
+{
+    BOOL ok = GetMonitorBrightness(monitor->hPhysical, minimum, current, maximum);
+    DWORD error = ok ? ERROR_SUCCESS : GetLastError();
+    if (!ok && DdcCommunicationError(error)) {
+        Diagnostics_Monitor(monitor, "WARN", "brightness-read",
+            "RETRY firstError=0x%08lX delayMs=%d", error, DDC_SETTLE_MS);
+        Sleep(DDC_SETTLE_MS);
+        ok = GetMonitorBrightness(monitor->hPhysical, minimum, current, maximum);
+        error = ok ? ERROR_SUCCESS : GetLastError();
+    }
+    SetLastError(error);
+    return ok;
+}
 
 typedef struct HandleLease {
     HANDLE handle;
@@ -87,81 +120,16 @@ void Monitor_FlushRetiredHandles(void)
         }
         ReleaseSRWLockExclusive(&g_leaseLock);
         if (!retired) break;
-        DestroyPhysicalMonitor(retired->handle);
+        BOOL destroyed = DestroyPhysicalMonitor(retired->handle);
+        Diagnostics_Log(destroyed ? "INFO" : "ERROR", "handles", "retired hPhysical=%p destroyed=%d error=0x%08lX",
+                        retired->handle, destroyed, destroyed ? ERROR_SUCCESS : GetLastError());
         free(retired);
     }
     ReleaseSRWLockExclusive(&g_acquireLock);
 }
 
-/* ---- Logging (only in debug builds: -DDEBUG) ---- */
-
-#ifdef DEBUG
-
-#include <shlobj.h>
-
-static FILE *g_logFile = NULL;
-static SRWLOCK g_logLock = SRWLOCK_INIT;
-
-/* The log goes to %APPDATA%\Lumos, next to config.ini, and not next to the
-   exe: the app normally lives under Program Files, where a non-elevated
-   process cannot create files, and a 64-bit process gets no VirtualStore
-   redirection either, so an exe-relative log silently never appears. */
-static void LogOpen(void)
-{
-    if (g_logFile) return;
-    WCHAR path[MAX_PATH];
-    if (SUCCEEDED(SHGetFolderPathW(NULL, CSIDL_APPDATA, NULL, 0, path))) {
-        if (FAILED(StringCchCatW(path, MAX_PATH, L"\\Lumos"))) return;
-        CreateDirectoryW(path, NULL);
-        if (FAILED(StringCchCatW(path, MAX_PATH, L"\\lumos-ddc.log"))) return;
-    } else {
-        wcscpy(path, L".\\lumos-ddc.log");
-    }
-    g_logFile = _wfopen(path, L"a");
-}
-
-static void Log(const char *fmt, ...)
-{
-    AcquireSRWLockExclusive(&g_logLock);
-    if (!g_logFile) LogOpen();
-    if (!g_logFile) { ReleaseSRWLockExclusive(&g_logLock); return; }
-
-    SYSTEMTIME st;
-    GetLocalTime(&st);
-    fprintf(g_logFile, "[%04d-%02d-%02d %02d:%02d:%02d.%03d] ",
-            st.wYear, st.wMonth, st.wDay,
-            st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
-
-    va_list ap;
-    va_start(ap, fmt);
-    vfprintf(g_logFile, fmt, ap);
-    va_end(ap);
-
-    fprintf(g_logFile, "\n");
-    fflush(g_logFile);
-    ReleaseSRWLockExclusive(&g_logLock);
-}
-
-static void LogW(const char *prefix, const WCHAR *wstr)
-{
-    AcquireSRWLockExclusive(&g_logLock);
-    if (!g_logFile) LogOpen();
-    if (!g_logFile) { ReleaseSRWLockExclusive(&g_logLock); return; }
-
-    SYSTEMTIME st;
-    GetLocalTime(&st);
-    fprintf(g_logFile, "[%04d-%02d-%02d %02d:%02d:%02d.%03d] %s: %ls\n",
-            st.wYear, st.wMonth, st.wDay,
-            st.wHour, st.wMinute, st.wSecond, st.wMilliseconds,
-            prefix, wstr);
-    fflush(g_logFile);
-    ReleaseSRWLockExclusive(&g_logLock);
-}
-
-#else
-#define Log(...) ((void)0)
-#define LogW(...) ((void)0)
-#endif
+#define Log(...) Diagnostics_Log("INFO", "enumeration", __VA_ARGS__)
+#define LogW(prefix, text) Log("%s: %ls", prefix, text)
 
 /* ---- Friendly monitor name via EnumDisplayDevices ---- */
 
@@ -459,6 +427,7 @@ static BOOL CALLBACK MonitorEnumProc(HMONITOR hMon, HDC hdcMon, LPRECT lpRect, L
 
             if (bm->backend == BACKEND_DDC)
                 Monitor_ReadSourceSync(bm);
+            Diagnostics_MonitorState(bm, "physical monitor enumerated");
 
             ml->count++;
             tracked[i] = FALSE; /* ownership transferred to the monitor list */
@@ -526,26 +495,39 @@ void Monitor_Cleanup(MonitorList *ml)
 
 BOOL Monitor_ReadBrightnessSync(BrightMonitor *bm)
 {
+    ULONGLONG start = GetTickCount64();
+    Diagnostics_Monitor(bm, "INFO", "brightness-read", "START");
     if (bm->backend == BACKEND_DDC && bm->hasHandle) {
-        DWORD minimum, current, maximum;
-        BOOL ok = GetMonitorBrightness(bm->hPhysical,
-                                       &minimum, &current, &maximum);
+        DWORD minimum = 0, current = 0, maximum = 0;
+        BOOL ok = ReadDdcBrightness(bm, &minimum, &current, &maximum);
+        DWORD error = ok ? ERROR_SUCCESS : GetLastError();
         if (ok && maximum > minimum && current >= minimum && current <= maximum) {
             bm->brightnessMin = minimum;
             bm->brightnessCur = current;
             bm->brightnessMax = maximum;
             bm->controllable = TRUE;
             bm->awaitingAnswer = FALSE;
+            Diagnostics_Monitor(bm, "INFO", "brightness-read",
+                "OK raw=%lu range=%lu..%lu elapsedMs=%llu", current, minimum, maximum,
+                (unsigned long long)(GetTickCount64() - start));
             return TRUE;
         }
+        Diagnostics_Monitor(bm, "ERROR", "brightness-read",
+            "%s error=0x%08lX raw=%lu range=%lu..%lu elapsedMs=%llu retainedCapability=%d",
+            ok ? "INVALID-REPLY" : "FAILED", error, current, minimum, maximum,
+            (unsigned long long)(GetTickCount64() - start), bm->controllable);
     } else if (bm->backend == BACKEND_WMI) {
         DWORD pct = 0;
         if (Wmi_GetBrightness(bm->wmiInstance, &pct) && pct <= 100) {
             bm->brightnessCur = pct;   /* WMI range is fixed 0-100 */
             bm->controllable = TRUE;
             bm->awaitingAnswer = FALSE;
+            Diagnostics_Monitor(bm, "INFO", "brightness-read", "OK WMI percent=%lu", pct);
             return TRUE;
         }
+        Diagnostics_Monitor(bm, "ERROR", "brightness-read", "FAILED WMI value=%lu", pct);
+    } else {
+        Diagnostics_Monitor(bm, "INFO", "brightness-read", "SKIP reason=no-brightness-backend");
     }
     /* Transient failures cannot revoke previously validated capability/values. */
     return FALSE;
@@ -556,29 +538,41 @@ DWORD Monitor_RefreshBrightnessSync(MonitorList *ml)
     DWORD readMask = 0;
     for (int i = 0; i < ml->count; i++) {
         if (Monitor_ReadBrightnessSync(&ml->monitors[i])) readMask |= 1u << i;
-        else Log("RefreshBrightness[%d] FAILED, err=%lu", i, GetLastError());
+        else Diagnostics_Monitor(&ml->monitors[i], "WARN", "brightness-refresh", "row=%d FAILED", i + 1);
     }
     return readMask;
 }
 
 BOOL Monitor_ReadSourceSync(BrightMonitor *mon)
 {
+    ULONGLONG start = GetTickCount64();
+    Diagnostics_Monitor(mon, "INFO", "source-read", "START vcp=0x60 expected=0x%02lX filter=%d",
+                        mon->expectedInput, mon->sourceFilter);
     DWORD input = 0, maximum = 0;
     MC_VCP_CODE_TYPE type;
     BOOL ok = mon->backend == BACKEND_DDC && mon->hasHandle &&
               GetVCPFeatureAndVCPFeatureReply(mon->hPhysical, 0x60, &type,
                                              &input, &maximum);
+    DWORD error = ok ? ERROR_SUCCESS : GetLastError();
     /* Some displays reject back-to-back DDC commands with a transient error.
        Retry once after a short pause; never reuse a cached match to authorize a
        write. This runs on the worker (or initial enumeration), not the UI. */
     if (!ok && mon->backend == BACKEND_DDC && mon->hasHandle) {
+        Diagnostics_Monitor(mon, "WARN", "source-read", "RETRY firstError=0x%08lX delayMs=100", error);
         Sleep(100);
         ok = GetVCPFeatureAndVCPFeatureReply(mon->hPhysical, 0x60, &type,
                                           &input, &maximum);
+        error = ok ? ERROR_SUCCESS : GetLastError();
     }
     mon->sourceKnown = ok && input > 0 && input <= 255;
     mon->currentInput = mon->sourceKnown ? input : 0;
     mon->sourceCheckedTick = GetTickCount64();
+    Diagnostics_Monitor(mon, mon->sourceKnown ? "INFO" : "WARN", "source-read",
+        "%s error=0x%08lX reply=0x%02lX(%s) maximum=%lu expected=0x%02lX(%s) "
+        "policy=%s elapsedMs=%llu", mon->sourceKnown ? "OK" : ok ? "INVALID-REPLY" : "FAILED",
+        error, input, Diagnostics_InputName(input), maximum, mon->expectedInput,
+        Diagnostics_InputName(mon->expectedInput), Diagnostics_SourceReason(mon),
+        (unsigned long long)(GetTickCount64() - start));
     return mon->sourceKnown;
 }
 
@@ -588,24 +582,37 @@ MonitorWriteOutcome Monitor_SetBrightnessForPurposeGuardedSync(
 {
     BOOL captureBaseline = purpose == MONITOR_WRITE_IDLE && !mon->preIdleBrightnessValid;
     DWORD baseline = 0;
+    Diagnostics_Monitor(mon, "INFO", "brightness-write", "REQUEST purpose=%s value=%lu otherInput=0x%02lX epoch=%lu",
+        Diagnostics_WritePurpose(purpose), value, otherInput, mon->idleEpoch);
     if (sourceUpdated) *sourceUpdated = FALSE;
-    if (!Monitor_CanControl(mon))
+    if (!Monitor_CanControl(mon)) {
+        Diagnostics_Monitor(mon, "INFO", "brightness-write", "SKIP reason=%s",
+            mon->excludedFromControl ? "monitor-excluded" : "brightness-unavailable");
         return MONITOR_WRITE_SKIPPED;
+    }
 
     if (purpose == MONITOR_WRITE_IDLE_RELEASE &&
         (mon->backend != BACKEND_DDC || !mon->sourceFilter ||
          !mon->expectedInput || mon->expectedInput > 255 ||
-         !otherInput || otherInput > 255 || otherInput == mon->expectedInput))
+         !otherInput || otherInput > 255 || otherInput == mon->expectedInput)) {
+        Diagnostics_Monitor(mon, "WARN", "brightness-write", "SKIP reason=invalid-idle-restore-association");
         return MONITOR_WRITE_SKIPPED;
+    }
 
     DWORD percent = value > 100 ? 100 : value;
 
     if (mon->backend == BACKEND_WMI) {
-        if (captureBaseline && (!Wmi_GetBrightness(mon->wmiInstance, &baseline) || baseline > 100))
+        if (captureBaseline && (!Wmi_GetBrightness(mon->wmiInstance, &baseline) || baseline > 100)) {
+            Diagnostics_Monitor(mon, "ERROR", "brightness-write", "FAILED reason=WMI-baseline-unavailable");
             return MONITOR_WRITE_FAILED;
-        if (guard && !guard(context)) return MONITOR_WRITE_CANCELLED;
+        }
+        if (guard && !guard(context)) {
+            Diagnostics_Monitor(mon, "INFO", "brightness-write", "CANCELLED reason=request-superseded");
+            return MONITOR_WRITE_CANCELLED;
+        }
         BOOL ok = Wmi_SetBrightness(mon->wmiInstance, percent);
-        Log("SetBrightness(WMI): '%ls' pct=%lu -> %s", mon->name, percent, ok ? "OK" : "FAILED");
+        Diagnostics_Monitor(mon, ok ? "INFO" : "ERROR", "brightness-write", "%s WMI percent=%lu",
+                            ok ? "APPLIED" : "FAILED", percent);
         if (ok) {
             mon->brightnessCur = percent;   /* WMI range is fixed 0-100 */
             if (captureBaseline) {
@@ -617,50 +624,93 @@ MonitorWriteOutcome Monitor_SetBrightnessForPurposeGuardedSync(
     }
 
     if (!mon->hasHandle || mon->backend != BACKEND_DDC ||
-        mon->brightnessMax <= mon->brightnessMin)
+        mon->brightnessMax <= mon->brightnessMin) {
+        Diagnostics_Monitor(mon, "ERROR", "brightness-write", "FAILED reason=invalid-backend-or-range");
         return MONITOR_WRITE_FAILED;
+    }
 
     if (captureBaseline) {
-        DWORD minimum, maximum;
-        if (!GetMonitorBrightness(mon->hPhysical, &minimum, &baseline, &maximum) ||
-            maximum <= minimum || baseline < minimum || baseline > maximum)
+        DWORD minimum = 0, maximum = 0;
+        Diagnostics_Monitor(mon, "INFO", "idle-baseline", "START");
+        BOOL ok = ReadDdcBrightness(mon, &minimum, &baseline, &maximum);
+        DWORD error = ok ? ERROR_SUCCESS : GetLastError();
+        if (!ok || maximum <= minimum || baseline < minimum || baseline > maximum) {
+            Diagnostics_Monitor(mon, "ERROR", "idle-baseline",
+                "FAILED error=0x%08lX raw=%lu range=%lu..%lu", error, baseline, minimum, maximum);
             return MONITOR_WRITE_FAILED;
+        }
+        Diagnostics_Monitor(mon, "INFO", "idle-baseline", "OK raw=%lu range=%lu..%lu", baseline, minimum, maximum);
         mon->brightnessMin = minimum;
         mon->brightnessMax = maximum;
     }
 
-    if (mon->sourceFilter) {
-        Monitor_ReadSourceSync(mon);
-        if (sourceUpdated) *sourceUpdated = TRUE;
-    }
-    if (guard && !guard(context)) return MONITOR_WRITE_CANCELLED;
-    if (purpose == MONITOR_WRITE_IDLE_RELEASE) {
-        if (!mon->sourceKnown || mon->currentInput != otherInput)
-            return MONITOR_WRITE_SKIPPED;
-    } else if (!Monitor_SourceAllowsControl(mon)) return MONITOR_WRITE_SKIPPED;
-
-    if (purpose == MONITOR_WRITE_IDLE_RELEASE) {
-        if (value < mon->brightnessMin || value > mon->brightnessMax)
-            return MONITOR_WRITE_FAILED;
-    } else {
-        value = Brightness_ToRaw(mon, percent);
-    }
-
-    Log("SetBrightness: '%ls' pct=%lu val=%lu (range %lu-%lu) hPhys=%p",
-        mon->name, percent, value, mon->brightnessMin, mon->brightnessMax, mon->hPhysical);
-
-    BOOL ok = SetMonitorBrightness(mon->hPhysical, value);
-    if (ok) {
-        mon->brightnessCur = value;
-        if (captureBaseline) {
-            mon->preIdleBrightness = baseline;
-            mon->preIdleBrightnessValid = TRUE;
+    for (int attempt = 1; attempt <= DDC_WRITE_ATTEMPTS; attempt++) {
+        /* A failed transaction or a baseline read must settle before the next
+           command. Capture the original baseline only once across retries. */
+        if (attempt > 1 || captureBaseline) Sleep(DDC_SETTLE_MS);
+        if (mon->sourceFilter) {
+            Monitor_ReadSourceSync(mon);
+            if (sourceUpdated) *sourceUpdated = TRUE;
         }
-        Log("  -> OK");
-    } else {
-        Log("  -> FAILED, err=%lu", GetLastError());
+        if (guard && !guard(context)) {
+            Diagnostics_Monitor(mon, "INFO", "brightness-write", "CANCELLED reason=request-superseded");
+            return MONITOR_WRITE_CANCELLED;
+        }
+        if (purpose == MONITOR_WRITE_IDLE_RELEASE) {
+            if (!mon->sourceKnown || mon->currentInput != otherInput) {
+                Diagnostics_Monitor(mon, "INFO", "brightness-write", "SKIP reason=restore-input-changed-or-unknown");
+                return MONITOR_WRITE_SKIPPED;
+            }
+        } else if (!Monitor_SourceAllowsControl(mon)) {
+            Diagnostics_Monitor(mon, "INFO", "brightness-write", "SKIP reason=%s", Diagnostics_SourceReason(mon));
+            return MONITOR_WRITE_SKIPPED;
+        }
+
+        if (purpose == MONITOR_WRITE_IDLE_RELEASE) {
+            if (value < mon->brightnessMin || value > mon->brightnessMax) {
+                Diagnostics_Monitor(mon, "ERROR", "brightness-write", "FAILED reason=restore-outside-range");
+                return MONITOR_WRITE_FAILED;
+            }
+        } else {
+            value = Brightness_ToRaw(mon, percent);
+        }
+
+        /* The VG27A rejects SetMonitorBrightness immediately after VCP 0x60.
+           Keep a short command gap, and recheck cancellation after the wait. */
+        if (mon->sourceFilter) Sleep(DDC_SETTLE_MS);
+        if (guard && !guard(context)) {
+            Diagnostics_Monitor(mon, "INFO", "brightness-write", "CANCELLED reason=request-superseded-after-settle");
+            return MONITOR_WRITE_CANCELLED;
+        }
+
+        Diagnostics_Monitor(mon, "INFO", "brightness-write",
+            "START purpose=%s percent=%lu raw=%lu range=%lu..%lu attempt=%d/%d settleMs=%d",
+            Diagnostics_WritePurpose(purpose), percent, value, mon->brightnessMin, mon->brightnessMax,
+            attempt, DDC_WRITE_ATTEMPTS, mon->sourceFilter ? DDC_SETTLE_MS : 0);
+
+        ULONGLONG start = GetTickCount64();
+        BOOL ok = SetMonitorBrightness(mon->hPhysical, value);
+        DWORD error = ok ? ERROR_SUCCESS : GetLastError();
+        if (ok) {
+            mon->brightnessCur = value;
+            if (captureBaseline) {
+                mon->preIdleBrightness = baseline;
+                mon->preIdleBrightnessValid = TRUE;
+            }
+        }
+        Diagnostics_Monitor(mon, ok ? "INFO" : "ERROR", "brightness-write",
+            "%s purpose=%s raw=%lu error=0x%08lX elapsedMs=%llu baselineValid=%d baselineRaw=%lu attempt=%d/%d",
+            ok ? "APPLIED" : "FAILED", Diagnostics_WritePurpose(purpose), value, error,
+            (unsigned long long)(GetTickCount64() - start), mon->preIdleBrightnessValid, mon->preIdleBrightness,
+            attempt, DDC_WRITE_ATTEMPTS);
+        if (ok) return MONITOR_WRITE_APPLIED;
+        if (!DdcCommunicationError(error) || attempt == DDC_WRITE_ATTEMPTS)
+            return MONITOR_WRITE_FAILED;
+        Diagnostics_Monitor(mon, "WARN", "brightness-write",
+            "RETRY error=0x%08lX nextAttempt=%d delayMs=%d recheckSource=%d",
+            error, attempt + 1, DDC_SETTLE_MS, mon->sourceFilter);
     }
-    return ok ? MONITOR_WRITE_APPLIED : MONITOR_WRITE_FAILED;
+    return MONITOR_WRITE_FAILED;
 }
 
 MonitorWriteOutcome Monitor_SetBrightnessGuardedSync(BrightMonitor *mon, DWORD percent,
@@ -685,7 +735,11 @@ void Monitor_PreviewBrightness(BrightMonitor *mon, DWORD percent)
 
 BOOL Monitor_SetBrightness(BrightMonitor *mon, DWORD percent)
 {
-    if (!Monitor_CanControl(mon)) return FALSE;
+    if (!Monitor_CanControl(mon)) {
+        Diagnostics_Monitor(mon, "INFO", "brightness-request", "SKIP percent=%lu reason=%s", percent,
+            mon->excludedFromControl ? "monitor-excluded" : "brightness-unavailable");
+        return FALSE;
+    }
     if (percent > 100) percent = 100;
     mon->desiredBrightnessValid = TRUE;
     mon->desiredBrightness = percent;
@@ -823,11 +877,18 @@ int Monitor_TrackUnanswered(MonitorList *fresh, const MonitorList *prev, unsigne
 
 BOOL Monitor_SetAllBrightness(MonitorList *ml, int percent)
 {
+    Diagnostics_Log("INFO", "brightness-group", "REQUEST masterPercent=%d monitors=%d", percent, ml->count);
     BOOL allOk = TRUE;
     for (int i = 0; i < ml->count; i++) {
         BrightMonitor *monitor = &ml->monitors[i];
-        if (monitor->excludedFromControl) continue;
+        if (monitor->excludedFromControl) {
+            Diagnostics_Monitor(monitor, "INFO", "brightness-group", "row=%d SKIP reason=monitor-excluded", i + 1);
+            continue;
+        }
         int adj = BrightMap_Level(percent, monitor->rangeLo, monitor->rangeHi);
+        Diagnostics_Monitor(monitor, "INFO", "brightness-group",
+            "row=%d masterPercent=%d levelPercent=%d configuredRange=%d..%d",
+            i + 1, percent, adj, monitor->rangeLo, monitor->rangeHi);
         if (!monitor->controllable) {
             /* Keep the newest master intent for connected/waking displays.
                Recovery must not replay their older per-monitor target; these
@@ -836,6 +897,11 @@ BOOL Monitor_SetAllBrightness(MonitorList *ml, int percent)
                 (monitor->backend == BACKEND_DDC && monitor->hasHandle)) {
                 monitor->desiredBrightnessValid = TRUE;
                 monitor->desiredBrightness = (DWORD)adj;
+                Diagnostics_Monitor(monitor, "INFO", "brightness-group",
+                    "row=%d RETAIN-INTENT reason=brightness-unavailable levelPercent=%d", i + 1, adj);
+            } else {
+                Diagnostics_Monitor(monitor, "INFO", "brightness-group",
+                    "row=%d SKIP reason=no-brightness-backend", i + 1);
             }
             continue;
         }

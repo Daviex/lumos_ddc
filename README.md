@@ -108,7 +108,7 @@ Lumos makes no network requests, downloads no updates and sends no telemetry. Cl
 - Brightness control uses local DDC/CI and WMI interfaces.
 - A mouse hook detects wheel input over the tray icon; registered hotkeys and Windows' last-input timestamp support shortcuts and idle dimming. Lumos does not record typed keys.
 - Call detection reads Windows' per-user microphone/camera usage state from the registry. Lumos does not capture audio or video.
-- Settings are stored in `%APPDATA%\Lumos\config.ini`. Optional autostart writes the current user's registry `Run` entry. Debug builds also write local diagnostic logs in `%APPDATA%\Lumos`, including wheel events over the tray icon; release builds omit these logs.
+- Settings are stored in `%APPDATA%\Lumos\config.ini`. Optional autostart writes the current user's registry `Run` entry. Temporary diagnostic logging is enabled in both release and debug builds and writes `lumos-diagnostics.log` beside the executable.
 
 ## Install
 
@@ -140,7 +140,7 @@ Cross-compile from Linux or WSL with MinGW (the outputs go to `build/`):
 mkdir -p build
 x86_64-w64-mingw32-windres lumos.rc -O coff -o build/lumos.res
 x86_64-w64-mingw32-gcc -O2 -s -Wall -mwindows -DUNICODE -D_UNICODE -D_WIN32_WINNT=0x0A00 \
-  lumos.c monitor.c monitor_worker.c brightness.c monitor_selection.c idle_black.c brightmap.c ui.c ui_draw.c ui_popup.c ui_graphics.c ui_monitor_selection.c ui_osd.c ui_menu.c ui_sched.c \
+  lumos.c monitor.c monitor_worker.c brightness.c monitor_selection.c idle_black.c diagnostics.c brightmap.c ui.c ui_draw.c ui_popup.c ui_graphics.c ui_monitor_selection.c ui_osd.c ui_menu.c ui_sched.c \
   ui_settings.c ui_about.c presets.c schedule.c hotkey.c a11y.c remote.c wmibright.c capture.c \
   build/lumos.res -o build/lumos.exe \
   -ldxva2 -luser32 -lgdi32 -lshell32 -lcomctl32 -ladvapi32 -lole32 -loleaut32 -lwbemuuid -ldwmapi -lwtsapi32 -loleacc -lkernel32 -lm
@@ -152,13 +152,14 @@ Or with MSVC from a Developer Command Prompt (this also writes to `build/`):
 
 ```bat
 build.bat            :: release
-build.bat debug      :: debug build, logs to %APPDATA%\Lumos\lumos-*.log
+build.bat debug      :: debug build, diagnostics and UI timings beside the exe
 ```
 
 ### Code organization
 
 - `lumos.c`: application lifecycle, tray/hotkeys, scheduling and monitor rescan coordination.
 - `idle_black.c`: per-monitor black idle windows, input wake and display power request.
+- `diagnostics.c`: shared, thread-safe runtime logging with bounded file rotation.
 - `monitor.c`, `wmibright.c`: hardware access and physical handle ownership.
 - `monitor_worker.c`: queued writes, refreshes and result delivery to the UI thread.
 - `brightness.c`: shared brightness calculations and monitor identity matching, with no hardware access.
@@ -317,6 +318,14 @@ checks the alternate input again before writing; unknown inputs cause no write,
 and a failed restoration is retried on a later source poll. This requires the
 monitor to keep accepting DDC/CI commands from this PC while showing another input.
 
+Filtered brightness writes wait 100 ms after the fresh source read so displays
+that reject consecutive DDC commands can accept the change. Transient I2C
+transmit/receive errors allow up to three write attempts, each rechecking the
+source and whether the request is still current. When activity ends idle mode,
+a failed brightness restore remains pending and is retried on the 2-second idle
+timer, using the latest requested brightness. Already restored and black-idle
+displays are left alone; queued/in-flight restores are not duplicated.
+
 Hotkeys are stored as text. Modifiers are `Ctrl`, `Alt`, `Shift` and `Win`, and keys are letters, digits, `F1` to `F24`, the arrows, `Home`, `End`, `PageUp`, `PageDown`, `Insert`, `Delete`, `Space`, `Enter`, `Tab`, `Backspace`, `Pause` and the numeric keypad (`Num0` to `Num9`, `NumPlus`, `NumMinus`, `NumMultiply`, `NumDivide`, `NumDecimal`). `None` turns a hotkey off, and a value that cannot be read falls back to the default. A `config.ini` from version 1.1 or older has no hotkey lines, and it keeps the `Ctrl+Alt+Up` / `Ctrl+Alt+Down` brightness hotkeys those versions used.
 
 Each line in `[Ranges]` is a monitor name followed by its minimum and maximum, the levels it takes when All Monitors is at 0% and at 100%. A second monitor with the same name is stored as `Name #2`, so two identical models keep separate ranges. A range is at least 20 points wide, so every brightness step still moves the monitor. A monitor without a line starts at `0,100`. A `config.ini` from an older version has a `[Deltas]` section with one offset per monitor instead. Lumos converts those offsets into ranges that keep the monitors matched the same way (offsets of +10 and -30 become `40,100` and `0,60`), and it leaves `[Deltas]` untouched so an older version still finds its offsets.
@@ -346,6 +355,30 @@ it; returning to this PC while still idle shows it again. Panel brightness
 was never reduced, so another source retains its original brightness. Black
 idle does not power off the monitor or trigger its standby/panel maintenance
 cycle. The monitor's own OLED care functions remain necessary.
+
+## Temporary diagnostics
+
+Release and debug builds currently write **`lumos-diagnostics.log` in the executable's
+folder**, regardless of the working directory. Entries are visible immediately.
+One previous file, `lumos-diagnostics.previous.log`, is retained on rotation at
+5 MiB, bounding the pair to about 10 MiB. If the executable folder cannot be
+written, the log falls back to `%APPDATA%\Lumos`; its header records the actual
+path and the executable-folder error. The logger never requests elevation.
+
+Diagnostics cover the whole application and every discovered monitor. Monitor
+entries include its name, stable DDC/WMI identity and native handles; list events
+also include the row number. Timestamp, process/thread, severity and operation
+identify each entry. Source polls report VCP input names/codes, retries, native
+errors and duration. Brightness writes report their purpose, requested value,
+native range, original idle baseline, result and skip/cancellation reason.
+Worker queue generations/sequences distinguish superseded requests and stale
+results. Idle checks record elapsed inactivity and threshold; fullscreen/capture
+exclusions, source handoffs, overlay show/hide/wake, settings persistence,
+schedule/manual actions, topology/power events and rescans are recorded too.
+
+To diagnose a monitor, start this version, reproduce the missed automation and
+inspect the current/previous log by its monitor name or stable identity. Logging
+itself adds no hardware polling and retains the configured source interval.
 
 ## Requirements
 

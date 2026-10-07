@@ -1,4 +1,5 @@
 #include "monitor_worker.h"
+#include "diagnostics.h"
 #include <stdlib.h>
 
 typedef struct {
@@ -135,7 +136,10 @@ static void PostResult(int index, DWORD generation, DWORD sequence,
                        BOOL brightnessUpdated)
 {
     MonitorResult *result = (MonitorResult *)malloc(sizeof(*result));
-    if (!result) return;
+    if (!result) {
+        Diagnostics_Monitor(monitor, "ERROR", "worker", "result allocation FAILED row=%d", index + 1);
+        return;
+    }
     result->index = index;
     result->generation = generation;
     result->sequence = sequence;
@@ -159,8 +163,13 @@ static void PostResult(int index, DWORD generation, DWORD sequence,
     result->backend = monitor->backend;
     result->sourceFilter = monitor->sourceFilter;
     result->expectedInput = monitor->expectedInput;
-    if (!PostMessageW(g_worker.owner, WM_MONITOR_RESULT, 0, (LPARAM)result))
+    Diagnostics_Monitor(monitor, success ? "INFO" : "WARN", "worker",
+        "DELIVER row=%d generation=%lu sequence=%lu kind=%d success=%d purpose=%s brightnessWritten=%d",
+        index + 1, generation, sequence, kind, success, Diagnostics_WritePurpose(purpose), brightnessWritten);
+    if (!PostMessageW(g_worker.owner, WM_MONITOR_RESULT, 0, (LPARAM)result)) {
+        Diagnostics_Monitor(monitor, "ERROR", "worker", "PostMessage FAILED error=0x%08lX", GetLastError());
         free(result);
+    }
 }
 
 /* Hardware calls and result delivery never hold the request lock. */
@@ -182,6 +191,10 @@ static BOOL WriteIsCurrent(void *context)
 
 static void ApplyWrite(int index, WriteRequest *request)
 {
+    Diagnostics_Monitor(&request->monitor, "INFO", "worker",
+        "EXECUTE row=%d generation=%lu sequence=%lu purpose=%s value=%lu",
+        index + 1, request->generation, request->sequence,
+        Diagnostics_WritePurpose(request->purpose), request->percent);
     WriteGuardContext guard = { index, request->generation, request->sequence };
     BOOL sourceUpdated;
     MonitorWriteOutcome outcome = Monitor_SetBrightnessForPurposeGuardedSync(
@@ -203,6 +216,8 @@ static void ApplyWrite(int index, WriteRequest *request)
 
 static void ApplyRefresh(RefreshRequest *request)
 {
+    Diagnostics_Log("INFO", "worker", "brightness refresh START generation=%lu count=%d",
+                    request->generation, request->monitors.count);
     DWORD readMask = Monitor_RefreshBrightnessSync(&request->monitors);
     for (int i = 0; i < request->monitors.count; i++) {
         if (readMask & (1u << i))
@@ -215,11 +230,20 @@ static void ApplyRefresh(RefreshRequest *request)
 
 static void ApplySourceRefresh(RefreshRequest *request)
 {
+    Diagnostics_Log("INFO", "worker", "source refresh START generation=%lu count=%d allMonitors=%d",
+                    request->generation, request->monitors.count, request->allMonitors);
     for (int i = 0; i < request->monitors.count; i++) {
         BrightMonitor *monitor = &request->monitors.monitors[i];
-        if (monitor->backend != BACKEND_DDC || !monitor->hasHandle) continue;
+        if (monitor->backend != BACKEND_DDC || !monitor->hasHandle) {
+            Diagnostics_Monitor(monitor, "INFO", "source-poll", "row=%d SKIP reason=no-DDC-handle", i + 1);
+            continue;
+        }
         if (!request->allMonitors && (monitor->excludedFromControl ||
-            (!monitor->sourceFilter && monitor->controllable))) continue;
+            (!monitor->sourceFilter && monitor->controllable))) {
+            Diagnostics_Monitor(monitor, "INFO", "source-poll", "row=%d SKIP reason=%s", i + 1,
+                monitor->excludedFromControl ? "monitor-excluded" : "filter-off-and-brightness-known");
+            continue;
+        }
         /* A failed initial brightness read must not permanently hide a monitor
            or stop its source polling. Reads recover capability without writing. */
         BOOL brightnessUpdated = !monitor->controllable && Monitor_ReadBrightnessSync(monitor);
@@ -228,6 +252,7 @@ static void ApplySourceRefresh(RefreshRequest *request)
         PostResult(i, request->generation, request->sequences[i], monitor,
                    success, MONITOR_RESULT_SOURCE, TRUE, MONITOR_WRITE_NORMAL, FALSE, brightnessUpdated);
     }
+    Diagnostics_Log("INFO", "worker", "source refresh END generation=%lu", request->generation);
     ReleaseRefreshRequest(request);
 }
 
@@ -235,6 +260,7 @@ static DWORD WINAPI WorkerProc(LPVOID unused)
 {
     int nextIndex = 0;
     (void)unused;
+    Diagnostics_Log("INFO", "worker", "thread START");
 
     for (;;) {
         WorkItem work;
@@ -255,6 +281,7 @@ static DWORD WINAPI WorkerProc(LPVOID unused)
         }
     }
     Monitor_FlushRetiredHandles();
+    Diagnostics_Log("INFO", "worker", "thread END");
     return 0;
 }
 
@@ -270,11 +297,13 @@ BOOL MonitorWorker_Start(HWND owner, MonitorList *view)
     if (g_worker.event)
         g_worker.thread = CreateThread(NULL, 0, WorkerProc, NULL, 0, NULL);
     if (!g_worker.thread) {
+        Diagnostics_Log("ERROR", "worker", "thread startup FAILED error=0x%08lX", GetLastError());
         if (g_worker.event) CloseHandle(g_worker.event);
         DeleteCriticalSection(&g_worker.lock);
         return FALSE;
     }
     InterlockedExchange(&g_running, TRUE);
+    Diagnostics_Log("INFO", "worker", "ready generation=1");
     return TRUE;
 }
 
@@ -299,12 +328,19 @@ static int FindMonitorIndex(const BrightMonitor *monitor)
 static BOOL QueueWrite(BrightMonitor *monitor, DWORD percent,
                        MonitorWritePurpose purpose, DWORD otherInput)
 {
-    if (!MonitorWorker_Running()) return FALSE;
+    if (!MonitorWorker_Running()) {
+        Diagnostics_Monitor(monitor, "ERROR", "worker-queue", "REJECT reason=worker-not-running");
+        return FALSE;
+    }
     int index = FindMonitorIndex(monitor);
-    if (index < 0) return FALSE;
+    if (index < 0) {
+        Diagnostics_Monitor(monitor, "ERROR", "worker-queue", "REJECT reason=monitor-not-in-current-list");
+        return FALSE;
+    }
 
     EnterCriticalSection(&g_worker.lock);
     WriteRequest *request = &g_worker.writes[index];
+    BOOL replaced = request->pending;
     ReleaseWriteRequest(request);
     request->monitor = *monitor;
     Monitor_Retain(&request->monitor);
@@ -316,7 +352,11 @@ static BOOL QueueWrite(BrightMonitor *monitor, DWORD percent,
     request->sequence = ++g_worker.sequences[index];
     request->generation = g_worker.generation;
     request->pending = TRUE;
+    DWORD generation = request->generation, sequence = request->sequence;
     LeaveCriticalSection(&g_worker.lock);
+    Diagnostics_Monitor(monitor, "INFO", "worker-queue",
+        "row=%d generation=%lu sequence=%lu purpose=%s value=%lu replacedPending=%d otherInput=0x%02lX",
+        index + 1, generation, sequence, Diagnostics_WritePurpose(purpose), percent, replaced, otherInput);
     SetEvent(g_worker.event);
     return TRUE;
 }
@@ -346,6 +386,7 @@ void MonitorWorker_Cancel(BrightMonitor *monitor)
     ReleaseWriteRequest(&g_worker.writes[index]);
     g_worker.inFlight[index] = FALSE;
     LeaveCriticalSection(&g_worker.lock);
+    Diagnostics_Monitor(monitor, "INFO", "worker-queue", "CANCEL row=%d", index + 1);
     SetEvent(g_worker.event);
 }
 
@@ -355,6 +396,7 @@ void MonitorWorker_Refresh(const MonitorList *view)
     EnterCriticalSection(&g_worker.lock);
     SnapshotRefreshLocked(&g_worker.refresh, view);
     LeaveCriticalSection(&g_worker.lock);
+    Diagnostics_Log("INFO", "worker-queue", "brightness refresh queued count=%d", view->count);
     SetEvent(g_worker.event);
 }
 
@@ -365,6 +407,7 @@ void MonitorWorker_RefreshSources(const MonitorList *view, BOOL allMonitors)
     SnapshotRefreshLocked(&g_worker.sources, view);
     g_worker.sources.allMonitors = allMonitors;
     LeaveCriticalSection(&g_worker.lock);
+    Diagnostics_Log("INFO", "worker-queue", "source refresh queued count=%d allMonitors=%d", view->count, allMonitors);
     SetEvent(g_worker.event);
 }
 
@@ -374,7 +417,9 @@ void MonitorWorker_Reset(void)
     EnterCriticalSection(&g_worker.lock);
     ++g_worker.generation;
     CancelPendingLocked();
+    DWORD generation = g_worker.generation;
     LeaveCriticalSection(&g_worker.lock);
+    Diagnostics_Log("INFO", "worker-queue", "RESET generation=%lu pending requests cancelled", generation);
     SetEvent(g_worker.event);
 }
 
@@ -420,7 +465,9 @@ void MonitorWorker_Stop(void)
     SetEvent(g_worker.event);
     /* Never hang exit on an unresponsive display driver. Process teardown will
        reclaim a stuck worker and its leases; its state must remain alive. */
-    if (WaitForSingleObject(g_worker.thread, 2000) == WAIT_OBJECT_0) {
+    DWORD waited = WaitForSingleObject(g_worker.thread, 2000);
+    Diagnostics_Log(waited == WAIT_OBJECT_0 ? "INFO" : "WARN", "worker", "shutdown waitResult=0x%08lX", waited);
+    if (waited == WAIT_OBJECT_0) {
         AcquireSRWLockExclusive(&g_lifecycleLock);
         InterlockedExchange(&g_running, FALSE);
         CloseHandle(g_worker.thread);

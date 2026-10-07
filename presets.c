@@ -1,5 +1,6 @@
 #include "presets.h"
 #include "brightmap.h"
+#include "diagnostics.h"
 #include <shlobj.h>
 #include <strsafe.h>
 #include <stdio.h>
@@ -15,6 +16,27 @@
 static const WCHAR *const kHotkeyKeys[HOTKEY_COUNT] = {
     L"HotkeyBrighten", L"HotkeyDim", L"HotkeyPopup"
 };
+/* Keep persistence errors visible; registry APIs report their own status codes. */
+static BOOL WriteSettingString(const WCHAR *section, const WCHAR *key,
+                              const WCHAR *value, const WCHAR *path)
+{
+    BOOL ok = WritePrivateProfileStringW(section, key, value, path);
+    DWORD error = ok ? ERROR_SUCCESS : GetLastError();
+    Diagnostics_Log(ok ? "INFO" : "ERROR", "config-write",
+        "%s ini=\"%ls\" section=\"%ls\" key=\"%ls\" value=\"%ls\" error=0x%08lX",
+        ok ? "OK" : "FAILED", path, section, key ? key : L"<delete-section>",
+        value ? value : L"<delete-key>", error);
+    return ok;
+}
+
+static BOOL WriteSettingSection(const WCHAR *section, const WCHAR *values, const WCHAR *path)
+{
+    BOOL ok = WritePrivateProfileSectionW(section, values, path);
+    DWORD error = ok ? ERROR_SUCCESS : GetLastError();
+    Diagnostics_Log(ok ? "INFO" : "ERROR", "config-write",
+        "%s ini=\"%ls\" rewriteSection=\"%ls\" error=0x%08lX", ok ? "OK" : "FAILED", path, section, error);
+    return ok;
+}
 
 static void EnsureDirectory(const WCHAR *path)
 {
@@ -55,20 +77,20 @@ void Settings_CreateDefaults(Settings *s)
     WCHAR dayBrightness[4];
     WCHAR sourcePollSeconds[4];
     StringCchPrintfW(dayBrightness, ARRAYSIZE(dayBrightness), L"%d", DEFAULT_DAY_BRIGHTNESS);
-    WritePrivateProfileStringW(L"Presets", L"Night", L"30", s->iniPath);
-    WritePrivateProfileStringW(L"Presets", L"Day", dayBrightness, s->iniPath);
-    WritePrivateProfileStringW(L"Presets", L"Presentation", L"100", s->iniPath);
-    WritePrivateProfileStringW(L"Settings", L"Step", L"5", s->iniPath);
-    WritePrivateProfileStringW(L"Settings", L"Autostart", L"0", s->iniPath);
-    WritePrivateProfileStringW(L"Settings", L"IdleDimEnabled", L"0", s->iniPath);
-    WritePrivateProfileStringW(L"Settings", L"IdleDimPercent", L"5", s->iniPath);
-    WritePrivateProfileStringW(L"Settings", L"IdleDimMinutes", L"5", s->iniPath);
+    WriteSettingString(L"Presets", L"Night", L"30", s->iniPath);
+    WriteSettingString(L"Presets", L"Day", dayBrightness, s->iniPath);
+    WriteSettingString(L"Presets", L"Presentation", L"100", s->iniPath);
+    WriteSettingString(L"Settings", L"Step", L"5", s->iniPath);
+    WriteSettingString(L"Settings", L"Autostart", L"0", s->iniPath);
+    WriteSettingString(L"Settings", L"IdleDimEnabled", L"0", s->iniPath);
+    WriteSettingString(L"Settings", L"IdleDimPercent", L"5", s->iniPath);
+    WriteSettingString(L"Settings", L"IdleDimMinutes", L"5", s->iniPath);
     StringCchPrintfW(sourcePollSeconds, ARRAYSIZE(sourcePollSeconds), L"%d", DEFAULT_SOURCE_POLL_SECONDS);
-    WritePrivateProfileStringW(L"Settings", L"SourcePollSeconds", sourcePollSeconds, s->iniPath);
-    WritePrivateProfileStringW(MONITOR_SELECTION_SECTION, L"Mode", L"All", s->iniPath);
-    WritePrivateProfileStringW(MONITOR_SELECTION_SECTION, L"Count", L"0", s->iniPath);
-    WritePrivateProfileStringW(MONITOR_INPUT_SECTION, L"Count", L"0", s->iniPath);
-    WritePrivateProfileStringW(MONITOR_BLACK_SECTION, L"Count", L"0", s->iniPath);
+    WriteSettingString(L"Settings", L"SourcePollSeconds", sourcePollSeconds, s->iniPath);
+    WriteSettingString(MONITOR_SELECTION_SECTION, L"Mode", L"All", s->iniPath);
+    WriteSettingString(MONITOR_SELECTION_SECTION, L"Count", L"0", s->iniPath);
+    WriteSettingString(MONITOR_INPUT_SECTION, L"Count", L"0", s->iniPath);
+    WriteSettingString(MONITOR_BLACK_SECTION, L"Count", L"0", s->iniPath);
 
     /* Written out on a new install, so that a config.ini with no hotkey lines
        is recognizably older than 1.2 (see Settings_Load). */
@@ -79,7 +101,7 @@ void Settings_CreateDefaults(Settings *s)
         int k = 0;
         for (; text[k]; k++) textW[k] = (WCHAR)(unsigned char)text[k];
         textW[k] = L'\0';
-        WritePrivateProfileStringW(L"Settings", kHotkeyKeys[i], textW, s->iniPath);
+        WriteSettingString(L"Settings", kHotkeyKeys[i], textW, s->iniPath);
     }
 }
 
@@ -140,8 +162,8 @@ static void SaveMonitorSelection(const Settings *s)
     const MonitorSelection *selection = &s->monitorSelection;
     int savedIndices[MAX_MONITORS], count = 0;
     WCHAR field[16], value[16];
-    WritePrivateProfileSectionW(MONITOR_SELECTION_SECTION, L"", s->iniPath);
-    WritePrivateProfileStringW(MONITOR_SELECTION_SECTION, L"Mode",
+    WriteSettingSection(MONITOR_SELECTION_SECTION, L"", s->iniPath);
+    WriteSettingString(MONITOR_SELECTION_SECTION, L"Mode",
                                selection->selectedOnly ? L"Selected" : L"All", s->iniPath);
     for (int i = 0; i < selection->count && i < MAX_MONITORS; i++) {
         if (!Settings_MonitorKeyValid(selection->keys[i])) continue;
@@ -150,13 +172,13 @@ static void SaveMonitorSelection(const Settings *s)
             if (_wcsicmp(selection->keys[savedIndices[j]], selection->keys[i]) == 0) duplicate = TRUE;
         if (duplicate) continue;
         StringCchPrintfW(field, ARRAYSIZE(field), L"Key%d", count);
-        WritePrivateProfileStringW(MONITOR_SELECTION_SECTION, field, selection->keys[i], s->iniPath);
+        WriteSettingString(MONITOR_SELECTION_SECTION, field, selection->keys[i], s->iniPath);
         StringCchPrintfW(field, ARRAYSIZE(field), L"Name%d", count);
-        WritePrivateProfileStringW(MONITOR_SELECTION_SECTION, field, selection->names[i], s->iniPath);
+        WriteSettingString(MONITOR_SELECTION_SECTION, field, selection->names[i], s->iniPath);
         savedIndices[count++] = i;
     }
     StringCchPrintfW(value, ARRAYSIZE(value), L"%d", count);
-    WritePrivateProfileStringW(MONITOR_SELECTION_SECTION, L"Count", value, s->iniPath);
+    WriteSettingString(MONITOR_SELECTION_SECTION, L"Count", value, s->iniPath);
 }
 
 /* Black idle is an explicit per-display choice, retained while disconnected. */
@@ -190,7 +212,7 @@ static void SaveMonitorIdleBlack(const Settings *s)
     const MonitorSelection *selection = &s->monitorSelection;
     int indices[MAX_MONITORS], count = 0;
     WCHAR field[16], value[16];
-    WritePrivateProfileSectionW(MONITOR_BLACK_SECTION, L"", s->iniPath);
+    WriteSettingSection(MONITOR_BLACK_SECTION, L"", s->iniPath);
     for (int i = 0; i < selection->idleBlackCount && i < MAX_MONITORS; i++) {
         if (!Settings_MonitorKeyValid(selection->idleBlackKeys[i])) continue;
         BOOL duplicate = FALSE;
@@ -199,13 +221,13 @@ static void SaveMonitorIdleBlack(const Settings *s)
                 duplicate = TRUE;
         if (duplicate) continue;
         StringCchPrintfW(field, ARRAYSIZE(field), L"Key%d", count);
-        WritePrivateProfileStringW(MONITOR_BLACK_SECTION, field, selection->idleBlackKeys[i], s->iniPath);
+        WriteSettingString(MONITOR_BLACK_SECTION, field, selection->idleBlackKeys[i], s->iniPath);
         StringCchPrintfW(field, ARRAYSIZE(field), L"Name%d", count);
-        WritePrivateProfileStringW(MONITOR_BLACK_SECTION, field, selection->idleBlackNames[i], s->iniPath);
+        WriteSettingString(MONITOR_BLACK_SECTION, field, selection->idleBlackNames[i], s->iniPath);
         indices[count++] = i;
     }
     StringCchPrintfW(value, ARRAYSIZE(value), L"%d", count);
-    WritePrivateProfileStringW(MONITOR_BLACK_SECTION, L"Count", value, s->iniPath);
+    WriteSettingString(MONITOR_BLACK_SECTION, L"Count", value, s->iniPath);
 }
 
 static BOOL ParseMonitorInput(const WCHAR *value, DWORD *input)
@@ -283,21 +305,21 @@ static void SaveMonitorInputs(const Settings *s)
     WCHAR field[16], value[16];
     for (int i = 0; i < selection->inputRuleCount && i < MAX_MONITORS; i++)
         AddMonitorInputRule(rules, &count, &selection->inputRules[i]);
-    WritePrivateProfileSectionW(MONITOR_INPUT_SECTION, L"", s->iniPath);
+    WriteSettingSection(MONITOR_INPUT_SECTION, L"", s->iniPath);
     for (int i = 0; i < count; i++) {
         StringCchPrintfW(field, ARRAYSIZE(field), L"Key%d", i);
-        WritePrivateProfileStringW(MONITOR_INPUT_SECTION, field, rules[i].key, s->iniPath);
+        WriteSettingString(MONITOR_INPUT_SECTION, field, rules[i].key, s->iniPath);
         StringCchPrintfW(field, ARRAYSIZE(field), L"Name%d", i);
-        WritePrivateProfileStringW(MONITOR_INPUT_SECTION, field, rules[i].name, s->iniPath);
+        WriteSettingString(MONITOR_INPUT_SECTION, field, rules[i].name, s->iniPath);
         StringCchPrintfW(field, ARRAYSIZE(field), L"Enabled%d", i);
-        WritePrivateProfileStringW(MONITOR_INPUT_SECTION, field,
+        WriteSettingString(MONITOR_INPUT_SECTION, field,
                                    rules[i].enabled ? L"1" : L"0", s->iniPath);
         StringCchPrintfW(field, ARRAYSIZE(field), L"Input%d", i);
         StringCchPrintfW(value, ARRAYSIZE(value), L"%lu", (unsigned long)rules[i].input);
-        WritePrivateProfileStringW(MONITOR_INPUT_SECTION, field, value, s->iniPath);
+        WriteSettingString(MONITOR_INPUT_SECTION, field, value, s->iniPath);
     }
     StringCchPrintfW(value, ARRAYSIZE(value), L"%d", count);
-    WritePrivateProfileStringW(MONITOR_INPUT_SECTION, L"Count", value, s->iniPath);
+    WriteSettingString(MONITOR_INPUT_SECTION, L"Count", value, s->iniPath);
 }
 
 /* Parse "lo,hi". wcstol rather than swscanf, because a hand-edited number
@@ -477,26 +499,26 @@ void Settings_Save(Settings *s)
     WCHAR val[16];
 
     /* Clear presets section and rewrite */
-    WritePrivateProfileSectionW(L"Presets", L"", s->iniPath);
+    WriteSettingSection(L"Presets", L"", s->iniPath);
     for (int i = 0; i < s->presetCount; i++) {
         wsprintfW(val, L"%u", s->presets[i].brightness);
-        WritePrivateProfileStringW(L"Presets", s->presets[i].name, val, s->iniPath);
+        WriteSettingString(L"Presets", s->presets[i].name, val, s->iniPath);
     }
 
     wsprintfW(val, L"%d", s->step);
-    WritePrivateProfileStringW(L"Settings", L"Step", val, s->iniPath);
+    WriteSettingString(L"Settings", L"Step", val, s->iniPath);
 
     wsprintfW(val, L"%d", s->autostart ? 1 : 0);
-    WritePrivateProfileStringW(L"Settings", L"Autostart", val, s->iniPath);
+    WriteSettingString(L"Settings", L"Autostart", val, s->iniPath);
 
-    WritePrivateProfileStringW(L"Settings", L"IdleDimEnabled",
+    WriteSettingString(L"Settings", L"IdleDimEnabled",
                                s->idleDimEnabled ? L"1" : L"0", s->iniPath);
     wsprintfW(val, L"%d", s->idleDimPercent);
-    WritePrivateProfileStringW(L"Settings", L"IdleDimPercent", val, s->iniPath);
+    WriteSettingString(L"Settings", L"IdleDimPercent", val, s->iniPath);
     wsprintfW(val, L"%d", s->idleDimMinutes);
-    WritePrivateProfileStringW(L"Settings", L"IdleDimMinutes", val, s->iniPath);
+    WriteSettingString(L"Settings", L"IdleDimMinutes", val, s->iniPath);
     wsprintfW(val, L"%d", Settings_ClampSourcePollSeconds(s->sourcePollSeconds));
-    WritePrivateProfileStringW(L"Settings", L"SourcePollSeconds", val, s->iniPath);
+    WriteSettingString(L"Settings", L"SourcePollSeconds", val, s->iniPath);
 
     for (int i = 0; i < HOTKEY_COUNT; i++) {
         char text[HOTKEY_TEXT_MAX];
@@ -505,19 +527,19 @@ void Settings_Save(Settings *s)
         int k = 0;
         for (; text[k]; k++) textW[k] = (WCHAR)(unsigned char)text[k];
         textW[k] = L'\0';
-        WritePrivateProfileStringW(L"Settings", kHotkeyKeys[i], textW, s->iniPath);
+        WriteSettingString(L"Settings", kHotkeyKeys[i], textW, s->iniPath);
     }
 
     /* Rewrite [Ranges]. [Deltas] from older versions is left as it was, so
        going back to an older build still finds its offsets. */
-    WritePrivateProfileSectionW(L"Ranges", L"", s->iniPath);
+    WriteSettingSection(L"Ranges", L"", s->iniPath);
     for (int i = 0; i < s->rangeCount; i++) {
         wsprintfW(val, L"%d,%d", s->rangeLo[i], s->rangeHi[i]);
-        WritePrivateProfileStringW(L"Ranges", s->rangeNames[i], val, s->iniPath);
+        WriteSettingString(L"Ranges", s->rangeNames[i], val, s->iniPath);
     }
 
     /* Save schedule enabled flag */
-    WritePrivateProfileStringW(L"Settings", L"ScheduleEnabled",
+    WriteSettingString(L"Settings", L"ScheduleEnabled",
                                s->scheduleEnabled ? L"1" : L"0", s->iniPath);
 
     /* Rewrite the entire [Schedule] section (clears removed points).
@@ -533,7 +555,7 @@ void Settings_Save(Settings *s)
             section[pos++] = L'\0';
         }
         section[pos] = L'\0';  /* final terminator */
-        WritePrivateProfileSectionW(L"Schedule", section, s->iniPath);
+        WriteSettingSection(L"Schedule", section, s->iniPath);
     }
     SaveMonitorSelection(s);
     SaveMonitorInputs(s);
@@ -571,7 +593,10 @@ BOOL Settings_SetAutostart(BOOL enable)
                                KEY_SET_VALUE, &hKey);
         if (status == ERROR_FILE_NOT_FOUND) return TRUE;
     }
-    if (status != ERROR_SUCCESS) return FALSE;
+    if (status != ERROR_SUCCESS) {
+        Diagnostics_Log("ERROR", "autostart", "registry open/create FAILED enable=%d status=0x%08lX", enable, (DWORD)status);
+        return FALSE;
+    }
 
     if (enable) {
         status = RegSetValueExW(hKey, APP_NAME, 0, REG_SZ,
@@ -582,6 +607,8 @@ BOOL Settings_SetAutostart(BOOL enable)
         if (status == ERROR_FILE_NOT_FOUND) status = ERROR_SUCCESS;
     }
     RegCloseKey(hKey);
+    Diagnostics_Log(status == ERROR_SUCCESS ? "INFO" : "ERROR", "autostart", "%s enable=%d status=0x%08lX",
+                    status == ERROR_SUCCESS ? "APPLIED" : "FAILED", enable, (DWORD)status);
     return status == ERROR_SUCCESS;
 }
 

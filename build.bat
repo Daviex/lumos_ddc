@@ -2,8 +2,8 @@
 setlocal
 
 :: Lumos build script (MSVC)
-:: Usage: build.bat          (release, no logging)
-::        build.bat debug    (debug, logging to %APPDATA%\Lumos\lumos-*.log)
+:: Usage: build.bat          (release, diagnostics beside the exe)
+::        build.bat debug    (debug, diagnostics and UI timings beside the exe)
 
 if not exist build mkdir build
 
@@ -25,7 +25,7 @@ if errorlevel 1 (
 :: /MT embeds the C runtime: distribute only the exe, no VC runtime DLLs.
 :: All intermediates and the exe go to build\.
 cl /nologo /O2 /MT /W4 /WX- %DEFS% ^
-   lumos.c monitor.c monitor_worker.c brightness.c brightmap.c monitor_selection.c idle_black.c ^
+   lumos.c monitor.c monitor_worker.c brightness.c brightmap.c monitor_selection.c idle_black.c diagnostics.c ^
    ui.c ui_draw.c ui_popup.c ui_graphics.c ui_monitor_selection.c ui_osd.c ui_menu.c ^
    ui_sched.c ui_settings.c ui_about.c presets.c schedule.c hotkey.c a11y.c ^
    remote.c wmibright.c capture.c ^

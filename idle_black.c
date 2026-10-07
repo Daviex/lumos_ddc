@@ -1,5 +1,6 @@
 #include "idle_black.h"
 #include "brightness.h"
+#include "diagnostics.h"
 
 #define BLACK_INPUT_TIMER 1
 #define BLACK_INPUT_POLL_MS 100
@@ -8,6 +9,7 @@ typedef struct {
     HWND window;
     HMONITOR monitor;
     RECT bounds;
+    BrightMonitor identity;
 } BlackWindow;
 
 static const WCHAR BLACK_CLASS[] = L"LumosIdleBlack";
@@ -29,16 +31,23 @@ BOOL IdleBlack_Active(void)
 void IdleBlack_Clear(void)
 {
     for (int i = 0; i < MAX_MONITORS; i++) {
-        if (g_blackWindows[i].window) DestroyWindow(g_blackWindows[i].window);
+        if (g_blackWindows[i].window) {
+            Diagnostics_Monitor(&g_blackWindows[i].identity, "INFO", "overlay", "HIDE reason=clear-request window=%p",
+                                (void *)g_blackWindows[i].window);
+            if (!DestroyWindow(g_blackWindows[i].window))
+                Diagnostics_Monitor(&g_blackWindows[i].identity, "ERROR", "overlay", "DestroyWindow FAILED error=0x%08lX", GetLastError());
+        }
         ZeroMemory(&g_blackWindows[i], sizeof(g_blackWindows[i]));
     }
 }
 
-static void WakeFromBlack(void)
+static void WakeFromBlack(const char *reason)
 {
     if (!IdleBlack_Active()) return;
+    Diagnostics_Log("INFO", "overlay", "WAKE reason=%s", reason);
     IdleBlack_Clear();
-    PostMessageW(g_blackOwner, WM_IDLE_BLACK_WAKE, 0, 0);
+    if (!PostMessageW(g_blackOwner, WM_IDLE_BLACK_WAKE, 0, 0))
+        Diagnostics_Log("ERROR", "overlay", "wake notification FAILED error=0x%08lX", GetLastError());
 }
 
 static LRESULT CALLBACK BlackWndProc(HWND window, UINT message, WPARAM wp, LPARAM lp)
@@ -68,17 +77,20 @@ static LRESULT CALLBACK BlackWndProc(HWND window, UINT message, WPARAM wp, LPARA
     case WM_XBUTTONDOWN:
     case WM_MOUSEWHEEL:
     case WM_MOUSEHWHEEL:
-        WakeFromBlack();
+        WakeFromBlack("mouse-button-or-wheel");
         return 0;
     case WM_TIMER: {
         LASTINPUTINFO input = { sizeof(input), 0 };
-        if (wp == BLACK_INPUT_TIMER &&
-            (!GetLastInputInfo(&input) || input.dwTime != g_blackLastInput))
-            WakeFromBlack();
+        if (wp == BLACK_INPUT_TIMER) {
+            BOOL ok = GetLastInputInfo(&input);
+            if (!ok) Diagnostics_Log("ERROR", "overlay", "GetLastInputInfo FAILED error=0x%08lX", GetLastError());
+            if (!ok || input.dwTime != g_blackLastInput)
+                WakeFromBlack(ok ? "last-input-changed" : "last-input-query-failed");
+        }
         return 0;
     }
     case WM_CLOSE:
-        WakeFromBlack();
+        WakeFromBlack("window-close");
         return 0;
     }
     return DefWindowProcW(window, message, wp, lp);
@@ -95,6 +107,8 @@ void IdleBlack_Init(HINSTANCE instance, HWND owner)
     window.hbrBackground = (HBRUSH)GetStockObject(BLACK_BRUSH);
     window.lpszClassName = BLACK_CLASS;
     g_blackRegistered = RegisterClassExW(&window) != 0;
+    Diagnostics_Log(g_blackRegistered ? "INFO" : "ERROR", "overlay", "initialize registered=%d error=0x%08lX",
+                    g_blackRegistered, g_blackRegistered ? ERROR_SUCCESS : GetLastError());
 }
 
 /* Keep physical monitor coordinates consistent on mixed-DPI desktops without
@@ -110,9 +124,17 @@ void IdleBlack_Update(const MonitorList *view, BOOL enabled, BOOL idle)
     if (view && enabled) {
         for (int i = 0; i < view->count; i++) {
             const BrightMonitor *monitor = &view->monitors[i];
-            if (monitor->excludedFromControl || !monitor->idleBlack || !monitor->hMonitor) continue;
+            if (!monitor->idleBlack) continue;
+            if (monitor->excludedFromControl || !monitor->hMonitor) {
+                Diagnostics_Monitor(monitor, "INFO", "overlay", "SKIP reason=%s",
+                    monitor->excludedFromControl ? "monitor-excluded" : "no-Windows-display");
+                continue;
+            }
             keepDisplay = TRUE;
-            if (!idle || !Monitor_SourceAllowsControl(monitor)) continue;
+            if (!idle || !Monitor_SourceAllowsControl(monitor)) {
+                if (idle) Diagnostics_Monitor(monitor, "INFO", "overlay", "SKIP reason=%s", Diagnostics_SourceReason(monitor));
+                continue;
+            }
             BOOL duplicate = FALSE;
             for (int j = 0; j < count; j++) if (desired[j] == monitor->hMonitor) duplicate = TRUE;
             if (!duplicate) desired[count++] = monitor->hMonitor;
@@ -122,10 +144,15 @@ void IdleBlack_Update(const MonitorList *view, BOOL enabled, BOOL idle)
        is shorter than Lumos's idle timeout. It does not prohibit system sleep. */
     if (keepDisplay && !g_blackPreviousState) {
         g_blackPreviousState = SetThreadExecutionState(ES_CONTINUOUS | ES_DISPLAY_REQUIRED);
+        Diagnostics_Log(g_blackPreviousState ? "INFO" : "ERROR", "power",
+            "keep-display-awake previousState=0x%08lX error=0x%08lX",
+            g_blackPreviousState, g_blackPreviousState ? ERROR_SUCCESS : GetLastError());
         if (g_blackPreviousState & ~ES_CONTINUOUS)
             SetThreadExecutionState(g_blackPreviousState | ES_CONTINUOUS | ES_DISPLAY_REQUIRED);
     } else if (!keepDisplay && g_blackPreviousState) {
-        SetThreadExecutionState(g_blackPreviousState | ES_CONTINUOUS);
+        EXECUTION_STATE result = SetThreadExecutionState(g_blackPreviousState | ES_CONTINUOUS);
+        Diagnostics_Log(result ? "INFO" : "ERROR", "power", "release-display-request state=0x%08lX error=0x%08lX",
+                        g_blackPreviousState, result ? ERROR_SUCCESS : GetLastError());
         g_blackPreviousState = 0;
     }
 
@@ -135,7 +162,10 @@ void IdleBlack_Update(const MonitorList *view, BOOL enabled, BOOL idle)
         BOOL retain = FALSE;
         for (int j = 0; j < count; j++) if (desired[j] == black->monitor) retain = TRUE;
         if (!retain) {
-            DestroyWindow(black->window);
+            Diagnostics_Monitor(&black->identity, "INFO", "overlay", "HIDE reason=no-longer-eligible idle=%d enabled=%d sessionLocked=%d",
+                                idle, enabled, g_blackSessionLocked);
+            if (!DestroyWindow(black->window))
+                Diagnostics_Monitor(&black->identity, "ERROR", "overlay", "DestroyWindow FAILED error=0x%08lX", GetLastError());
             ZeroMemory(black, sizeof(*black));
         }
     }
@@ -150,6 +180,7 @@ void IdleBlack_Update(const MonitorList *view, BOOL enabled, BOOL idle)
     LASTINPUTINFO input = { sizeof(input), 0 };
     /* If the input query fails, leave the desktop visible. */
     if (first && !GetLastInputInfo(&input)) {
+        Diagnostics_Log("ERROR", "overlay", "SKIP first overlay: last-input query FAILED error=0x%08lX", GetLastError());
         if (oldDpi) setDpi(oldDpi);
         return;
     }
@@ -157,7 +188,10 @@ void IdleBlack_Update(const MonitorList *view, BOOL enabled, BOOL idle)
     for (int j = 0; j < count; j++) {
         MONITORINFO info = {0};
         info.cbSize = sizeof(info);
-        if (!GetMonitorInfoW(desired[j], &info)) continue;
+        if (!GetMonitorInfoW(desired[j], &info)) {
+            Diagnostics_Log("ERROR", "overlay", "GetMonitorInfo FAILED hMonitor=%p error=0x%08lX", (void *)desired[j], GetLastError());
+            continue;
+        }
         int index = -1;
         for (int i = 0; i < MAX_MONITORS; i++)
             if (g_blackWindows[i].window && g_blackWindows[i].monitor == desired[j]) index = i;
@@ -167,29 +201,43 @@ void IdleBlack_Update(const MonitorList *view, BOOL enabled, BOOL idle)
         }
         if (index < 0) continue;
         BlackWindow *black = &g_blackWindows[index];
+        for (int i = 0; view && i < view->count; i++)
+            if (view->monitors[i].hMonitor == desired[j] && view->monitors[i].idleBlack &&
+                !view->monitors[i].excludedFromControl && Monitor_SourceAllowsControl(&view->monitors[i])) {
+                black->identity = view->monitors[i];
+                break;
+            }
         int width = info.rcMonitor.right - info.rcMonitor.left;
         int height = info.rcMonitor.bottom - info.rcMonitor.top;
         if (!black->window) {
             black->window = CreateWindowExW(WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
                 BLACK_CLASS, L"", WS_POPUP, info.rcMonitor.left, info.rcMonitor.top, width, height,
                 g_blackOwner, NULL, g_blackInstance, NULL);
-            if (!black->window) continue;
+            if (!black->window) {
+                Diagnostics_Monitor(&black->identity, "ERROR", "overlay", "CreateWindow FAILED error=0x%08lX", GetLastError());
+                continue;
+            }
             black->monitor = desired[j];
             if (!SetTimer(black->window, BLACK_INPUT_TIMER, BLACK_INPUT_POLL_MS, NULL)) {
+                Diagnostics_Monitor(&black->identity, "ERROR", "overlay", "input timer FAILED error=0x%08lX", GetLastError());
                 DestroyWindow(black->window);
                 ZeroMemory(black, sizeof(*black));
                 continue;
             }
+            Diagnostics_Monitor(&black->identity, "INFO", "overlay", "SHOW true-black bounds=%ld,%ld,%ld,%ld window=%p inputPollMs=100",
+                info.rcMonitor.left, info.rcMonitor.top, info.rcMonitor.right, info.rcMonitor.bottom, (void *)black->window);
         }
         black->bounds = info.rcMonitor;
-        SetWindowPos(black->window, HWND_TOPMOST, info.rcMonitor.left, info.rcMonitor.top,
-                     width, height, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+        if (!SetWindowPos(black->window, HWND_TOPMOST, info.rcMonitor.left, info.rcMonitor.top,
+                         width, height, SWP_NOACTIVATE | SWP_SHOWWINDOW))
+            Diagnostics_Monitor(&black->identity, "ERROR", "overlay", "SetWindowPos FAILED error=0x%08lX", GetLastError());
     }
     if (oldDpi) setDpi(oldDpi);
 }
 
 void IdleBlack_Shutdown(void)
 {
+    Diagnostics_Log("INFO", "overlay", "shutdown");
     IdleBlack_Clear();
     if (g_blackPreviousState) SetThreadExecutionState(g_blackPreviousState | ES_CONTINUOUS);
     g_blackPreviousState = 0;
@@ -200,6 +248,7 @@ void IdleBlack_Shutdown(void)
 
 void IdleBlack_SetSessionLocked(BOOL locked)
 {
+    Diagnostics_Log("INFO", "overlay", "session locked=%d", locked);
     g_blackSessionLocked = locked;
     if (locked) IdleBlack_Update(NULL, FALSE, FALSE);
 }

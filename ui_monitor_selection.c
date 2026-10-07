@@ -1,4 +1,5 @@
 #include "ui_monitor_selection.h"
+#include "diagnostics.h"
 #include "ui.h"
 #include "ui_graphics.h"
 #include <commctrl.h>
@@ -411,7 +412,20 @@ static BOOL PopulateSelectionList(SelectionEdit *edit)
 
 static void CloseSelectionWindow(HWND hwnd, SelectionEdit *edit, BOOL apply)
 {
-    if (apply && !CommitMonitorSelection(edit)) return;
+    if (apply && !CommitMonitorSelection(edit)) {
+        Diagnostics_Log("WARN", "monitor-picker", "APPLY rejected: invalid selection or rule limit");
+        return;
+    }
+    Diagnostics_Log("INFO", "monitor-picker", "%s selectedOnly=%d rows=%d%s",
+        apply ? "APPLY" : "CANCEL", edit->selectedOnly, edit->count,
+        apply ? " settings remain a draft until parent Save" : " changes discarded");
+    if (apply) for (int i = 0; i < edit->count; i++) {
+        const SelectionRow *row = &edit->rows[i];
+        Diagnostics_Log("INFO", "monitor-picker",
+            "row=%d monitor=\"%ls\" id=\"%ls\" selected=%d blackIdle=%d filter=%d expected=0x%02lX connected=%d current=0x%02lX known=%d",
+            i + 1, row->name, row->key, row->checked, row->idleBlack, row->sourceFilter,
+            row->expectedInput, row->connected, row->currentInput, row->sourceKnown);
+    }
     edit->applied = apply;
     DestroyWindow(hwnd);
 }
@@ -570,6 +584,7 @@ HWND UI_ShowMonitorSelection(HWND owner, MonitorSelection *working,
                              const MonitorList *monitors,
                              MonitorSelectionClosedCallback closed)
 {
+    Diagnostics_Log("INFO", "monitor-picker", "OPEN");
     if (g_pickerWindow) { SetForegroundWindow(g_pickerWindow); return g_pickerWindow; }
     SelectionEdit *edit = (SelectionEdit *)calloc(1, sizeof(*edit));
     if (!edit) return NULL;
@@ -599,6 +614,7 @@ HWND UI_ShowMonitorSelection(HWND owner, MonitorSelection *working,
     g_pickerWindow = CreateWindowExW(exStyle, PICKER_CLASS, L"Choose Monitors", style,
                                       x, y, width, height, owner, NULL, g_pickerInstance, edit);
     if (!g_pickerWindow) {
+        Diagnostics_Log("ERROR", "monitor-picker", "CreateWindow FAILED error=0x%08lX", GetLastError());
         /* WM_NCDESTROY owns data after WM_NCCREATE. Earlier failures leave it here. */
         if (g_pickerPending) free(g_pickerPending);
         g_pickerPending = NULL;

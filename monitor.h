@@ -112,8 +112,9 @@ void Monitor_CycleActive(MonitorList *ml, int direction);
 /* UI setters/refreshes enqueue work after MonitorWorker_Start. These helpers
    are used only by the hardware worker and the initial startup enumeration. */
 BOOL Monitor_SetBrightnessSync(BrightMonitor *mon, DWORD percent);
-/* Freshly verifies the source before a filtered DDC write. The optional guard
-   runs after that potentially slow read and immediately before native writing. */
+/* Freshly verifies the source before every filtered DDC write attempt. A short
+   command gap and bounded retries handle transient I2C errors. The optional
+   guard runs after source reads/waits, immediately before native writing. */
 typedef enum {
     MONITOR_WRITE_FAILED = 0,
     MONITOR_WRITE_APPLIED,
