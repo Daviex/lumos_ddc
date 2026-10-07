@@ -4,6 +4,7 @@
 #include <commctrl.h>
 #include <wtsapi32.h>
 #include <shlobj.h>
+#include <powrprof.h>
 #include <windowsx.h>
 #include <stdio.h>
 #include <stdarg.h>
@@ -24,11 +25,12 @@
 #include "remote.h"
 #include "diagnostics.h"
 
-/* GUID_CONSOLE_DISPLAY_STATE {6FE69556-704A-47A0-8F24-C28D936FDA47}
-   Defined manually because some MinGW headers omit it. Fires on display
-   power on/off (including the transition back on after a lock screen). */
-static const GUID kGuidConsoleDisplayState =
-    { 0x6fe69556, 0x704a, 0x47a0, { 0x8f, 0x24, 0xc2, 0x8d, 0x93, 0x6f, 0xda, 0x47 } };
+/* Interactive applications observe their own session's display and presence.
+   Defined locally for MinGW versions which omit the GUID constants. */
+static const GUID kGuidSessionDisplayStatus =
+    { 0x2b84c20e, 0xad23, 0x4ddf, { 0x93, 0xdb, 0x05, 0xff, 0xbd, 0x7e, 0xfc, 0xa5 } };
+static const GUID kGuidSessionUserPresence =
+    { 0x3c0f4548, 0xc03f, 0x4c4d, { 0xb9, 0xf2, 0x23, 0x7e, 0xde, 0x68, 0x63, 0x76 } };
 
 /* Coalesce the near-simultaneous unlock + display-power triggers into one
    re-enumeration so we don't hammer the DDC/I2C bus. */
@@ -97,7 +99,12 @@ static MonitorList  g_monitors;
 static Settings     g_settings;
 static NOTIFYICONDATAW g_nid;
 static HHOOK        g_mouseHook;
-static HPOWERNOTIFY g_hPowerNotify;   /* GUID_CONSOLE_DISPLAY_STATE registration */
+static HPOWERNOTIFY g_hPowerNotify;
+static HPOWERNOTIFY g_hPresenceNotify;
+static BOOL         g_sessionDisplayKnown;
+static DWORD        g_sessionDisplayState;
+static BOOL         g_sessionPresenceKnown;
+static DWORD        g_sessionPresenceState;
 static UINT         g_wmTakeover;     /* cross-process "quit, I'm replacing you" message */
 static BOOL         g_scheduleSuspended = FALSE;
 static int          g_scheduleSuspendMinute = 0;   /* minute-of-day at suspend */
@@ -344,7 +351,9 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdLineA, int showCmd
     UpdateIdleBlack(g_settings.idleDimEnabled, FALSE);
     WTSRegisterSessionNotification(g_hwndHidden, NOTIFY_FOR_THIS_SESSION);
     g_hPowerNotify = RegisterPowerSettingNotification(
-        g_hwndHidden, &kGuidConsoleDisplayState, DEVICE_NOTIFY_WINDOW_HANDLE);
+        g_hwndHidden, &kGuidSessionDisplayStatus, DEVICE_NOTIFY_WINDOW_HANDLE);
+    g_hPresenceNotify = RegisterPowerSettingNotification(
+        g_hwndHidden, &kGuidSessionUserPresence, DEVICE_NOTIFY_WINDOW_HANDLE);
 
     /* Create popup (hidden) */
     g_hwndPopup = UI_CreatePopup(hInst, &g_monitors);
@@ -384,6 +393,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdLineA, int showCmd
     RemoveMouseHook();
     UnregisterHotkeys(g_hwndHidden);
     if (g_hPowerNotify) UnregisterPowerSettingNotification(g_hPowerNotify);
+    if (g_hPresenceNotify) UnregisterPowerSettingNotification(g_hPresenceNotify);
     WTSUnRegisterSessionNotification(g_hwndHidden);
     RemoveTrayIcon();
     if (g_hwndPopup) DestroyWindow(g_hwndPopup);
@@ -941,6 +951,10 @@ static ULONGLONG CurrentLocalMinute(int *minuteOfDay)
    disabled, or empty. Applies only when the value changed (less DDC traffic). */
 static void Schedule_ApplyNow(void)
 {
+    if (g_sessionDisplayKnown && g_sessionDisplayState == 0) {
+        g_rescan.reapplyBrightness = TRUE;
+        return;
+    }
     Diagnostics_Log("INFO", "schedule", "check enabled=%d points=%d idle=%d suspended=%d lastApplied=%d",
         g_settings.scheduleEnabled, g_settings.scheduleCount, g_idleDimmed,
         g_scheduleSuspended, g_scheduleLastApplied);
@@ -991,6 +1005,10 @@ static void Schedule_ApplyNow(void)
    master fallback. An acknowledged idle baseline remains native raw state. */
 static void ReapplyBrightness(void)
 {
+    if (g_sessionDisplayKnown && g_sessionDisplayState == 0) {
+        g_rescan.reapplyBrightness = TRUE;
+        return;
+    }
     Diagnostics_Log("INFO", "policy", "reapply idle=%d masterValid=%d masterTarget=%d scheduleSuspended=%d",
                     g_idleDimmed, g_masterTargetValid, g_masterTarget, g_scheduleSuspended);
     /* Woke up with nobody at the keyboard (display power-on, unlock by another
@@ -1107,11 +1125,13 @@ static DWORD IdleMilliseconds(void)
 static void Idle_Activity(void)
 {
     IdleActivity_Record(&g_idleActivity, GetTickCount64());
-    Idle_Restore();
+    if (!g_sessionDisplayKnown || g_sessionDisplayState != 0)
+        Idle_Restore();
 }
 
 static void UpdateIdleBlack(BOOL enabled, BOOL idle)
 {
+    enabled = enabled && (!g_sessionDisplayKnown || g_sessionDisplayState != 0);
     if (idle && g_idleActivity.inputValid)
         IdleBlack_UpdateForInput(&g_monitors, enabled, idle, g_idleActivity.inputTick);
     else
@@ -1119,7 +1139,7 @@ static void UpdateIdleBlack(BOOL enabled, BOOL idle)
 }
 
 /* Reasons to leave the brightness alone even though no input has arrived. */
-enum { DIMBLOCK_NONE = 0, DIMBLOCK_FULLSCREEN, DIMBLOCK_CAPTURE };
+enum { DIMBLOCK_NONE = 0, DIMBLOCK_FULLSCREEN, DIMBLOCK_CAPTURE, DIMBLOCK_DISPLAY_REQUEST };
 
 /* Fullscreen video, presentation mode and a live call all mean somebody is
    watching without touching anything. Also checked while already dimmed. */
@@ -1135,6 +1155,17 @@ static int Idle_DimBlocked(void)
     if (Capture_InUse())
         return DIMBLOCK_CAPTURE;
 
+    /* This public query is aggregate: it cannot identify request owners.
+       An OLED request from this process would otherwise inhibit our own idle
+       forever. Keep the existing fullscreen/capture policy in that mode. */
+    if (!IdleBlack_HoldsDisplayRequest()) {
+        ULONG executionState = 0;
+        if (CallNtPowerInformation(SystemExecutionState, NULL, 0,
+                                  &executionState, sizeof(executionState)) == 0 &&
+            (executionState & ES_DISPLAY_REQUIRED))
+            return DIMBLOCK_DISPLAY_REQUEST;
+    }
+
     return DIMBLOCK_NONE;
 }
 
@@ -1143,6 +1174,7 @@ static int Idle_DimBlocked(void)
    recover it from the monitors first, otherwise there is nothing to restore. */
 static void DimIdleMonitor(BrightMonitor *monitor)
 {
+    if (g_sessionDisplayKnown && g_sessionDisplayState == 0) return;
     if (monitor->idleBlack) {
         /* Changing to black mode cannot leave an earlier acknowledged LCD
            dim on the panel, including an acknowledgement which arrives late. */
@@ -1250,6 +1282,7 @@ static void Idle_Dim(void)
    no brightness has been requested. The inferred master is only a UI value. */
 static void RestoreIdleMonitor(BrightMonitor *monitor)
 {
+    if (g_sessionDisplayKnown && g_sessionDisplayState == 0) return;
     if (!Monitor_CanControl(monitor) ||
         (!monitor->idleApplied && !monitor->idleDimPending && !monitor->idleReleasePending))
         return;
@@ -1275,6 +1308,7 @@ static void RestoreIdleMonitor(BrightMonitor *monitor)
    Otherwise, wake must not flatten individual monitor targets to the master. */
 static void Idle_Restore(void)
 {
+    if (g_sessionDisplayKnown && g_sessionDisplayState == 0) return;
     if (!g_idleDimmed)
         return;
     g_idleDimmed = FALSE;   /* cleared first: ReapplyBrightness holds the idle level while set */
@@ -1307,6 +1341,7 @@ static void Idle_Restore(void)
    retry the latest policy without touching displays which already recovered. */
 static void RetryIdleRestores(void)
 {
+    if (g_sessionDisplayKnown && g_sessionDisplayState == 0) return;
     MonitorTarget pending[MAX_MONITORS];
     DWORD pendingMask = MonitorWorker_PendingTargets(pending);
     for (int i = 0; i < g_monitors.count; i++) {
@@ -1328,6 +1363,12 @@ static void Idle_Tick(void)
     Diagnostics_Log("INFO", "idle", "tick enabled=%d noInputMs=%lu thresholdMs=%lu dimmed=%d masterValid=%d master=%d",
         g_settings.idleDimEnabled, idleMs, (DWORD)g_settings.idleDimMinutes * 60000u,
         g_idleDimmed, g_masterTargetValid, g_masterTarget);
+    if (g_sessionDisplayKnown && g_sessionDisplayState == 0) {
+        /* Do not send idle brightness writes to a display Windows has turned
+           off. Retain any acknowledged baseline for recovery after power-on. */
+        UpdateIdleBlack(FALSE, FALSE);
+        return;
+    }
     if (!g_settings.idleDimEnabled) {
         g_idleLastBlock = DIMBLOCK_NONE;
         Idle_Restore();   /* setting turned off mid-dim */
@@ -1601,6 +1642,10 @@ static void HandleTimer(HWND hwnd, WPARAM wParam)
    Only the monitor which came back is written when the policy is unchanged. */
 static void ResumeSourceMonitor(BrightMonitor *monitor)
 {
+    if (g_sessionDisplayKnown && g_sessionDisplayState == 0) {
+        g_rescan.reapplyBrightness = TRUE;
+        return;
+    }
     Diagnostics_MonitorState(monitor, "source-resume requested");
     if (!Monitor_CanControl(monitor) || !Monitor_SourceAllowsControl(monitor)) {
         Diagnostics_Monitor(monitor, "INFO", "source-resume", "SKIP sourcePolicy=%s", Diagnostics_SourceReason(monitor));
@@ -1784,6 +1829,10 @@ static DWORD CapturePendingTargets(MonitorTarget pending[MAX_MONITORS])
 
 static void ApplyPendingTargets(const MonitorTarget pending[MAX_MONITORS], DWORD mask)
 {
+    if (g_sessionDisplayKnown && g_sessionDisplayState == 0) {
+        if (mask) g_rescan.reapplyBrightness = TRUE;
+        return;
+    }
     for (int i = 0; i < MAX_MONITORS; i++) {
         if (!(mask & (1u << i))) continue;
         int match = Monitor_FindUniqueDisplay(&g_monitors, &pending[i].monitor);
@@ -1922,6 +1971,55 @@ static void SetIdleDimEnabled(BOOL on)
         Idle_Restore();   /* undo an active dim immediately */
 }
 
+/* Power notifications carry DWORD payloads, which need not be aligned. Initial
+   presence is just a snapshot; only a later return to present is activity. */
+static void HandlePowerSettingChange(HWND hwnd, const POWERBROADCAST_SETTING *setting)
+{
+    if (!setting) return;
+    BOOL display = IsEqualGUID(&setting->PowerSetting, &kGuidSessionDisplayStatus);
+    BOOL presence = IsEqualGUID(&setting->PowerSetting, &kGuidSessionUserPresence);
+    if ((!display && !presence) || setting->DataLength < sizeof(DWORD)) return;
+    DWORD value;
+    CopyMemory(&value, setting->Data, sizeof(value));
+    if (value > 2) return;
+    if (display) {
+        BOOL returning = !g_sessionDisplayKnown || g_sessionDisplayState == 0;
+        g_sessionDisplayKnown = TRUE;
+        g_sessionDisplayState = value;
+        Diagnostics_Log("INFO", "power", "session display state=%lu", value);
+        if (value == 0) {
+            for (int i = 0; i < g_monitors.count; i++) {
+                BrightMonitor *monitor = &g_monitors.monitors[i];
+                /* Cancel queued PC idle work; a native call already in progress
+                   can still acknowledge its baseline later. An alternate-input
+                   handoff may undo our dim on another PC and remains allowed. */
+                if (monitor->idleDimPending ||
+                    (monitor->idleReleasePending &&
+                     (Monitor_SourceAllowsControl(monitor) || !monitor->sourceKnown))) {
+                    MonitorWorker_Cancel(monitor);
+                    monitor->idleDimPending = monitor->idleReleasePending = FALSE;
+                    g_rescan.reapplyBrightness = TRUE;
+                }
+            }
+            UpdateIdleBlack(FALSE, FALSE);
+        } else {
+            /* A normal on->dim notification does not require new DDC handles
+               and must not cause us to undo Windows's own dim transition. */
+            if (returning) {
+                g_rescan.reapplyBrightness = TRUE;
+                ScheduleRescanFromTrigger(hwnd);
+            }
+            if (value == 1) Idle_Tick();
+        }
+    } else {
+        BOOL returned = g_sessionPresenceKnown && g_sessionPresenceState != 0 && value == 0;
+        g_sessionPresenceKnown = TRUE;
+        g_sessionPresenceState = value;
+        Diagnostics_Log("INFO", "power", "session presence state=%lu returned=%d", value, returned);
+        if (returned) Idle_Activity();
+    }
+}
+
 /* ---- Main Window Proc ---- */
 
 static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
@@ -2013,18 +2111,8 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
         return 0;
 
     case WM_POWERBROADCAST:
-        /* Display powered back on (GUID_CONSOLE_DISPLAY_STATE) or system resume */
         if (wParam == PBT_POWERSETTINGCHANGE) {
-            POWERBROADCAST_SETTING *pbs = (POWERBROADCAST_SETTING *)lParam;
-            if (pbs &&
-                IsEqualGUID(&pbs->PowerSetting, &kGuidConsoleDisplayState) &&
-                pbs->DataLength >= 1) {
-                DbgLog("display power state = %u", (unsigned)pbs->Data[0]);
-                if (pbs->Data[0] != 0) {   /* 0 = off, non-zero = on/dimmed */
-                    g_rescan.reapplyBrightness = TRUE;
-                    ScheduleRescanFromTrigger(hwnd);
-                }
-            }
+            HandlePowerSettingChange(hwnd, (const POWERBROADCAST_SETTING *)lParam);
         } else if (wParam == PBT_APMRESUMEAUTOMATIC || wParam == PBT_APMRESUMESUSPEND) {
             DbgLog("power: APM resume");
             g_rescan.reapplyBrightness = TRUE;   /* wake from sleep: displays often reset brightness */

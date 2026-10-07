@@ -9,6 +9,7 @@ static int failures, creates, destroys, wakes, powerCalls, positions;
 static DWORD inputTick = 100;
 static BOOL inputOk = TRUE, createOk = TRUE, timerOk = TRUE;
 static BOOL inputDuringCreate;
+static int powerFailuresRemaining;
 static EXECUTION_STATE powerFlags;
 static EXECUTION_STATE mockPowerState = ES_CONTINUOUS;
 static DWORD windowStyle, windowExStyle;
@@ -73,6 +74,10 @@ static EXECUTION_STATE WINAPI MockPower(EXECUTION_STATE flags)
 {
     powerCalls++;
     powerFlags = flags;
+    if (powerFailuresRemaining) {
+        powerFailuresRemaining--;
+        return 0;
+    }
     EXECUTION_STATE previous = mockPowerState;
     mockPowerState = flags;
     return previous;
@@ -131,6 +136,7 @@ static MonitorList MakeView(void)
 
 static void Reset(void)
 {
+    powerFailuresRemaining = 0;
     IdleBlack_Shutdown();
     creates = destroys = wakes = powerCalls = positions = 0;
     inputOk = createOk = timerOk = TRUE;
@@ -225,6 +231,62 @@ static void TestPreserveExistingPowerRequest(void)
     CHECK(mockPowerState == (ES_CONTINUOUS | ES_SYSTEM_REQUIRED));
 }
 
+static void TestPowerAcquisitionFailureAndRetry(void)
+{
+    Reset();
+    MonitorList view = MakeView();
+    CHECK(!IdleBlack_HoldsDisplayRequest());
+    powerFailuresRemaining = 1;
+    IdleBlack_Update(&view, TRUE, FALSE);
+    CHECK(!IdleBlack_HoldsDisplayRequest() && powerCalls == 1);
+    CHECK(mockPowerState == ES_CONTINUOUS);
+    IdleBlack_Update(&view, TRUE, FALSE);
+    CHECK(IdleBlack_HoldsDisplayRequest() && powerCalls == 2);
+    CHECK(mockPowerState == (ES_CONTINUOUS | ES_DISPLAY_REQUIRED));
+    IdleBlack_Update(&view, FALSE, FALSE);
+    CHECK(!IdleBlack_HoldsDisplayRequest() && mockPowerState == ES_CONTINUOUS);
+}
+
+static void TestPowerReleaseFailureAndRetry(void)
+{
+    Reset();
+    MonitorList view = MakeView();
+    mockPowerState = ES_CONTINUOUS | ES_SYSTEM_REQUIRED;
+    IdleBlack_Update(&view, TRUE, FALSE);
+    CHECK(IdleBlack_HoldsDisplayRequest());
+    CHECK(mockPowerState == (ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED));
+    powerFailuresRemaining = 1;
+    IdleBlack_Update(&view, FALSE, FALSE);
+    CHECK(IdleBlack_HoldsDisplayRequest());
+    CHECK(mockPowerState == (ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED));
+    IdleBlack_Update(&view, FALSE, FALSE);
+    CHECK(!IdleBlack_HoldsDisplayRequest());
+    CHECK(mockPowerState == (ES_CONTINUOUS | ES_SYSTEM_REQUIRED));
+}
+
+static void TestPowerLockAndShutdownCleanup(void)
+{
+    Reset();
+    MonitorList view = MakeView();
+    mockPowerState = ES_CONTINUOUS | ES_SYSTEM_REQUIRED;
+    IdleBlack_Update(&view, TRUE, TRUE);
+    powerFailuresRemaining = 1;
+    IdleBlack_SetSessionLocked(TRUE);
+    CHECK(!IdleBlack_Active() && IdleBlack_HoldsDisplayRequest());
+    IdleBlack_Update(&view, TRUE, TRUE); /* The locked session retries release. */
+    CHECK(!IdleBlack_Active() && !IdleBlack_HoldsDisplayRequest());
+    CHECK(mockPowerState == (ES_CONTINUOUS | ES_SYSTEM_REQUIRED));
+    IdleBlack_SetSessionLocked(FALSE);
+    IdleBlack_Update(&view, TRUE, TRUE);
+    CHECK(IdleBlack_Active() && IdleBlack_HoldsDisplayRequest());
+    powerFailuresRemaining = 1;
+    IdleBlack_Shutdown();
+    CHECK(!IdleBlack_Active() && IdleBlack_HoldsDisplayRequest());
+    IdleBlack_Shutdown();
+    CHECK(!IdleBlack_HoldsDisplayRequest());
+    CHECK(mockPowerState == (ES_CONTINUOUS | ES_SYSTEM_REQUIRED));
+}
+
 static void TestDecisionInputBeforeCover(void)
 {
     Reset();
@@ -303,6 +365,9 @@ int main(void)
     TestCoverageAndWake();
     TestSourceScopeAndFailures();
     TestPreserveExistingPowerRequest();
+    TestPowerAcquisitionFailureAndRetry();
+    TestPowerReleaseFailureAndRetry();
+    TestPowerLockAndShutdownCleanup();
     TestDecisionInputBeforeCover();
     TestDecisionInputAfterValidation();
     TestDecisionInputFailure();

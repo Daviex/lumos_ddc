@@ -154,6 +154,10 @@ ownership, including failed restores and dim acknowledgements arriving late.
 Idle orchestration also covers retrograde input, query failure recovery,
 late presentation/capture exclusions, a full timeout after exclusions end,
 and explicit overlay wake without a changed input timestamp.
+Windows integration checks display-required requests before and during idle,
+query failures, system-only requests and avoiding the OLED request's own bit.
+Session events verify DWORD payload validation, display-off recovery and
+genuine presence transitions without resetting the timeout on snapshots.
 
 `test_idle_activity.c` tests the pure monotonic activity tracker with simulated
 input and clocks: first-sample validation, normal DWORD wrap, unchanged input
@@ -170,6 +174,8 @@ opaque cover over the full monitor (including negative desktop coordinates),
 prompt wake, failed input/timer setup, session lock and cleanup. An offscreen
 GDI DIB verifies that every painted pixel is RGB 0,0,0. No screen is covered
 and no real execution-state request is made.
+Power ownership is also checked on failed acquisition/release, retries, lock
+and shutdown while preserving a previous system-required request.
 
 ```powershell
 clang -std=c11 -Wall -Wextra -Werror -DSTRSAFE_NO_DEPRECATE -DUNICODE -D_UNICODE tests/test_idle_black.c tests/diagnostics_stub.c brightness.c brightmap.c -lgdi32 -luser32 -o build/test_idle_black.exe

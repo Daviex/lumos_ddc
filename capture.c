@@ -1,11 +1,12 @@
 #include "capture.h"
 
-/* Windows records capability usage under the ConsentStore. Every application
-   that has used the microphone or the camera gets a subkey there holding
-   LastUsedTimeStart and LastUsedTimeStop, and LastUsedTimeStop stays zero for
-   as long as the device is open. Reading it needs no elevation and does not
-   depend on which application makes the call, so it covers Teams, Zoom, Meet
-   and anything else equally. */
+/* Windows can report capability usage under ConsentStore. Recognized app
+   records expose LastUsedTimeStart/Stop; a zero stop time is interpreted as
+   an open microphone or camera. Reading it needs no elevation and does not
+   capture audio or video. This is a per-user usage heuristic, rather than a
+   documented universal call API: some desktop applications do not appear in
+   Windows's privacy usage reporting. Do not infer freshness from the start
+   time, since a legitimate device session can remain open for many hours. */
 #define CONSENT_STORE \
     L"Software\\Microsoft\\Windows\\CurrentVersion\\CapabilityAccessManager\\ConsentStore\\"
 

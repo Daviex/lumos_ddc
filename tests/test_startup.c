@@ -7,6 +7,7 @@
 #include <commctrl.h>
 #include <wtsapi32.h>
 #include <shlobj.h>
+#include <powrprof.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -33,6 +34,10 @@ static ULONGLONG nowTick;
 static DWORD lastInputTick;
 static BOOL inputOk, captureActive;
 static QUERY_USER_NOTIFICATION_STATE notificationState;
+static ULONG powerExecutionState;
+static NTSTATUS powerQueryStatus;
+static int powerQueryCalls;
+static BOOL blackPowerHeld;
 static int setAllCalls, setOneCalls, actualWrites, lastBase, lastUiTarget;
 static int refreshCalls, popupCalls, destroyCalls, workerResets, cleanupCalls;
 static int timerCalls, killCalls;
@@ -66,6 +71,7 @@ static UINT_PTR WINAPI MockSetTimer(HWND, UINT_PTR, UINT, TIMERPROC);
 static BOOL WINAPI MockKillTimer(HWND, UINT_PTR);
 static BOOL WINAPI MockDestroyWindow(HWND);
 static HRESULT WINAPI MockNotificationState(QUERY_USER_NOTIFICATION_STATE *state);
+static NTSTATUS WINAPI MockPowerInformation(POWER_INFORMATION_LEVEL, PVOID, ULONG, PVOID, ULONG);
 static BOOL WINAPI MockGetCursorPos(LPPOINT point);
 static HMONITOR WINAPI MockMonitorFromPoint(POINT point, DWORD flags);
 static void ConfigureTwoReadyMonitors(void);
@@ -78,6 +84,7 @@ static void ConfigureTwoReadyMonitors(void);
 #define KillTimer MockKillTimer
 #define DestroyWindow MockDestroyWindow
 #define SHQueryUserNotificationState MockNotificationState
+#define CallNtPowerInformation MockPowerInformation
 #define GetCursorPos MockGetCursorPos
 #define MonitorFromPoint MockMonitorFromPoint
 #define WinMain static UnusedApplicationEntryPoint
@@ -90,6 +97,7 @@ static void ConfigureTwoReadyMonitors(void);
 #undef KillTimer
 #undef DestroyWindow
 #undef SHQueryUserNotificationState
+#undef CallNtPowerInformation
 #undef GetCursorPos
 #undef MonitorFromPoint
 #undef WinMain
@@ -120,6 +128,15 @@ static HRESULT WINAPI MockNotificationState(QUERY_USER_NOTIFICATION_STATE *state
 }
 
 BOOL Capture_InUse(void) { return captureActive; }
+static NTSTATUS WINAPI MockPowerInformation(POWER_INFORMATION_LEVEL level, PVOID input,
+                                            ULONG inputLength, PVOID output, ULONG outputLength)
+{
+    CHECK(level == SystemExecutionState && !input && inputLength == 0);
+    CHECK(output && outputLength == sizeof(ULONG));
+    powerQueryCalls++;
+    *(ULONG *)output = powerExecutionState;
+    return powerQueryStatus;
+}
 
 static BOOL WINAPI MockGetCursorPos(LPPOINT point)
 {
@@ -352,6 +369,7 @@ void IdleBlack_UpdateForInput(const MonitorList *view, BOOL enabled, BOOL idle, 
 void IdleBlack_Clear(void) { blackClears++; blackIdle = FALSE; }
 void IdleBlack_SetSessionLocked(BOOL locked) { (void)locked; }
 void IdleBlack_Shutdown(void) { CHECK(FALSE); }
+BOOL IdleBlack_HoldsDisplayRequest(void) { return blackPowerHeld; }
 BOOL MonitorWorker_Running(void) { return mockWorkerRunning; }
 void MonitorWorker_Cancel(BrightMonitor *monitor)
 {
@@ -442,6 +460,12 @@ static void ResetState(void)
     inputOk = TRUE;
     captureActive = FALSE;
     notificationState = QUNS_ACCEPTS_NOTIFICATIONS;
+    powerExecutionState = 0;
+    powerQueryStatus = 0;
+    powerQueryCalls = 0;
+    blackPowerHeld = FALSE;
+    g_sessionDisplayKnown = g_sessionPresenceKnown = FALSE;
+    g_sessionDisplayState = g_sessionPresenceState = 0;
     g_settings.sourcePollSeconds = DEFAULT_SOURCE_POLL_SECONDS;
     nowMinute = 570; /* 09:30 */
     nowDay = 1;
@@ -2209,6 +2233,172 @@ static void TestExplicitWakeAndReadOnlyCommands(void)
     CHECK(g_idleDimmed);
 }
 
+static void TestWindowsDisplayRequestsAndOwnOledRequest(void)
+{
+    ConfigureIdleTest();
+    powerExecutionState = ES_DISPLAY_REQUIRED;
+    Idle_Tick();
+    CHECK(!g_idleDimmed && actualWrites == 0 && g_idleLastBlock == DIMBLOCK_DISPLAY_REQUEST);
+    powerExecutionState = 0;
+    Idle_Tick();
+    CHECK(!g_idleDimmed && IdleMilliseconds() == 0);
+    nowTick += 60000;
+    Idle_Tick();
+    CHECK(g_idleDimmed);
+    powerExecutionState = ES_DISPLAY_REQUIRED;
+    Idle_Tick();
+    CHECK(!g_idleDimmed && g_monitors.monitors[0].brightnessCur == 50);
+
+    ConfigureIdleTest();
+    powerExecutionState = ES_SYSTEM_REQUIRED | ES_USER_PRESENT;
+    Idle_Tick();
+    CHECK(g_idleDimmed); /* System sleep requests alone do not require a screen. */
+    ConfigureIdleTest();
+    powerExecutionState = ES_DISPLAY_REQUIRED;
+    powerQueryStatus = (NTSTATUS)0xc0000001UL;
+    Idle_Tick();
+    CHECK(g_idleDimmed); /* Failed query falls back to the existing policy. */
+
+    ConfigureIdleTest();
+    g_monitors.monitors[0].idleBlack = TRUE;
+    blackPowerHeld = TRUE;
+    powerExecutionState = ES_DISPLAY_REQUIRED;
+    Idle_Tick();
+    CHECK(g_idleDimmed && blackIdle && actualWrites == 0 && powerQueryCalls == 0);
+    captureActive = TRUE; /* Known call exclusions still apply in OLED mode. */
+    Idle_Tick();
+    CHECK(!g_idleDimmed && !blackIdle && powerQueryCalls == 0);
+}
+
+static void DeliverPowerSetting(const GUID *guid, DWORD value, DWORD length)
+{
+    POWERBROADCAST_SETTING *setting = calloc(1, sizeof(*setting) + sizeof(DWORD));
+    CHECK(setting != NULL);
+    if (!setting) return;
+    setting->PowerSetting = *guid;
+    setting->DataLength = length;
+    CopyMemory(setting->Data, &value, sizeof(value));
+    HandlePowerSettingChange(testWindow, setting);
+    free(setting);
+}
+
+static void TestSessionPowerPayloadAndPresenceTransitions(void)
+{
+    ConfigureIdleTest();
+    Idle_Tick();
+    CHECK(g_idleDimmed);
+    DeliverPowerSetting(&kGuidSessionUserPresence, 0, 1);
+    CHECK(!g_sessionPresenceKnown && g_idleDimmed);
+    DeliverPowerSetting(&kGuidSessionDisplayStatus, 0x100, sizeof(DWORD));
+    CHECK(!g_sessionDisplayKnown && g_idleDimmed); /* Not a one-byte off state. */
+    GUID unrelated = {0};
+    DeliverPowerSetting(&unrelated, 0, sizeof(DWORD));
+    HandlePowerSettingChange(testWindow, NULL);
+    CHECK(!g_sessionDisplayKnown && !g_sessionPresenceKnown);
+
+    DeliverPowerSetting(&kGuidSessionUserPresence, 0, sizeof(DWORD));
+    CHECK(g_sessionPresenceKnown && g_idleDimmed); /* Initial present is a snapshot. */
+    DeliverPowerSetting(&kGuidSessionUserPresence, 2, sizeof(DWORD));
+    CHECK(g_idleDimmed);
+    nowTick++;
+    DeliverPowerSetting(&kGuidSessionUserPresence, 0, sizeof(DWORD));
+    CHECK(!g_idleDimmed && IdleMilliseconds() == 0);
+    nowTick += 59000;
+    DeliverPowerSetting(&kGuidSessionUserPresence, 0, sizeof(DWORD));
+    CHECK(IdleMilliseconds() == 59000); /* Duplicate present does not rearm. */
+    nowTick += 1000;
+    Idle_Tick();
+    CHECK(g_idleDimmed);
+}
+
+static void TestIdleWaitsForSessionDisplayPowerOn(void)
+{
+    ConfigureIdleTest();
+    DeliverPowerSetting(&kGuidSessionDisplayStatus, 0, sizeof(DWORD));
+    Idle_Tick();
+    CHECK(!g_idleDimmed && actualWrites == 0 && !blackEnabled);
+    DeliverPowerSetting(&kGuidSessionDisplayStatus, 1, sizeof(DWORD));
+    CHECK(g_idleDimmed && g_rescan.reapplyBrightness && lastTimer == RESCAN_TIMER_ID);
+    int writes = actualWrites, timers = timerCalls;
+    DeliverPowerSetting(&kGuidSessionDisplayStatus, 2, sizeof(DWORD));
+    CHECK(actualWrites == writes && timerCalls == timers); /* Do not undo OS on->dim. */
+    DeliverPowerSetting(&kGuidSessionDisplayStatus, 0, sizeof(DWORD));
+    CHECK(g_idleDimmed && actualWrites == writes && !blackEnabled);
+    DeliverPowerSetting(&kGuidSessionUserPresence, 2, sizeof(DWORD));
+    DeliverPowerSetting(&kGuidSessionUserPresence, 0, sizeof(DWORD));
+    CHECK(g_idleDimmed && actualWrites == writes); /* Activity waits for the display. */
+    Idle_Tick();
+    CHECK(actualWrites == writes);
+    DeliverPowerSetting(&kGuidSessionDisplayStatus, 1, sizeof(DWORD));
+    CHECK(!g_idleDimmed && g_monitors.monitors[0].brightnessCur == 50);
+}
+
+static void TestOffDefersDisableModeChangeAndAutomaticPolicy(void)
+{
+    ConfigureIdleTest();
+    Idle_Tick();
+    DeliverPowerSetting(&kGuidSessionDisplayStatus, 0, sizeof(DWORD));
+    int writes = actualWrites;
+    SetIdleDimEnabled(FALSE);
+    CHECK(g_idleDimmed && g_monitors.monitors[0].idleApplied && actualWrites == writes);
+    ReapplyBrightness();
+    ResumeSourceMonitor(&g_monitors.monitors[0]);
+    CHECK(actualWrites == writes && g_rescan.reapplyBrightness);
+    DeliverPowerSetting(&kGuidSessionDisplayStatus, 1, sizeof(DWORD));
+    CHECK(!g_idleDimmed && !g_monitors.monitors[0].idleApplied && g_monitors.monitors[0].brightnessCur == 50);
+
+    ConfigureIdleTest();
+    Idle_Tick();
+    DeliverPowerSetting(&kGuidSessionDisplayStatus, 0, sizeof(DWORD));
+    CHECK(Settings_MonitorKey(&g_monitors.monitors[0], g_settings.monitorSelection.idleBlackKeys[0]));
+    g_settings.monitorSelection.idleBlackCount = 1;
+    writes = actualWrites;
+    UpdateMonitorSelection();
+    CHECK(g_monitors.monitors[0].idleBlack && g_monitors.monitors[0].idleApplied && actualWrites == writes);
+    nowTick++;
+    lastInputTick = (DWORD)nowTick;
+    DeliverPowerSetting(&kGuidSessionDisplayStatus, 1, sizeof(DWORD));
+    CHECK(!g_monitors.monitors[0].idleApplied && g_monitors.monitors[0].brightnessCur == 50);
+
+    ConfigureIdleTest();
+    ConfigureSchedule();
+    DeliverPowerSetting(&kGuidSessionDisplayStatus, 0, sizeof(DWORD));
+    Schedule_ApplyNow();
+    CHECK(actualWrites == 0 && g_scheduleLastApplied == -1 && g_rescan.reapplyBrightness);
+    nowMinute = 660;
+    lastInputTick = (DWORD)nowTick;
+    DeliverPowerSetting(&kGuidSessionDisplayStatus, 1, sizeof(DWORD));
+    ReapplyBrightness();
+    CHECK(g_scheduleLastApplied == Schedule_BrightnessAt(g_settings.schedule, g_settings.scheduleCount, nowMinute));
+    CHECK(actualWrites > 0);
+}
+
+static void TestOffCancelsQueuedPcIdleAndPreservesOtherInputHandoff(void)
+{
+    ConfigureIdleTest();
+    mockWorkerRunning = TRUE;
+    Idle_Tick();
+    DWORD epoch = g_monitors.monitors[0].idleEpoch;
+    CHECK(g_monitors.monitors[0].idleDimPending);
+    DeliverPowerSetting(&kGuidSessionDisplayStatus, 0, sizeof(DWORD));
+    CHECK(cancelCalls == 1 && !g_monitors.monitors[0].idleDimPending);
+    acceptResult = FALSE;
+    DeliverIdleWriteResult(0, epoch, 50); /* Native I/O can finish just before cancellation. */
+    CHECK(g_monitors.monitors[0].idleApplied && g_monitors.monitors[0].preIdleBrightness == 50);
+    mockWorkerRunning = FALSE;
+    nowTick++;
+    lastInputTick = (DWORD)nowTick;
+    DeliverPowerSetting(&kGuidSessionDisplayStatus, 1, sizeof(DWORD));
+    CHECK(g_monitors.monitors[0].brightnessCur == 50 && !g_monitors.monitors[0].idleApplied);
+
+    ConfigureIdleTest();
+    ConfigureTwoFilteredMonitors();
+    Idle_Dim();
+    DeliverPowerSetting(&kGuidSessionDisplayStatus, 0, sizeof(DWORD));
+    DeliverSourceResultAt(1, MONITOR_RESULT_SOURCE, TRUE, 0x12);
+    CHECK(g_monitors.monitors[1].brightnessCur == 128 && releaseWrites == 1);
+}
+
 int main(void)
 {
     (void)UnusedApplicationEntryPoint; /* Compile the entry point; never run it. */
@@ -2251,6 +2441,11 @@ int main(void)
     TestIrregularInputRestartsIdleAndFailureRecovery();
     TestLateExclusionsRestoreAndRearmOnce();
     TestExplicitWakeAndReadOnlyCommands();
+    TestWindowsDisplayRequestsAndOwnOledRequest();
+    TestSessionPowerPayloadAndPresenceTransitions();
+    TestIdleWaitsForSessionDisplayPowerOn();
+    TestOffDefersDisableModeChangeAndAutomaticPolicy();
+    TestOffCancelsQueuedPcIdleAndPreservesOtherInputHandoff();
     TestCliRangeAndRescanPreserveLatestMaster();
     TestMixedOledWakeRetriesOnlyUnrestoredMonitor();
     TestIdleWakePreservesIndividualTargetsAndSchedulePrecedence();

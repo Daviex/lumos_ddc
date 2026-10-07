@@ -28,6 +28,22 @@ BOOL IdleBlack_Active(void)
     return FALSE;
 }
 
+BOOL IdleBlack_HoldsDisplayRequest(void)
+{
+    return g_blackPreviousState != 0;
+}
+
+static void ReleaseDisplayRequest(void)
+{
+    if (!g_blackPreviousState) return;
+    EXECUTION_STATE result = SetThreadExecutionState(g_blackPreviousState | ES_CONTINUOUS);
+    Diagnostics_Log(result ? "INFO" : "ERROR", "power", "release-display-request state=0x%08lX error=0x%08lX",
+                    g_blackPreviousState, result ? ERROR_SUCCESS : GetLastError());
+    /* A failed call leaves our display request active. Retain the original
+       state so the next disable, lock or shutdown can retry its release. */
+    if (result) g_blackPreviousState = 0;
+}
+
 void IdleBlack_Clear(void)
 {
     for (int i = 0; i < MAX_MONITORS; i++) {
@@ -155,10 +171,7 @@ static void UpdateBlack(const MonitorList *view, BOOL enabled, BOOL idle,
         if (g_blackPreviousState & ~ES_CONTINUOUS)
             SetThreadExecutionState(g_blackPreviousState | ES_CONTINUOUS | ES_DISPLAY_REQUIRED);
     } else if (!keepDisplay && g_blackPreviousState) {
-        EXECUTION_STATE result = SetThreadExecutionState(g_blackPreviousState | ES_CONTINUOUS);
-        Diagnostics_Log(result ? "INFO" : "ERROR", "power", "release-display-request state=0x%08lX error=0x%08lX",
-                        g_blackPreviousState, result ? ERROR_SUCCESS : GetLastError());
-        g_blackPreviousState = 0;
+        ReleaseDisplayRequest();
     }
 
     for (int i = 0; i < MAX_MONITORS; i++) {
@@ -264,8 +277,7 @@ void IdleBlack_Shutdown(void)
 {
     Diagnostics_Log("INFO", "overlay", "shutdown");
     IdleBlack_Clear();
-    if (g_blackPreviousState) SetThreadExecutionState(g_blackPreviousState | ES_CONTINUOUS);
-    g_blackPreviousState = 0;
+    ReleaseDisplayRequest();
     if (g_blackRegistered) UnregisterClassW(BLACK_CLASS, g_blackInstance);
     g_blackRegistered = FALSE;
     g_blackSessionLocked = FALSE;

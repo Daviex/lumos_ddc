@@ -34,7 +34,7 @@ cl /nologo /O2 /MT /W4 /WX- %DEFS% ^
    /link /subsystem:windows ^
    dxva2.lib user32.lib gdi32.lib shell32.lib ^
    comctl32.lib advapi32.lib ole32.lib oleaut32.lib wbemuuid.lib ^
-   dwmapi.lib wtsapi32.lib oleacc.lib kernel32.lib
+   dwmapi.lib wtsapi32.lib oleacc.lib kernel32.lib powrprof.lib
 
 if errorlevel 1 (
     echo Build failed.

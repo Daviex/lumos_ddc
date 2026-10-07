@@ -17,5 +17,8 @@ void IdleBlack_Clear(void);
 void IdleBlack_SetSessionLocked(BOOL locked);
 void IdleBlack_Shutdown(void);
 BOOL IdleBlack_Active(void);
+/* TRUE only after a display request was acquired and until it is released.
+   A failed release retains ownership and is retried by later updates. */
+BOOL IdleBlack_HoldsDisplayRequest(void);
 
 #endif

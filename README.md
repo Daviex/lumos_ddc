@@ -75,7 +75,7 @@ Windows can dim a laptop panel, but it will not touch the brightness of external
 - **On-screen display** - A hotkey or wheel change shows an overlay with the All Monitors level and a progress bar.
 - **Keyboard and screen reader access** - The tray icon, the popup, the menu, Settings and About work entirely from the keyboard, and NVDA and Narrator can read their controls. With NVDA, a hotkey or wheel change is spoken even while another application has the focus. The schedule editor is not covered yet.
 - **Brightness schedule** - An optional time-of-day schedule that ramps the brightness smoothly between the points you set, wrapping around midnight. A manual change pauses it until the next point.
-- **Idle auto-dim** - Optional. After a period without keyboard or mouse input (default 5 minutes) the brightness drops to a low level (default 5%), and it comes back as soon as you touch the keyboard or the mouse. Lumos does not dim during fullscreen video, presentation mode, or while the microphone or the camera is in use, so a video call is not dimmed whatever application it runs in.
+- **Idle auto-dim** - Optional. After a period without keyboard or mouse input (default 5 minutes) the brightness drops to a low level (default 5%), and it comes back when activity resumes. Lumos avoids dimming when Windows reports fullscreen/presentation activity, microphone/camera use or a request to keep the display awake. Call detection depends on the usage state exposed by Windows, so some desktop applications may not be detected. OLED black idle retains its separate power policy described below.
 - **Presets** - Night, Day and Presentation, with editable brightness values.
 - **Command line** - `lumosctl.exe` sets, raises, lowers and reads the brightness of all monitors or one of them, applies presets, and switches the schedule and idle dim, through the running Lumos.
 - **Settings window** - A dark window for the brightness step, the hotkeys, idle dim, the schedule and autostart switches, the minimum of each monitor, and the preset values.
@@ -143,7 +143,7 @@ x86_64-w64-mingw32-gcc -O2 -s -Wall -mwindows -DUNICODE -D_UNICODE -D_WIN32_WINN
   lumos.c monitor.c monitor_worker.c brightness.c monitor_selection.c idle_black.c idle_activity.c diagnostics.c brightmap.c ui.c ui_draw.c ui_popup.c ui_graphics.c ui_monitor_selection.c ui_osd.c ui_menu.c ui_sched.c \
   ui_settings.c ui_about.c presets.c schedule.c hotkey.c a11y.c remote.c wmibright.c capture.c \
   build/lumos.res -o build/lumos.exe \
-  -ldxva2 -luser32 -lgdi32 -lshell32 -lcomctl32 -ladvapi32 -lole32 -loleaut32 -lwbemuuid -ldwmapi -lwtsapi32 -loleacc -lkernel32 -lm
+  -ldxva2 -luser32 -lgdi32 -lshell32 -lcomctl32 -ladvapi32 -lole32 -loleaut32 -lwbemuuid -ldwmapi -lwtsapi32 -loleacc -lkernel32 -lpowrprof -lm
 x86_64-w64-mingw32-gcc -O2 -s -Wall -municode -DUNICODE -D_UNICODE -D_WIN32_WINNT=0x0A00 \
   lumosctl.c cliparse.c -o build/lumosctl.exe -luser32
 ```
@@ -349,6 +349,18 @@ When an exclusion begins the display is restored; when it ends a full idle timeo
 starts again. General checks run every two seconds, and black-cover input wake
 is checked every 100 ms without adopting input which arrived during cover creation.
 
+Normal dimming also respects Windows display-required power requests, including
+applications which keep the screen awake while playing video in a window.
+Requests which only prevent system sleep do not block dimming. Windows session
+display notifications pause idle brightness writes while the display is off;
+returning user-presence notifications restart the configured timeout. The initial
+presence snapshot and repeated present notifications do not count as new activity.
+Idle restores and automatic schedule/recovery writes to the PC input wait for
+display power-on. Queued idle work is canceled; a native call already in progress
+can still complete, and its saved baseline is retained for recovery. The source
+handoff exception still restores a freshly verified other input, since another
+PC's image can be visible while this Windows session's display is off.
+
 For OLED displays, select the monitor in **Choose Monitors** and enable
 **OLED: true black when idle**, then Apply and Save. The existing idle timeout
 and fullscreen/call exclusions still apply. This optional mode covers the whole
@@ -366,6 +378,14 @@ prevent system sleep or session locking. Locking the session releases the reques
 and hides the windows; unlock restores the configured policy. Disabling idle
 protection, removing the last selected black-idle display, or exiting Lumos
 releases the request too.
+
+Windows exposes an aggregate display-required state without request owners.
+While Lumos holds its own OLED request, using that aggregate would permanently
+block its idle mode. In this mode Lumos therefore keeps its fullscreen,
+presentation and microphone/camera exclusions, and does not use the aggregate
+to infer other applications' requests. It never briefly drops its own request
+to probe others. An explicit session display-off notification hides the cover
+and releases the request until the display returns.
 
 The cover follows the input-source filter. Another or unreadable input hides
 it; returning to this PC while still idle shows it again. Panel brightness
