@@ -8,7 +8,7 @@
 [![Downloads](https://img.shields.io/github/downloads/sfortis/lumos_ddc/total?logo=github)](https://github.com/sfortis/lumos_ddc/releases)
 ![Windows](https://img.shields.io/badge/Windows-10%2F11-0078D6?logo=windows&logoColor=white)
 ![Language](https://img.shields.io/badge/C-native%20Windows%20API-A8B9CC?logo=c&logoColor=white)
-![Size](https://img.shields.io/badge/size-~170%20KB-success)
+![Size](https://img.shields.io/badge/size-~140%20KB-success)
 
 </div>
 
@@ -34,7 +34,7 @@
 
 Lumos is a small Windows system-tray utility that adjusts the hardware brightness of your monitors. It talks **DDC/CI** to external displays and uses the **WMI backlight** interface for internal laptop panels, so a single slider or hotkey dims everything at once: desktop monitors, a laptop screen, or a mixed setup.
 
-It is written against the native Windows API and GDI, with no runtime and no installer. The app is one 64-bit `.exe` of about 170 KB, and an optional companion, `lumosctl.exe`, controls it from the command line.
+It is written against the native Windows API and GDI, with no runtime and no installer. The app is one 64-bit `.exe` of about 140 KB, and an optional companion, `lumosctl.exe`, controls it from the command line.
 
 ## Why Lumos?
 
@@ -51,7 +51,7 @@ Windows can dim a laptop panel, but it will not touch the brightness of external
 | Time-of-day brightness schedule | No | Yes |
 | Dim when idle | No | Yes |
 | Command line control | No | Yes |
-| Footprint | n/a | One ~170 KB exe, no dependencies |
+| Footprint | n/a | One ~140 KB exe, no dependencies |
 
 ## Screenshots
 
