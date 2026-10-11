@@ -49,6 +49,7 @@ typedef struct {
     int    presetCount;
     int    step;       /* brightness step for hotkeys and mouse wheel (default 5) */
     BOOL   autostart;
+    BOOL   diagnosticsEnabled; /* write diagnostic logs; applies immediately on Save */
     /* Per-monitor ranges from [Ranges], keyed by monitor name (a second
        monitor with the same name gets " #2", and so on). rangeConnected marks
        the entries whose monitor is in the current list (Settings_ApplyRanges).

@@ -7,6 +7,7 @@
 #include "../diagnostics.h"
 
 static int failures, opens, closes, moves, debugLines;
+static HANDLE formattingReached, resumeFormatting;
 static BOOL denyExe, denyAll, failMove, failWrite;
 static ULONGLONG fileBytes;
 static WCHAR openedPath[MAX_PATH];
@@ -89,6 +90,15 @@ static BOOL WINAPI MockMove(const WCHAR *from, const WCHAR *to, DWORD flags)
 static void WINAPI MockDebug(const char *text)
 { CHECK(text != NULL); debugLines++; }
 
+static void WINAPI MockTime(LPSYSTEMTIME time)
+{
+    GetLocalTime(time);
+    if (formattingReached) {
+        SetEvent(formattingReached);
+        CHECK(WaitForSingleObject(resumeFormatting, 10000) == WAIT_OBJECT_0);
+    }
+}
+
 #define GetModuleFileNameW MockModule
 #define SHGetFolderPathW MockAppData
 #define CreateDirectoryW MockDirectory
@@ -98,6 +108,7 @@ static void WINAPI MockDebug(const char *text)
 #define WriteFile MockWrite
 #define MoveFileExW MockMove
 #define OutputDebugStringA MockDebug
+#define GetLocalTime MockTime
 #include "../diagnostics.c"
 #undef CloseHandle
 
@@ -105,11 +116,13 @@ static void Reset(void)
 {
     g_diagnosticsFile = INVALID_HANDLE_VALUE;
     g_diagnosticsOpened = g_diagnosticsClosed = FALSE;
+    InterlockedExchange(&g_diagnosticsEnabled, FALSE);
     g_diagnosticsBytes = fileBytes = 0;
     g_diagnosticsPath[0] = g_diagnosticsPrevious[0] = L'\0';
     currentLog[0] = previousLog[0] = '\0';
     denyExe = denyAll = failMove = failWrite = FALSE;
     opens = closes = moves = debugLines = 0;
+    formattingReached = resumeFormatting = NULL;
 }
 
 static DWORD WINAPI Writer(void *parameter)
@@ -123,11 +136,98 @@ static DWORD WINAPI Writer(void *parameter)
     return 0;
 }
 
-int main(void)
+static void TestDisabledStartupAndRuntimeSwitch(void)
 {
     Reset();
+    denyAll = TRUE;
+    BrightMonitor monitor = {0};
+    SetLastError(73);
+    Diagnostics_Log("INFO", "pre-init", "settings are not loaded yet");
+    Diagnostics_Init(FALSE);
+    Diagnostics_Log("ERROR", "disabled", "must not open a file or use debug output");
+    Diagnostics_Monitor(&monitor, "INFO", "disabled", "monitor entry");
+    Diagnostics_MonitorState(&monitor, "state entry");
+    CHECK(GetLastError() == 73);
+    CHECK(opens == 0 && closes == 0 && moves == 0 && debugLines == 0 && !currentLog[0]);
+    denyAll = FALSE;
+    Diagnostics_SetEnabled(TRUE);
+    CHECK(GetLastError() == 73 && opens == 1 && strstr(currentLog, "START build=") != NULL);
+    Diagnostics_Log("INFO", "enabled", "first enabled segment");
+    size_t length = strlen(currentLog);
+    ULONGLONG bytes = fileBytes;
+    Diagnostics_SetEnabled(TRUE); /* Reapplying an unchanged preference is idempotent. */
+    CHECK(opens == 1 && strlen(currentLog) == length);
+    Diagnostics_SetEnabled(FALSE);
+    CHECK(GetLastError() == 73 && closes == 1 && g_diagnosticsFile == INVALID_HANDLE_VALUE);
+    Diagnostics_Log("INFO", "disabled", "must not append while disabled");
+    Diagnostics_Close();
+    CHECK(opens == 1 && closes == 1 && fileBytes == bytes && strlen(currentLog) == length);
+    CHECK(strstr(currentLog, "must not append") == NULL && moves == 0 && debugLines == 0);
+    Diagnostics_SetEnabled(TRUE); /* Final shutdown cannot be reversed by late callers. */
+    CHECK(opens == 1 && fileBytes == bytes);
+
+    Reset();
+    Diagnostics_Init(TRUE);
+    Diagnostics_Log("INFO", "enabled", "history survives the toggle");
+    Diagnostics_SetEnabled(FALSE);
+    int oldOpens = opens, oldCloses = closes;
+    Diagnostics_SetEnabled(FALSE);
+    CHECK(opens == oldOpens && closes == oldCloses);
+    Diagnostics_SetEnabled(TRUE);
+    Diagnostics_Log("INFO", "reenabled", "second enabled segment");
+    CHECK(opens == oldOpens + 1 && closes == oldCloses);
+    CHECK(strstr(currentLog, "history survives") != NULL && strstr(currentLog, "second enabled segment") != NULL);
+    CHECK(moves == 0);
+    fileBytes = g_diagnosticsBytes = DIAGNOSTICS_MAX_BYTES;
+    Diagnostics_SetEnabled(FALSE);
+    Diagnostics_SetEnabled(TRUE); /* Reload the existing size before appending/rotating. */
+    CHECK(moves == 1 && fileBytes < DIAGNOSTICS_MAX_BYTES && strstr(previousLog, "history survives") != NULL);
+    Diagnostics_Close();
+}
+
+static DWORD WINAPI QueuedWriter(void *parameter)
+{
+    (void)parameter;
     SetLastError(0xC0262582);
-    Diagnostics_Init();
+    Diagnostics_Log("INFO", "race", "queued writer must not append after disable");
+    CHECK(GetLastError() == 0xC0262582);
+    return 0;
+}
+
+static void TestDisableDropsAlreadyFormattingWriter(void)
+{
+    Reset();
+    Diagnostics_Init(TRUE);
+    formattingReached = CreateEventW(NULL, TRUE, FALSE, NULL);
+    resumeFormatting = CreateEventW(NULL, TRUE, FALSE, NULL);
+    CHECK(formattingReached && resumeFormatting);
+    HANDLE thread = CreateThread(NULL, 0, QueuedWriter, NULL, 0, NULL);
+    CHECK(thread != NULL);
+    CHECK(WaitForSingleObject(formattingReached, 10000) == WAIT_OBJECT_0);
+    ULONGLONG bytes = fileBytes;
+    size_t length = strlen(currentLog);
+    Diagnostics_SetEnabled(FALSE);
+    SetEvent(resumeFormatting);
+    CHECK(WaitForSingleObject(thread, 10000) == WAIT_OBJECT_0);
+    CHECK(closes == 1 && opens == 1 && fileBytes == bytes && strlen(currentLog) == length);
+    CHECK(strstr(currentLog, "queued writer") == NULL && debugLines == 0);
+    CloseHandle(thread);
+    CloseHandle(formattingReached);
+    CloseHandle(resumeFormatting);
+    formattingReached = resumeFormatting = NULL;
+    Diagnostics_SetEnabled(TRUE);
+    Diagnostics_Log("INFO", "race", "fresh logging resumes");
+    CHECK(strstr(currentLog, "fresh logging resumes") != NULL && opens == 2);
+    Diagnostics_Close();
+}
+
+int main(void)
+{
+    TestDisabledStartupAndRuntimeSwitch();
+    TestDisableDropsAlreadyFormattingWriter();
+    Reset();
+    SetLastError(0xC0262582);
+    Diagnostics_Init(TRUE);
     CHECK(GetLastError() == 0xC0262582);
     CHECK(wcscmp(openedPath, L"C:\\Installed\\Lumos\\lumos-diagnostics.log") == 0);
     CHECK(strstr(currentLog, "START build=") != NULL);
@@ -169,13 +269,13 @@ int main(void)
     CHECK(opens == oldOpens && strstr(currentLog, "must not reopen") == NULL);
 
     Reset(); denyExe = TRUE;
-    Diagnostics_Init();
+    Diagnostics_Init(TRUE);
     CHECK(wcscmp(openedPath, L"C:\\Profile\\AppData\\Lumos\\lumos-diagnostics.log") == 0);
     CHECK(strstr(currentLog, "exeFolderError=0x00000005") != NULL);
     Reset(); denyAll = TRUE;
-    SetLastError(42); Diagnostics_Init();
+    SetLastError(42); Diagnostics_Init(TRUE);
     CHECK(GetLastError() == 42 && debugLines >= 2 && currentLog[0] == '\0');
-    Reset(); Diagnostics_Init(); failWrite = TRUE;
+    Reset(); Diagnostics_Init(TRUE); failWrite = TRUE;
     SetLastError(73); Diagnostics_Log("ERROR", "disk-test", "disk full");
     CHECK(GetLastError() == 73 && debugLines > 0);
     failWrite = FALSE; failMove = TRUE;

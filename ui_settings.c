@@ -37,6 +37,7 @@ typedef struct {
        the window never writes into Settings directly. */
     int   step;
     BOOL  autostart;
+    BOOL  diagnosticsEnabled;
     BOOL  scheduleEnabled;
     BOOL  idleDimEnabled;
     int   idleDimPercent;
@@ -119,6 +120,7 @@ static void BuildSettingsRows(SetEditData *d)
     SetAddRow(d, SET_SECTION, L"GENERAL");
     SetAddNumber(d, L"Brightness step", &d->step, 1, 50, 1, SET_UNIT_PERCENT);
     SetAddToggle(d, L"Start with Windows", &d->autostart);
+    SetAddToggle(d, L"Diagnostic logs", &d->diagnosticsEnabled);
     SetAddRow(d, SET_MONITORS, L"Choose Monitors");
     SetRow *sourceInterval = SetAddNumber(d, L"Source check interval", &d->sourcePollSeconds,
         MIN_SOURCE_POLL_SECONDS, MAX_SOURCE_POLL_SECONDS, 1, SET_UNIT_SECONDS);
@@ -839,6 +841,7 @@ static void SetCommit(SetEditData *d)
     Settings *s = d->settings;
     s->step            = d->step;
     s->autostart       = d->autostart;
+    s->diagnosticsEnabled = d->diagnosticsEnabled;
     s->scheduleEnabled = d->scheduleEnabled;
     s->idleDimEnabled  = d->idleDimEnabled;
     s->idleDimPercent  = d->idleDimPercent;
@@ -911,8 +914,8 @@ static void SetTrySave(HWND hwnd, SetEditData *d)
         }
     }
 
-    Diagnostics_Log("INFO", "settings-ui", "SAVE sourcePollSeconds=%d idleEnabled=%d idleMinutes=%d idlePercent=%d",
-                    d->sourcePollSeconds, d->idleDimEnabled, d->idleDimMinutes, d->idleDimPercent);
+    Diagnostics_Log("INFO", "settings-ui", "SAVE sourcePollSeconds=%d idleEnabled=%d idleMinutes=%d idlePercent=%d diagnosticsEnabled=%d",
+                    d->sourcePollSeconds, d->idleDimEnabled, d->idleDimMinutes, d->idleDimPercent, d->diagnosticsEnabled);
     SetCommit(d);
     HWND owner = d->owner;
     DestroyWindow(hwnd);
@@ -1210,6 +1213,7 @@ void UI_ShowSettings(HWND hwndOwner, Settings *s, MonitorList *monitors)
     g_set.sourcePollSeconds = Settings_ClampSourcePollSeconds(s->sourcePollSeconds);
     g_set.step = s->step;
     g_set.autostart = Settings_GetAutostart();   /* the registry is the truth here */
+    g_set.diagnosticsEnabled = s->diagnosticsEnabled;
     g_set.scheduleEnabled = s->scheduleEnabled;
     g_set.idleDimEnabled = s->idleDimEnabled;
     g_set.idleDimPercent = s->idleDimPercent;

@@ -151,6 +151,7 @@ static void InitParent(SetEditData *parent, Settings *settings)
     parent->idleDimPercent = settings->idleDimPercent;
     parent->idleDimMinutes = settings->idleDimMinutes;
     parent->autostart = settings->autostart;
+    parent->diagnosticsEnabled = settings->diagnosticsEnabled;
     parent->idleDimEnabled = settings->idleDimEnabled;
     parent->scheduleEnabled = settings->scheduleEnabled;
     parent->sourcePollSeconds = Settings_ClampSourcePollSeconds(settings->sourcePollSeconds);
@@ -482,6 +483,37 @@ static void TestBlackIdleOfflineAndBuiltInWorkingCopy(void)
     CHECK(working.idleBlackCount == 1 && !wcscmp(working.idleBlackKeys[0], L"DDC:OFFLINE-OLED"));
 }
 
+static void TestDiagnosticToggleSaveAndCancel(void)
+{
+    Settings live = {0};
+    live.diagnosticsEnabled = TRUE;
+    InitParent(&g_set, &live);
+    int row = -1;
+    for (int i = 0; i < g_set.rowCount; i++)
+        if (g_set.rows[i].bval == &g_set.diagnosticsEnabled) row = i;
+    CHECK(row >= 0 && g_set.rows[row].kind == SET_TOGGLE);
+    if (row < 0) return;
+    CHECK(!wcscmp(g_set.rows[row].label, L"Diagnostic logs"));
+    g_set.focusRow = row;
+    SetWndProc(testParent, WM_KEYDOWN, VK_SPACE, 0);
+    CHECK(!g_set.diagnosticsEnabled && live.diagnosticsEnabled);
+    SetWndProc(testParent, WM_KEYDOWN, VK_ESCAPE, 0);
+    CHECK(live.diagnosticsEnabled); /* Cancel discards the pending log preference too. */
+
+    InitParent(&g_set, &live);
+    g_set.focusRow = row;
+    SetWndProc(testParent, WM_KEYDOWN, VK_SPACE, 0);
+    int oldNotifications = saveNotifications;
+    SetTrySave(testParent, &g_set);
+    CHECK(!live.diagnosticsEnabled && saveNotifications == oldNotifications + 1);
+    InitParent(&g_set, &live);
+    CHECK(!g_set.diagnosticsEnabled);
+    g_set.focusRow = row;
+    SetWndProc(testParent, WM_KEYDOWN, VK_SPACE, 0);
+    SetTrySave(testParent, &g_set);
+    CHECK(live.diagnosticsEnabled && saveNotifications == oldNotifications + 2);
+}
+
 static void TestSourceIntervalSlider(void)
 {
     Settings live = {0};
@@ -679,6 +711,7 @@ int main(int argc, char **argv)
     TestSourceRulesAndLiveTelemetry();
     TestSourceStatusAndBuiltIn();
     TestSourceIntervalSlider();
+    TestDiagnosticToggleSaveAndCancel();
     TestSlowPollingTelemetryFreshness();
     TestSettingsAccessibilityAndHotkeyValidation();
     if (argc > 1 && strcmp(argv[1], "--preview") == 0) {

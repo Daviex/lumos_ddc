@@ -51,6 +51,7 @@ void Settings_Init(Settings *s)
     memset(s, 0, sizeof(*s));
     s->step = 5;   /* brightness step for hotkeys and mouse wheel */
     s->autostart = FALSE;
+    s->diagnosticsEnabled = TRUE;
     s->sourcePollSeconds = DEFAULT_SOURCE_POLL_SECONDS;
 
     if (SUCCEEDED(SHGetFolderPathW(NULL, CSIDL_APPDATA, NULL, 0, appData)) &&
@@ -82,6 +83,7 @@ void Settings_CreateDefaults(Settings *s)
     WriteSettingString(L"Presets", L"Presentation", L"100", s->iniPath);
     WriteSettingString(L"Settings", L"Step", L"5", s->iniPath);
     WriteSettingString(L"Settings", L"Autostart", L"0", s->iniPath);
+    WriteSettingString(L"Settings", L"DiagnosticsEnabled", L"1", s->iniPath);
     WriteSettingString(L"Settings", L"IdleDimEnabled", L"0", s->iniPath);
     WriteSettingString(L"Settings", L"IdleDimPercent", L"5", s->iniPath);
     WriteSettingString(L"Settings", L"IdleDimMinutes", L"5", s->iniPath);
@@ -421,6 +423,7 @@ void Settings_Load(Settings *s)
     if (s->step > 50) s->step = 50;
 
     s->autostart = (BOOL)GetPrivateProfileIntW(L"Settings", L"Autostart", 0, s->iniPath);
+    s->diagnosticsEnabled = GetPrivateProfileIntW(L"Settings", L"DiagnosticsEnabled", 1, s->iniPath) != 0;
 
     /* Idle auto-dim */
     s->idleDimEnabled = (BOOL)GetPrivateProfileIntW(L"Settings", L"IdleDimEnabled", 0, s->iniPath);
@@ -510,6 +513,7 @@ void Settings_Save(Settings *s)
 
     wsprintfW(val, L"%d", s->autostart ? 1 : 0);
     WriteSettingString(L"Settings", L"Autostart", val, s->iniPath);
+    WriteSettingString(L"Settings", L"DiagnosticsEnabled", s->diagnosticsEnabled ? L"1" : L"0", s->iniPath);
 
     WriteSettingString(L"Settings", L"IdleDimEnabled",
                                s->idleDimEnabled ? L"1" : L"0", s->iniPath);

@@ -2,8 +2,8 @@
 setlocal
 
 :: Lumos build script (MSVC)
-:: Usage: build.bat          (release, diagnostics beside the exe)
-::        build.bat debug    (debug, diagnostics and UI timings beside the exe)
+:: Usage: build.bat          (release, respects the Diagnostic logs setting)
+::        build.bat debug    (debug, optional diagnostics and UI timings)
 
 if not exist build mkdir build
 

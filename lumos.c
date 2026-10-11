@@ -203,11 +203,11 @@ static void LogSettings(const char *reason)
 {
     Diagnostics_Log("INFO", "settings",
         "%s ini=\"%ls\" idleEnabled=%d idleMinutes=%d idlePercent=%d sourcePollSeconds=%d "
-        "scheduleEnabled=%d schedulePoints=%d autostart=%d step=%d selectedOnly=%d "
+        "scheduleEnabled=%d schedulePoints=%d autostart=%d diagnosticsEnabled=%d step=%d selectedOnly=%d "
         "selectedCount=%d sourceRules=%d blackIdleCount=%d",
         reason, g_settings.iniPath, g_settings.idleDimEnabled, g_settings.idleDimMinutes,
         g_settings.idleDimPercent, g_settings.sourcePollSeconds, g_settings.scheduleEnabled,
-        g_settings.scheduleCount, g_settings.autostart, g_settings.step,
+        g_settings.scheduleCount, g_settings.autostart, g_settings.diagnosticsEnabled, g_settings.step,
         g_settings.monitorSelection.selectedOnly, g_settings.monitorSelection.count,
         g_settings.monitorSelection.inputRuleCount, g_settings.monitorSelection.idleBlackCount);
     for (int i = 0; i < g_settings.scheduleCount; i++)
@@ -285,7 +285,9 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdLineA, int showCmd
         }
     }
 
-    Diagnostics_Init();
+    /* Read the log preference before any subsystem can create a log file. */
+    Settings_Init(&g_settings);
+    Diagnostics_Init(g_settings.diagnosticsEnabled);
     Diagnostics_Log("INFO", "app", "launch login=%d", loginLaunch);
     /* Initialize COM for Shell */
     CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
@@ -297,7 +299,6 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdLineA, int showCmd
     /* Init subsystems */
     memset(&g_monitors, 0, sizeof(g_monitors));
     Monitor_Enumerate(&g_monitors);
-    Settings_Init(&g_settings);
     Settings_UpgradeAutostart(); /* Add the login switch to this exe's legacy Run entry. */
     Settings_ApplyRanges(&g_settings, &g_monitors);
     Settings_ApplyMonitorSelection(&g_settings, &g_monitors);
@@ -1560,6 +1561,7 @@ static void HandleCommand(HWND hwnd, int cmd)
     case IDM_SETTINGS_SAVED: {
         /* The window already wrote the edited values into g_settings.
            Persist them, then apply the ones with a runtime effect. */
+        Diagnostics_SetEnabled(g_settings.diagnosticsEnabled);
         if (Settings_GetAutostart() != g_settings.autostart &&
             !Settings_SetAutostart(g_settings.autostart))
             g_settings.autostart = Settings_GetAutostart();

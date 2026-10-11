@@ -237,7 +237,7 @@ Settings live in an INI file that is created on the first run:
 %APPDATA%\Lumos\config.ini
 ```
 
-Almost everything in it can be set from the interface. Settings covers the brightness step, the hotkeys, idle dim, the schedule and autostart switches, the monitor minimums and the preset values. The popup sets the monitor maximums, and the schedule points have their own editor (right-click the tray icon, then Edit Schedule). Preset names are the one thing that has to be edited in the file, because the interface has no text input.
+Almost everything in it can be set from the interface. Settings covers the brightness step, the hotkeys, idle dim, diagnostic logging, the schedule and autostart switches, the monitor minimums and the preset values. The popup sets the monitor maximums, and the schedule points have their own editor (right-click the tray icon, then Edit Schedule). Preset names are the one thing that has to be edited in the file, because the interface has no text input.
 
 ```ini
 [Presets]
@@ -248,6 +248,7 @@ Presentation=100
 [Settings]
 Step=5
 Autostart=0
+DiagnosticsEnabled=1
 ScheduleEnabled=0
 IdleDimEnabled=0
 IdleDimPercent=5
@@ -401,9 +402,17 @@ was never reduced, so another source retains its original brightness. Black
 idle does not power off the monitor or trigger its standby/panel maintenance
 cycle. The monitor's own OLED care functions remain necessary.
 
-## Temporary diagnostics
+## Diagnostics
 
-Release and debug builds currently write **`lumos-diagnostics.log` in the executable's
+**Settings > General > Diagnostic logs** enables or disables logging when you
+press Save, without restarting Lumos. The preference is saved as
+`DiagnosticsEnabled=1` or `0` in `[Settings]`; missing entries retain the existing
+enabled behavior. Cancel discards an edited preference. Disabling closes the
+file and stops file/debug output from all threads. Existing logs are retained;
+reenabling resumes logging with the same rotation limits. A disabled preference
+is read before startup opens any log file.
+
+When enabled, release and debug builds write **`lumos-diagnostics.log` in the executable's
 folder**, regardless of the working directory. Entries are visible immediately.
 One previous file, `lumos-diagnostics.previous.log`, is retained on rotation at
 5 MiB, bounding the pair to about 10 MiB. If the executable folder cannot be

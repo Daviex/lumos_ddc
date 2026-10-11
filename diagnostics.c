@@ -14,6 +14,7 @@ static WCHAR g_diagnosticsPath[MAX_PATH];
 static WCHAR g_diagnosticsPrevious[MAX_PATH];
 static ULONGLONG g_diagnosticsBytes;
 static BOOL g_diagnosticsOpened, g_diagnosticsClosed;
+static volatile LONG g_diagnosticsEnabled; /* Off until settings have been loaded. */
 
 static void Utf8(const WCHAR *text, char *out, int capacity)
 {
@@ -110,6 +111,7 @@ static void Emit(const BrightMonitor *monitor, const char *level, const char *sc
                  const char *format, va_list args)
 {
     DWORD previousError = GetLastError();
+    if (!InterlockedCompareExchange(&g_diagnosticsEnabled, 0, 0)) return;
     char message[2048], tag[1664] = "", line[4096];
     vsnprintf(message, sizeof(message), format, args);
     message[sizeof(message) - 1] = '\0';
@@ -131,7 +133,7 @@ static void Emit(const BrightMonitor *monitor, const char *level, const char *sc
         time.wYear, time.wMonth, time.wDay, time.wHour, time.wMinute, time.wSecond,
         time.wMilliseconds, GetCurrentProcessId(), GetCurrentThreadId(), level, scope, tag, message);
     AcquireSRWLockExclusive(&g_diagnosticsLock);
-    if (!g_diagnosticsClosed) {
+    if (!g_diagnosticsClosed && InterlockedCompareExchange(&g_diagnosticsEnabled, 0, 0)) {
         if (!g_diagnosticsOpened) {
             g_diagnosticsOpened = TRUE;
             DWORD primaryError = OpenLocked();
@@ -165,9 +167,32 @@ void Diagnostics_Monitor(const BrightMonitor *monitor, const char *level,
     va_end(args);
 }
 
-void Diagnostics_Init(void)
+void Diagnostics_SetEnabled(BOOL enabled)
 {
-    Diagnostics_Log("INFO", "session", "START build=%s %s diagnostics=enabled", __DATE__, __TIME__);
+    DWORD previousError = GetLastError();
+    BOOL changed = FALSE;
+    enabled = enabled != FALSE;
+    AcquireSRWLockExclusive(&g_diagnosticsLock);
+    if (!g_diagnosticsClosed && g_diagnosticsEnabled != enabled) {
+        InterlockedExchange(&g_diagnosticsEnabled, enabled);
+        changed = TRUE;
+        if (!enabled) {
+            if (g_diagnosticsFile != INVALID_HANDLE_VALUE) CloseHandle(g_diagnosticsFile);
+            g_diagnosticsFile = INVALID_HANDLE_VALUE;
+            g_diagnosticsOpened = FALSE;
+            g_diagnosticsBytes = 0;
+            g_diagnosticsPath[0] = g_diagnosticsPrevious[0] = L'\0';
+        }
+    }
+    ReleaseSRWLockExclusive(&g_diagnosticsLock);
+    if (changed && enabled)
+        Diagnostics_Log("INFO", "session", "START build=%s %s diagnostics=enabled", __DATE__, __TIME__);
+    SetLastError(previousError);
+}
+
+void Diagnostics_Init(BOOL enabled)
+{
+    Diagnostics_SetEnabled(enabled);
 }
 
 void Diagnostics_Close(void)
@@ -176,6 +201,7 @@ void Diagnostics_Close(void)
     Diagnostics_Log("INFO", "session", "END");
     AcquireSRWLockExclusive(&g_diagnosticsLock);
     g_diagnosticsClosed = TRUE;
+    InterlockedExchange(&g_diagnosticsEnabled, FALSE);
     if (g_diagnosticsFile != INVALID_HANDLE_VALUE) CloseHandle(g_diagnosticsFile);
     g_diagnosticsFile = INVALID_HANDLE_VALUE;
     ReleaseSRWLockExclusive(&g_diagnosticsLock);
@@ -214,6 +240,7 @@ const char *Diagnostics_SourceReason(const BrightMonitor *monitor)
 
 void Diagnostics_MonitorState(const BrightMonitor *monitor, const char *reason)
 {
+    if (!InterlockedCompareExchange(&g_diagnosticsEnabled, 0, 0)) return;
     DWORD previousError = GetLastError();
     ULONGLONG age = monitor->sourceCheckedTick ? GetTickCount64() - monitor->sourceCheckedTick : 0;
     Diagnostics_Monitor(monitor, "INFO", "state",

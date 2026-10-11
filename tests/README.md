@@ -10,6 +10,8 @@ Running it does not launch Lumos or change the registry or configuration files.
 Input-source rules are covered independently of selection: saved port/filter
 round trips, unchecked/offline retention, identity reorder, duplicate/corrupt
 rules and fail-closed handling of unassigned inputs.
+Diagnostic logging checks legacy/new-install defaults and persisted off/on
+preferences, including saving unrelated settings without reactivating logging.
 The source polling interval covers the legacy 3-second default, persistence of
 every whole-second value from 1 to 60, and bounds on malformed values.
 
@@ -247,6 +249,10 @@ file APIs and real Win32 threads. It verifies the executable-relative path,
 read-only-folder fallback, UTF-8 monitor names/stable identity, timestamps and
 process/thread tags, Win32 last-error preservation, concurrent complete entries,
 5 MiB rotation, write/rotation failures and late worker logs after shutdown.
+Disabled startup creates no file or debug output. Runtime toggles close/reopen
+the file without discarding history, retain rotation limits, preserve last-error
+and reject a writer paused in formatting before logging was disabled.
+The Settings toggle is also exercised with keyboard edits, Cancel and Save.
 
 ```powershell
 clang -std=c11 -Wall -Wextra -Werror -DSTRSAFE_NO_DEPRECATE -DUNICODE -D_UNICODE tests/test_diagnostics.c -o build/test_diagnostics.exe

@@ -3,9 +3,11 @@
 
 #include "monitor.h"
 
-/* Temporary diagnostics are enabled in release builds too. Every entry keeps
-   the caller's Win32 last-error value intact. Monitor identity survives reorder. */
-void Diagnostics_Init(void);
+/* Diagnostics start only after the persisted setting is loaded. Disabling
+   closes the file and stops all output; enabling resumes without a restart.
+   Every entry keeps the caller's Win32 last-error value intact. */
+void Diagnostics_Init(BOOL enabled);
+void Diagnostics_SetEnabled(BOOL enabled);
 void Diagnostics_Close(void);
 void Diagnostics_Log(const char *level, const char *scope, const char *format, ...);
 void Diagnostics_Monitor(const BrightMonitor *monitor, const char *level,

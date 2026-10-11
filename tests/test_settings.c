@@ -31,6 +31,8 @@ static struct {
     DWORD queryType, queryBytes;
     BOOL sourcePollPresent;
     WCHAR sourcePollValue[24];
+    BOOL diagnosticsPresent;
+    WCHAR diagnosticsValue[16];
     BOOL hotkeyPresent[HOTKEY_COUNT];
     WCHAR hotkeyValues[HOTKEY_COUNT][HOTKEY_TEXT_MAX];
     struct {
@@ -187,6 +189,11 @@ static BOOL WINAPI MockWritePrivateProfileStringW(LPCWSTR section, LPCWSTR key,
         mock.sourcePollPresent = TRUE;
         StringCchCopyW(mock.sourcePollValue, ARRAYSIZE(mock.sourcePollValue), value);
     }
+    if (section && key && value && wcscmp(section, L"Settings") == 0 &&
+        wcscmp(key, L"DiagnosticsEnabled") == 0) {
+        mock.diagnosticsPresent = TRUE;
+        StringCchCopyW(mock.diagnosticsValue, ARRAYSIZE(mock.diagnosticsValue), value);
+    }
     if (section && key && value && wcscmp(section, L"Presets") == 0 &&
         wcscmp(key, L"Day") == 0)
         CHECK(SUCCEEDED(StringCchCopyW(mock.defaultDayValue, ARRAYSIZE(mock.defaultDayValue), value)));
@@ -281,6 +288,8 @@ static UINT WINAPI MockGetPrivateProfileIntW(LPCWSTR section, LPCWSTR key,
     (void)path;
     if (wcscmp(section, L"Settings") == 0 && wcscmp(key, L"SourcePollSeconds") == 0 &&
         mock.sourcePollPresent) return (UINT)_wtoi(mock.sourcePollValue);
+    if (wcscmp(section, L"Settings") == 0 && wcscmp(key, L"DiagnosticsEnabled") == 0 &&
+        mock.diagnosticsPresent) return (UINT)_wtoi(mock.diagnosticsValue);
     const WCHAR *value = wcscmp(section, L"MonitorSelection") == 0 ? SelectionIniValue(key) : NULL;
     if (wcscmp(section, L"MonitorInputs") == 0) value = InputIniValue(key);
     if (wcscmp(section, L"MonitorIdleBlack") == 0)
@@ -1122,6 +1131,33 @@ static void TestBlackIdlePersistenceAndUniqueSelection(void)
     CHECK(loaded.monitorSelection.idleBlackCount == 0); /* Existing INI stays dim-only. */
 }
 
+static void TestDiagnosticLoggingPreference(void)
+{
+    Settings settings = {0}, loaded = {0};
+    ResetMocks();
+    Settings_Load(&loaded);
+    CHECK(loaded.diagnosticsEnabled); /* Old configurations retain their diagnostic behavior. */
+    Settings_CreateDefaults(&settings);
+    CHECK(mock.diagnosticsPresent && !wcscmp(mock.diagnosticsValue, L"1"));
+    settings.diagnosticsEnabled = FALSE;
+    Settings_Save(&settings);
+    Settings_Load(&loaded);
+    CHECK(!loaded.diagnosticsEnabled && !wcscmp(mock.diagnosticsValue, L"0"));
+    loaded.step = 9; /* Saving an unrelated setting must not reenable logging. */
+    Settings_Save(&loaded);
+    Settings_Load(&settings);
+    CHECK(!settings.diagnosticsEnabled);
+    settings.diagnosticsEnabled = TRUE;
+    Settings_Save(&settings);
+    Settings_Load(&loaded);
+    CHECK(loaded.diagnosticsEnabled && !wcscmp(mock.diagnosticsValue, L"1"));
+    StringCchCopyW(mock.diagnosticsValue, ARRAYSIZE(mock.diagnosticsValue), L"2");
+    Settings_Load(&loaded);
+    CHECK(loaded.diagnosticsEnabled == TRUE);
+    Settings_Save(&loaded);
+    CHECK(!wcscmp(mock.diagnosticsValue, L"1"));
+}
+
 static void TestSourcePollingSetting(void)
 {
     Settings settings = {0}, loaded = {0};
@@ -1285,6 +1321,7 @@ int main(void)
     TestMonitorInputsInvalidValues();
     TestMonitorInputsIdentityBounds();
     TestBlackIdlePersistenceAndUniqueSelection();
+    TestDiagnosticLoggingPreference();
     TestSourcePollingSetting();
     TestHotkeySettingsVersionsAndRoundtrip();
     TestRangeMigrationKeepsMonitorPolicies();

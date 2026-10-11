@@ -2,7 +2,8 @@
    those suites must not create runtime files beside their test executable. */
 #include "../diagnostics.h"
 
-void Diagnostics_Init(void) {}
+void Diagnostics_Init(BOOL enabled) { (void)enabled; }
+void Diagnostics_SetEnabled(BOOL enabled) { (void)enabled; }
 void Diagnostics_Close(void) {}
 void Diagnostics_Log(const char *level, const char *scope, const char *format, ...)
 { (void)level; (void)scope; (void)format; }
